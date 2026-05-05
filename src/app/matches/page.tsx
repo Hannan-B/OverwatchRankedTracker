@@ -28,9 +28,18 @@ export default function MatchesPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl text-ow-orange">Match History</h1>
-        <p className="text-sm text-slate-400 mt-1">{matches.length} matches recorded</p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl text-ow-orange">Match History</h1>
+          <p className="text-sm text-slate-400 mt-1">{matches.length} matches recorded</p>
+        </div>
+        <a
+          href="/matches/new"
+          className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
+                     px-5 py-2.5 rounded-lg tracking-wider transition-colors text-sm"
+        >
+          + LOG MATCH
+        </a>
       </div>
 
       {loading ? (

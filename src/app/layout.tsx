@@ -45,6 +45,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <Link href="/upload" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
               UPLOAD
             </Link>
+            <Link href="/process" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              PROCESS
+            </Link>
             <Link href="/matches" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
               MATCHES
             </Link>

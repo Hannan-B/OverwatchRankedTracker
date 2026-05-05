@@ -60,7 +60,7 @@ export default function DashboardPage() {
           <p className="text-sm text-slate-400 mt-1">Your competitive overview</p>
         </div>
         <Link
-          href="/upload"
+          href="/matches/new"
           className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
                      px-5 py-2.5 rounded-lg tracking-wider transition-colors text-sm"
         >
@@ -94,14 +94,23 @@ export default function DashboardPage() {
         ) : matches.length === 0 ? (
           <div className="text-center py-12 bg-ow-panel rounded-lg border border-white/5">
             <p className="text-slate-400 text-lg font-display">No matches recorded yet</p>
-            <p className="text-slate-500 text-sm mt-2">Upload your first match photos to get started</p>
-            <Link
-              href="/upload"
-              className="inline-block mt-4 bg-ow-orange hover:bg-ow-accent text-ow-dark
-                         font-display font-bold px-6 py-2 rounded-lg tracking-wider transition-colors"
-            >
-              UPLOAD MATCH
-            </Link>
+            <p className="text-slate-500 text-sm mt-2">Log your first match to get started</p>
+            <div className="flex justify-center gap-3 mt-4">
+              <Link
+                href="/matches/new"
+                className="bg-ow-orange hover:bg-ow-accent text-ow-dark
+                           font-display font-bold px-6 py-2 rounded-lg tracking-wider transition-colors"
+              >
+                LOG MATCH
+              </Link>
+              <Link
+                href="/upload"
+                className="bg-ow-panel border border-white/10 hover:border-ow-orange/30 text-slate-300
+                           font-display font-bold px-6 py-2 rounded-lg tracking-wider transition-colors"
+              >
+                UPLOAD PHOTOS
+              </Link>
+            </div>
           </div>
         ) : (
           <div className="space-y-2">
