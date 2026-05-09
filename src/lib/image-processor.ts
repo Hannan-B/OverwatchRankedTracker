@@ -1,15 +1,14 @@
 // ============================================================
 // IMAGE PROCESSOR — Orchestrates the full processing pipeline
-// Loads photos, detects page type, runs hero matching + OCR,
-// returns structured match data ready to save
+// OpenCV runs in a Web Worker (isolated from Next.js)
+// OCR runs in the main thread via Tesseract.js
 // ============================================================
 
-import { loadOpenCV } from './opencv-loader'
-import { preloadHeroBank, identifyHeroes } from './hero-matcher'
+import { initOpenCV, isOpenCVReady } from './opencv-loader'
+import { preloadHeroBank, detectAndMatchHeroes } from './hero-matcher'
 import { ocrSummaryPage, terminateOcr, type SummaryOcrResult } from './ocr-extractor'
 
 export interface ProcessedMatch {
-  // From OCR
   mapName: string | null
   result: 'victory' | 'defeat' | 'draw' | null
   score: string | null
@@ -17,15 +16,11 @@ export interface ProcessedMatch {
   eliminations: number | null
   assists: number | null
   deaths: number | null
-
-  // From hero matching
   heroes: {
     name: string
     confidence: number
     source: 'image' | 'ocr' | 'both'
   }[]
-
-  // Debug info
   ocrRaw: Record<string, string>
   processingTimeMs: number
 }
@@ -37,6 +32,27 @@ export type ProcessingStatus =
   | { stage: 'running_ocr'; progress: number }
   | { stage: 'matching_heroes'; progress: number }
   | { stage: 'complete'; progress: 100 }
+
+// ============================================================
+// RESULT FROM SCORE
+// ============================================================
+// Derives victory/defeat/draw from the score string.
+// Score format is "X-Y" where X is the player's team score
+// and Y is the opponent's score.
+
+function resultFromScore(score: string | null): 'victory' | 'defeat' | 'draw' | null {
+  if (!score) return null
+
+  const match = score.match(/^(\d+)-(\d+)$/)
+  if (!match) return null
+
+  const playerScore = parseInt(match[1])
+  const opponentScore = parseInt(match[2])
+
+  if (playerScore > opponentScore) return 'victory'
+  if (playerScore < opponentScore) return 'defeat'
+  return 'draw'
+}
 
 export async function processMatchPhotos(
   photoUrls: string[],
@@ -51,15 +67,14 @@ export async function processMatchPhotos(
     ocrRaw: {}, processingTimeMs: 0,
   }
 
-  // Step 1: Load OpenCV
+  // Step 1: Initialize OpenCV Web Worker
   onStatus({ stage: 'loading_opencv', progress: 0 })
-  let cv: any
+  let opencvAvailable = false
   try {
-    cv = await loadOpenCV()
+    opencvAvailable = await initOpenCV()
+    console.log('OpenCV available:', opencvAvailable)
   } catch (e) {
-    console.error('Failed to load OpenCV:', e)
-    // Continue without OpenCV — OCR still works
-    cv = null
+    console.warn('OpenCV Worker failed:', e)
   }
 
   // Step 2: Load hero bank
@@ -75,7 +90,6 @@ export async function processMatchPhotos(
       photoIndex: i,
       total: photoUrls.length,
     })
-
     try {
       const img = await loadImage(photoUrls[i])
       images.push(img)
@@ -90,35 +104,48 @@ export async function processMatchPhotos(
     return result
   }
 
-  // Step 4: Determine page types and run OCR on Summary page
-  // The first photo is most likely the Summary page
+  // Step 4: Run OCR on all images (full-image approach)
   onStatus({ stage: 'running_ocr', progress: 40 })
 
   let summaryOcr: SummaryOcrResult | null = null
   try {
-    // Try OCR on the first image (assumed Summary page)
     summaryOcr = await ocrSummaryPage(images[0])
     result.mapName = summaryOcr.mapName
-    result.result = summaryOcr.result
     result.score = summaryOcr.score
     result.gameLengthSeconds = summaryOcr.gameLengthSeconds
     result.eliminations = summaryOcr.eliminations
     result.assists = summaryOcr.assists
     result.deaths = summaryOcr.deaths
     result.ocrRaw = summaryOcr.raw
+
+    // Derive result from score (primary method)
+    // Falls back to OCR-based detection if score isn't available
+    const scoreResult = resultFromScore(result.score)
+    if (scoreResult) {
+      result.result = scoreResult
+      console.log(`Result derived from score "${result.score}": ${scoreResult}`)
+    } else {
+      result.result = summaryOcr.result
+      console.log(`Result from OCR fallback: ${result.result}`)
+    }
+
+    console.log('OCR results:', {
+      map: result.mapName, result: result.result,
+      score: result.score, elims: result.eliminations,
+    })
   } catch (e) {
     console.warn('Summary OCR failed:', e)
   }
 
-  // Step 5: Run hero matching on all images
+  // Step 5: Run hero matching via Web Worker
   onStatus({ stage: 'matching_heroes', progress: 60 })
 
-  const allHeroMatches: Map<string, { score: number; source: 'image' | 'ocr' | 'both' }> = new Map()
+  const allHeroMatches = new Map<string, { score: number; source: 'image' | 'ocr' | 'both' }>()
 
-  if (cv) {
-    // Try Summary page hero detection on first image
+  if (opencvAvailable) {
+    // Summary page hero detection
     try {
-      const summaryHeroes = await identifyHeroes(cv, images[0], 'summary')
+      const summaryHeroes = await detectAndMatchHeroes(images[0], 'summary', true)
       for (const match of summaryHeroes) {
         allHeroMatches.set(match.heroName, { score: match.score, source: 'image' })
       }
@@ -126,15 +153,11 @@ export async function processMatchPhotos(
       console.warn('Summary hero detection failed:', e)
     }
 
-    // Try Breakdown page hero detection on remaining images
+    // Breakdown page hero detection
     for (let i = 1; i < images.length; i++) {
-      onStatus({
-        stage: 'matching_heroes',
-        progress: 60 + ((i / images.length) * 30),
-      })
-
+      onStatus({ stage: 'matching_heroes', progress: 60 + ((i / images.length) * 30) })
       try {
-        const breakdownHeroes = await identifyHeroes(cv, images[i], 'breakdown')
+        const breakdownHeroes = await detectAndMatchHeroes(images[i], 'breakdown', true)
         for (const match of breakdownHeroes) {
           const existing = allHeroMatches.get(match.heroName)
           if (existing) {
@@ -152,7 +175,7 @@ export async function processMatchPhotos(
     console.warn('OpenCV not available — using OCR-only hero detection')
   }
 
-  // Add OCR hero names (cross-reference if image matching found them too)
+  // Add OCR hero names
   if (summaryOcr?.heroNames) {
     for (const ocrHero of summaryOcr.heroNames) {
       const existing = allHeroMatches.get(ocrHero)
@@ -164,13 +187,14 @@ export async function processMatchPhotos(
     }
   }
 
-  // Convert to sorted array
+  // Convert to sorted array, filter by confidence threshold
+  // Threshold 0.13: keeps all validated correct matches (lowest was 0.14)
+  // while filtering false positives (highest was 0.10)
+  const HERO_CONFIDENCE_THRESHOLD = 0.13
+
   result.heroes = Array.from(allHeroMatches.entries())
-    .map(([name, data]) => ({
-      name,
-      confidence: data.score,
-      source: data.source,
-    }))
+    .map(([name, data]) => ({ name, confidence: data.score, source: data.source }))
+    .filter(h => h.confidence >= HERO_CONFIDENCE_THRESHOLD || h.source === 'ocr')
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, 3)
 
@@ -182,10 +206,6 @@ export async function processMatchPhotos(
 
   return result
 }
-
-// ============================================================
-// UTILITIES
-// ============================================================
 
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {

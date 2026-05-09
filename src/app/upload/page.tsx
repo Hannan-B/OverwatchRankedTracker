@@ -115,6 +115,34 @@ export default function UploadPage() {
     })
   }
 
+  // Convert any image to JPEG blob (handles HEIC on iPhone)
+  async function convertToJpeg(file: File): Promise<Blob> {
+    return new Promise((resolve, reject) => {
+      const img = new Image()
+      img.onload = () => {
+        const canvas = document.createElement('canvas')
+        canvas.width = img.naturalWidth
+        canvas.height = img.naturalHeight
+        const ctx = canvas.getContext('2d')!
+        ctx.drawImage(img, 0, 0)
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(img.src)
+            if (blob) resolve(blob)
+            else reject(new Error('Failed to convert image'))
+          },
+          'image/jpeg',
+          0.92 // High quality
+        )
+      }
+      img.onerror = () => {
+        URL.revokeObjectURL(img.src)
+        reject(new Error('Failed to load image for conversion'))
+      }
+      img.src = URL.createObjectURL(file)
+    })
+  }
+
   async function uploadAll() {
     if (files.length === 0 || !role) return
     setStep('uploading')
@@ -141,13 +169,21 @@ export default function UploadPage() {
     for (let i = 0; i < updated.length; i++) {
       updated[i].status = 'uploading'
       setFiles([...updated])
-      const file = updated[i].file
-      const ext = file.name.split('.').pop() || 'heic'
-      const path = `pending/${batchId}/photo_${i + 1}.${ext}`
-      const { error } = await supabase.storage
-        .from('match-images')
-        .upload(path, file, { contentType: file.type || 'image/heic' })
-      updated[i].status = error ? 'error' : 'success'
+
+      try {
+        // Convert to JPEG (handles HEIC from iPhone)
+        const jpegBlob = await convertToJpeg(updated[i].file)
+        const path = `pending/${batchId}/photo_${i + 1}.jpg`
+
+        const { error } = await supabase.storage
+          .from('match-images')
+          .upload(path, jpegBlob, { contentType: 'image/jpeg' })
+
+        updated[i].status = error ? 'error' : 'success'
+      } catch (err) {
+        console.warn(`Failed to convert/upload photo ${i}:`, err)
+        updated[i].status = 'error'
+      }
       setFiles([...updated])
     }
 
