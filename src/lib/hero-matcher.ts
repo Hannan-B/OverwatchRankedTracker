@@ -2,16 +2,19 @@
 // HERO MATCHER — Uses Web Worker for OpenCV operations
 // ORB matching (50%) runs in worker
 // Structural (30%) + Color Moments (20%) run in main thread
+// NOW WITH ROLE FILTERING + SANITY CHECK + AUTO-CORRECT
 // ============================================================
 
 import { HEROES } from '@/data/reference'
 import { orbMatchScore, detectPortraits as workerDetectPortraits } from './opencv-loader'
+import type { RoleType } from '@/lib/types'
 
 interface MatchResult {
   heroName: string
   score: number
   margin: number
   runnerUp: string
+  correctedRole?: RoleType // set when matched hero's role differs from selected role
 }
 
 // Hero bank: name -> { img, pixelData }
@@ -32,6 +35,12 @@ const HERO_FILENAME_MAP: Record<string, string> = {
 
 function heroFilename(name: string): string {
   return HERO_FILENAME_MAP[name] || name
+}
+
+// Build a quick lookup: hero name -> role
+const HERO_ROLE_MAP = new Map<string, RoleType>()
+for (const hero of HEROES) {
+  HERO_ROLE_MAP.set(hero.name, hero.role)
 }
 
 // ============================================================
@@ -211,21 +220,27 @@ async function combinedScore(
     }
   }
 
+  // When ORB is disabled, reweight structural and color
+  // structural (60%) + color (40%) instead of the usual 50/30/20 split
+  if (!useOrb) {
+    return 0.6 * structural + 0.4 * moments
+  }
+
   return 0.5 * orb + 0.3 * structural + 0.2 * moments
 }
 
 // ============================================================
-// PUBLIC API
+// MATCH AGAINST A SUBSET OF HEROES
 // ============================================================
 
-export async function matchHero(
+async function matchAgainstCandidates(
   portraitData: { data: number[]; width: number; height: number },
+  candidates: [string, HeroBankEntry][],
   useOrb: boolean,
-): Promise<MatchResult> {
+): Promise<{ heroName: string; score: number; margin: number; runnerUp: string }> {
   const scores: [string, number][] = []
 
-  const entries = Array.from(heroBank.entries())
-  for (const [name, entry] of entries) {
+  for (const [name, entry] of candidates) {
     const score = await combinedScore(portraitData, entry, useOrb)
     scores.push([name, score])
   }
@@ -235,8 +250,75 @@ export async function matchHero(
   return {
     heroName: scores[0][0],
     score: scores[0][1],
-    margin: scores[0][1] - scores[1][1],
-    runnerUp: scores[1][0],
+    margin: scores.length > 1 ? scores[0][1] - scores[1][1] : scores[0][1],
+    runnerUp: scores.length > 1 ? scores[1][0] : 'N/A',
+  }
+}
+
+// ============================================================
+// PUBLIC API
+// ============================================================
+
+export async function matchHero(
+  portraitData: { data: number[]; width: number; height: number },
+  useOrb: boolean,
+  roleFilter?: RoleType,
+): Promise<MatchResult> {
+  const allEntries = Array.from(heroBank.entries())
+
+  // If no role filter, match against all heroes (original behaviour)
+  if (!roleFilter) {
+    const result = await matchAgainstCandidates(portraitData, allEntries, useOrb)
+    return result
+  }
+
+  // Step 1: Match against role-filtered candidates (full ORB + structural + color)
+  const filteredEntries = allEntries.filter(
+    ([name]) => HERO_ROLE_MAP.get(name) === roleFilter
+  )
+
+  console.log(`Role filter: ${roleFilter} → ${filteredEntries.length} candidates (of ${allEntries.length} total)`)
+
+  const filteredResult = await matchAgainstCandidates(portraitData, filteredEntries, useOrb)
+
+  console.log(`Filtered match: ${filteredResult.heroName} (score: ${filteredResult.score.toFixed(4)}, margin: ${filteredResult.margin.toFixed(4)})`)
+
+  // Step 2: Sanity check — run FAST structural+color-only (no ORB) against ALL heroes
+  // This is cheap because ORB is the slow part (~95% of matching time)
+  console.log(`Running sanity check (structural+color only) against all ${allEntries.length} heroes...`)
+  const sanityResult = await matchAgainstCandidates(portraitData, allEntries, false)
+  const sanityRole = HERO_ROLE_MAP.get(sanityResult.heroName)
+
+  console.log(`Sanity check winner: ${sanityResult.heroName} (${sanityRole}) score: ${sanityResult.score.toFixed(4)}`)
+
+  // Step 3: If sanity check agrees with the filtered role, trust the filtered result
+  if (sanityRole === roleFilter) {
+    console.log(`Sanity check confirms role "${roleFilter}" — using filtered result`)
+    return filteredResult
+  }
+
+  // Step 4: Sanity check disagrees — the user likely picked the wrong role
+  // Run full ORB match on all heroes to get the definitive answer
+  console.log(`Sanity check disagrees: filtered="${roleFilter}" vs sanity="${sanityRole}" (${sanityResult.heroName})`)
+  console.log(`Running full match (with ORB) against all ${allEntries.length} heroes...`)
+
+  const fullResult = await matchAgainstCandidates(portraitData, allEntries, useOrb)
+  const fullRole = HERO_ROLE_MAP.get(fullResult.heroName)
+
+  console.log(`Full match winner: ${fullResult.heroName} (${fullRole}) score: ${fullResult.score.toFixed(4)}`)
+
+  // If the full match found a hero in the filtered role after all,
+  // the sanity check was a false alarm — use the filtered result
+  if (fullRole === roleFilter) {
+    console.log(`Full match agrees with filtered role "${roleFilter}" — sanity check was a false alarm`)
+    return filteredResult
+  }
+
+  // Full match confirms wrong role — auto-correct
+  console.log(`AUTO-CORRECT: Selected role was "${roleFilter}" but matched hero "${fullResult.heroName}" is "${fullRole}"`)
+  return {
+    ...fullResult,
+    correctedRole: fullRole,
   }
 }
 
@@ -244,6 +326,7 @@ export async function detectAndMatchHeroes(
   img: HTMLImageElement,
   pageType: 'summary' | 'breakdown',
   opencvAvailable: boolean,
+  roleFilter?: RoleType,
 ): Promise<MatchResult[]> {
   await loadHeroBank()
 
@@ -266,11 +349,11 @@ export async function detectAndMatchHeroes(
 
   console.log(`Detected ${portraits.length} portrait(s) on ${pageType} page`)
 
-  // Match each portrait
+  // Match each portrait (with role filter + sanity check)
   const results: MatchResult[] = []
   for (const portrait of portraits) {
-    const result = await matchHero(portrait, true)
-    console.log(`Matched: ${result.heroName} (score: ${result.score.toFixed(4)}, margin: ${result.margin.toFixed(4)})`)
+    const result = await matchHero(portrait, true, roleFilter)
+    console.log(`Matched: ${result.heroName} (score: ${result.score.toFixed(4)}, margin: ${result.margin.toFixed(4)}${result.correctedRole ? `, ROLE CORRECTED → ${result.correctedRole}` : ''})`)
     results.push(result)
   }
 

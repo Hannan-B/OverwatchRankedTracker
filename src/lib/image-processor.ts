@@ -2,11 +2,13 @@
 // IMAGE PROCESSOR — Orchestrates the full processing pipeline
 // OpenCV runs in a Web Worker (isolated from Next.js)
 // OCR runs in the main thread via Tesseract.js
+// NOW WITH ROLE FILTERING + AUTO-CORRECT
 // ============================================================
 
 import { initOpenCV, isOpenCVReady } from './opencv-loader'
 import { preloadHeroBank, detectAndMatchHeroes } from './hero-matcher'
 import { ocrSummaryPage, terminateOcr, type SummaryOcrResult } from './ocr-extractor'
+import type { RoleType } from '@/lib/types'
 
 export interface ProcessedMatch {
   mapName: string | null
@@ -21,6 +23,7 @@ export interface ProcessedMatch {
     confidence: number
     source: 'image' | 'ocr' | 'both'
   }[]
+  correctedRole: RoleType | null  // set when hero matching detected wrong role selection
   ocrRaw: Record<string, string>
   processingTimeMs: number
 }
@@ -57,6 +60,7 @@ function resultFromScore(score: string | null): 'victory' | 'defeat' | 'draw' | 
 export async function processMatchPhotos(
   photoUrls: string[],
   onStatus: (status: ProcessingStatus) => void,
+  roleFilter?: RoleType,
 ): Promise<ProcessedMatch> {
   const startTime = Date.now()
 
@@ -64,6 +68,7 @@ export async function processMatchPhotos(
     mapName: null, result: null, score: null,
     gameLengthSeconds: null, eliminations: null,
     assists: null, deaths: null, heroes: [],
+    correctedRole: null,
     ocrRaw: {}, processingTimeMs: 0,
   }
 
@@ -80,6 +85,10 @@ export async function processMatchPhotos(
   // Step 2: Load hero bank
   onStatus({ stage: 'loading_heroes', progress: 10 })
   await preloadHeroBank()
+
+  if (roleFilter) {
+    console.log(`Role filter active: ${roleFilter}`)
+  }
 
   // Step 3: Load all photos as Image elements
   const images: HTMLImageElement[] = []
@@ -137,27 +146,33 @@ export async function processMatchPhotos(
     console.warn('Summary OCR failed:', e)
   }
 
-  // Step 5: Run hero matching via Web Worker
+  // Step 5: Run hero matching via Web Worker (with role filter)
   onStatus({ stage: 'matching_heroes', progress: 60 })
 
   const allHeroMatches = new Map<string, { score: number; source: 'image' | 'ocr' | 'both' }>()
+  let detectedCorrectedRole: RoleType | null = null
 
   if (opencvAvailable) {
-    // Summary page hero detection
+    // Summary page hero detection (with role filter)
     try {
-      const summaryHeroes = await detectAndMatchHeroes(images[0], 'summary', true)
+      const summaryHeroes = await detectAndMatchHeroes(images[0], 'summary', true, roleFilter)
       for (const match of summaryHeroes) {
         allHeroMatches.set(match.heroName, { score: match.score, source: 'image' })
+        // If any hero triggered auto-correct, capture the corrected role
+        if (match.correctedRole && !detectedCorrectedRole) {
+          detectedCorrectedRole = match.correctedRole
+          console.log(`Role auto-correct triggered: ${roleFilter} → ${match.correctedRole} (from hero ${match.heroName})`)
+        }
       }
     } catch (e) {
       console.warn('Summary hero detection failed:', e)
     }
 
-    // Breakdown page hero detection
+    // Breakdown page hero detection (with role filter)
     for (let i = 1; i < images.length; i++) {
       onStatus({ stage: 'matching_heroes', progress: 60 + ((i / images.length) * 30) })
       try {
-        const breakdownHeroes = await detectAndMatchHeroes(images[i], 'breakdown', true)
+        const breakdownHeroes = await detectAndMatchHeroes(images[i], 'breakdown', true, roleFilter)
         for (const match of breakdownHeroes) {
           const existing = allHeroMatches.get(match.heroName)
           if (existing) {
@@ -165,6 +180,11 @@ export async function processMatchPhotos(
             existing.score = Math.max(existing.score, match.score)
           } else {
             allHeroMatches.set(match.heroName, { score: match.score, source: 'image' })
+          }
+          // Capture auto-correct from breakdown pages too
+          if (match.correctedRole && !detectedCorrectedRole) {
+            detectedCorrectedRole = match.correctedRole
+            console.log(`Role auto-correct triggered: ${roleFilter} → ${match.correctedRole} (from hero ${match.heroName})`)
           }
         }
       } catch (e) {
@@ -197,6 +217,9 @@ export async function processMatchPhotos(
     .filter(h => h.confidence >= HERO_CONFIDENCE_THRESHOLD || h.source === 'ocr')
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, 3)
+
+  // Set corrected role if auto-correct was triggered
+  result.correctedRole = detectedCorrectedRole
 
   // Clean up
   await terminateOcr()

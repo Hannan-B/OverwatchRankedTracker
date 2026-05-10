@@ -109,13 +109,18 @@ export default function ProcessPage() {
     setErrorMsg(null)
 
     try {
+      // Pass the role filter from metadata into processing
       const result = await processMatchPhotos(
         batch.photoUrls,
-        (status) => setProcessingStatus(status)
+        (status) => setProcessingStatus(status),
+        batch.metadata.role_played,
       )
 
       setProcessedResult(result)
       console.log('Processing result:', result)
+      if (result.correctedRole) {
+        console.log(`Role was auto-corrected: ${batch.metadata.role_played} → ${result.correctedRole}`)
+      }
 
       // Auto-save to database
       setPageState('saving')
@@ -133,6 +138,9 @@ export default function ProcessPage() {
     const meta = batch.metadata
     const gameMode = processed.mapName ? getGameModeForMap(processed.mapName) : null
 
+    // Use corrected role if auto-correct fired, otherwise use what the user selected
+    const finalRole = processed.correctedRole || meta.role_played
+
     // Get season
     const { data: seasonId } = await supabase
       .rpc('get_season_for_date', { match_date: new Date().toISOString() })
@@ -145,7 +153,7 @@ export default function ProcessPage() {
         game_mode: gameMode || null,
         result: processed.result || 'defeat',
         score: processed.score,
-        role_played: meta.role_played,
+        role_played: finalRole,
         game_length_seconds: processed.gameLengthSeconds,
         starting_side: null,
         season_id: seasonId || null,
@@ -203,6 +211,18 @@ export default function ProcessPage() {
             Processed in {(processedResult.processingTimeMs / 1000).toFixed(1)}s
           </p>
         </div>
+
+        {/* Role auto-correct notification */}
+        {processedResult.correctedRole && currentBatch && (
+          <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg px-5 py-4">
+            <p className="text-ow-orange font-display font-bold text-sm">ROLE AUTO-CORRECTED</p>
+            <p className="text-slate-400 text-xs mt-1">
+              You selected <span className="text-white font-display">{currentBatch.metadata.role_played.toUpperCase()}</span> but
+              the matched hero is <span className="text-white font-display">{processedResult.correctedRole.toUpperCase()}</span>.
+              The role has been updated automatically.
+            </p>
+          </div>
+        )}
 
         {/* Summary of what was extracted */}
         <div className="bg-ow-panel rounded-lg p-5 border border-white/5 space-y-3">
@@ -293,9 +313,17 @@ export default function ProcessPage() {
   // ======================== PROCESSING / SAVING ========================
   if (pageState === 'processing' || pageState === 'saving') {
     const progress = pageState === 'saving' ? 95 : (processingStatus?.progress || 0)
-    const message = pageState === 'saving'
+    const stage = processingStatus?.stage || 'loading_opencv'
+
+    // Update status message to reflect role filtering
+    let message = pageState === 'saving'
       ? 'Saving to database...'
-      : STATUS_MESSAGES[processingStatus?.stage || 'loading_opencv'] || 'Processing...'
+      : STATUS_MESSAGES[stage] || 'Processing...'
+
+    // Show filtered hero count when matching
+    if (stage === 'matching_heroes' && currentBatch) {
+      message = `Identifying heroes (${currentBatch.metadata.role_played} first)...`
+    }
 
     return (
       <div className="max-w-3xl mx-auto">
