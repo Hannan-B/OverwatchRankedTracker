@@ -1,14 +1,87 @@
 // ============================================================
 // IMAGE PROCESSOR — Orchestrates the full processing pipeline
-// OpenCV runs in a Web Worker (isolated from Next.js)
-// OCR runs in the main thread via Tesseract.js
-// NOW WITH ROLE FILTERING + AUTO-CORRECT
+// Auto-detects summary vs breakdown pages
+// Portrait matcher identifies heroes on summary page
+// Assignment by elimination for breakdown pages
+// Catalog-driven stat extraction for breakdowns
 // ============================================================
 
 import { initOpenCV, isOpenCVReady } from './opencv-loader'
-import { preloadHeroBank, detectAndMatchHeroes } from './hero-matcher'
+import { preloadHeroBank, detectAndMatchHeroes, matchHero } from './hero-matcher'
 import { ocrSummaryPage, terminateOcr, type SummaryOcrResult } from './ocr-extractor'
+import { ocrBreakdownPage, terminateBreakdownOcr, type BreakdownOcrResult, type BreakdownStat } from './breakdown-ocr'
 import type { RoleType } from '@/lib/types'
+import Tesseract from 'tesseract.js'
+
+// ============================================================
+// PAGE TYPE DETECTION
+// ============================================================
+
+type PageType = 'summary' | 'breakdown' | 'unknown'
+
+let classifyWorker: Tesseract.Worker | null = null
+
+async function getClassifyWorker(): Promise<Tesseract.Worker> {
+  if (!classifyWorker) {
+    classifyWorker = await Tesseract.createWorker('eng')
+  }
+  return classifyWorker
+}
+
+const SUMMARY_KEYWORDS = ['TOTAL PERFORMANCE', 'FINAL SCORE', 'GAME LENGTH']
+const BREAKDOWN_KEYWORDS = ['PERCENT PLAYED', 'PLAY TIME']
+
+async function classifyImage(img: HTMLImageElement): Promise<PageType> {
+  const worker = await getClassifyWorker()
+
+  const canvas = document.createElement('canvas')
+  canvas.width = img.naturalWidth
+  canvas.height = img.naturalHeight
+  canvas.getContext('2d')!.drawImage(img, 0, 0)
+
+  const { data } = await worker.recognize(canvas)
+  const text = data.text.toUpperCase()
+
+  let summaryScore = 0
+  let breakdownScore = 0
+
+  for (const kw of SUMMARY_KEYWORDS) {
+    if (text.includes(kw)) summaryScore++
+  }
+  for (const kw of BREAKDOWN_KEYWORDS) {
+    if (text.includes(kw)) breakdownScore++
+  }
+
+  console.log(`Page classification: summary=${summaryScore}, breakdown=${breakdownScore}`)
+
+  if (summaryScore >= 2 && summaryScore > breakdownScore) return 'summary'
+  if (breakdownScore >= 1 && breakdownScore >= summaryScore) return 'breakdown'
+  if (summaryScore >= 1) return 'summary'
+  if (breakdownScore >= 1) return 'breakdown'
+
+  return 'unknown'
+}
+
+async function terminateClassifyWorker() {
+  if (classifyWorker) {
+    await classifyWorker.terminate()
+    classifyWorker = null
+  }
+}
+
+// ============================================================
+// TYPES
+// ============================================================
+
+export interface HeroBreakdownResult {
+  heroName: string
+  percentPlayed: number | null
+  playTimeSeconds: number | null
+  stats: BreakdownStat[]
+  expectedStatCount: number
+  foundStatCount: number
+  matchedToSummary: boolean
+}
 
 export interface ProcessedMatch {
   mapName: string | null
@@ -23,7 +96,8 @@ export interface ProcessedMatch {
     confidence: number
     source: 'image' | 'ocr' | 'both'
   }[]
-  correctedRole: RoleType | null  // set when hero matching detected wrong role selection
+  heroBreakdowns: HeroBreakdownResult[]
+  correctedRole: RoleType | null
   ocrRaw: Record<string, string>
   processingTimeMs: number
 }
@@ -32,30 +106,119 @@ export type ProcessingStatus =
   | { stage: 'loading_opencv'; progress: 0 }
   | { stage: 'loading_heroes'; progress: 10 }
   | { stage: 'processing_photo'; progress: number; photoIndex: number; total: number }
+  | { stage: 'classifying_pages'; progress: number }
   | { stage: 'running_ocr'; progress: number }
   | { stage: 'matching_heroes'; progress: number }
+  | { stage: 'reading_breakdowns'; progress: number }
   | { stage: 'complete'; progress: 100 }
 
 // ============================================================
 // RESULT FROM SCORE
 // ============================================================
-// Derives victory/defeat/draw from the score string.
-// Score format is "X-Y" where X is the player's team score
-// and Y is the opponent's score.
 
 function resultFromScore(score: string | null): 'victory' | 'defeat' | 'draw' | null {
   if (!score) return null
-
   const match = score.match(/^(\d+)-(\d+)$/)
   if (!match) return null
-
   const playerScore = parseInt(match[1])
   const opponentScore = parseInt(match[2])
-
   if (playerScore > opponentScore) return 'victory'
   if (playerScore < opponentScore) return 'defeat'
   return 'draw'
 }
+
+// ============================================================
+// ASSIGNMENT BY ELIMINATION
+// Matches breakdown images to known heroes optimally.
+// Each image gets scored against all candidate heroes,
+// then assigned greedily: highest-confidence pair first.
+// ============================================================
+
+interface BreakdownAssignment {
+  imageIndex: number
+  heroName: string
+  score: number
+}
+
+async function assignBreakdownsToHeroes(
+  breakdownImages: HTMLImageElement[],
+  knownHeroNames: string[],
+  opencvAvailable: boolean,
+): Promise<BreakdownAssignment[]> {
+  if (!opencvAvailable || breakdownImages.length === 0 || knownHeroNames.length === 0) {
+    return []
+  }
+
+  console.log(`Assignment by elimination: ${breakdownImages.length} images × ${knownHeroNames.length} heroes`)
+
+  // Score each image's portrait against each known hero individually
+  // This builds the full matrix needed for optimal greedy assignment
+  const fullScoreMatrix: { imageIndex: number; heroName: string; score: number }[] = []
+
+  for (let i = 0; i < breakdownImages.length; i++) {
+    // Detect portrait from this image
+    const canvas = document.createElement('canvas')
+    canvas.width = breakdownImages[i].naturalWidth
+    canvas.height = breakdownImages[i].naturalHeight
+    canvas.getContext('2d')!.drawImage(breakdownImages[i], 0, 0)
+    const imgData = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height)
+
+    // Import portrait detection
+    const { detectPortraits } = await import('./opencv-loader')
+    const portraits = await detectPortraits(
+      imgData.data, canvas.width, canvas.height, 'breakdown',
+    )
+
+    if (portraits.length === 0) {
+      console.warn(`Breakdown ${i + 1}: no portrait detected`)
+      continue
+    }
+
+    // Score this portrait against each known hero
+    for (const heroName of knownHeroNames) {
+      const result = await matchHero(portraits[0], true, undefined, [heroName])
+      fullScoreMatrix.push({
+        imageIndex: i,
+        heroName,
+        score: result.score,
+      })
+    }
+
+    console.log(`Breakdown ${i + 1} scores: ${knownHeroNames.map(h => {
+      const s = fullScoreMatrix.find(m => m.imageIndex === i && m.heroName === h)
+      return `${h}=${s?.score.toFixed(4) || '?'}`
+    }).join(', ')}`)
+  }
+
+  // Greedy assignment: pick highest-confidence pair, assign, remove both, repeat
+  const assignments: BreakdownAssignment[] = []
+  const assignedImages = new Set<number>()
+  const assignedHeroes = new Set<string>()
+
+  // Sort by score descending
+  const sorted = [...fullScoreMatrix].sort((a, b) => b.score - a.score)
+
+  for (const entry of sorted) {
+    if (assignedImages.has(entry.imageIndex)) continue
+    if (assignedHeroes.has(entry.heroName)) continue
+
+    assignments.push(entry)
+    assignedImages.add(entry.imageIndex)
+    assignedHeroes.add(entry.heroName)
+
+    console.log(`Assigned: image ${entry.imageIndex + 1} → ${entry.heroName} (score: ${entry.score.toFixed(4)})`)
+
+    // Stop when all images or all heroes are assigned
+    if (assignedImages.size === breakdownImages.length) break
+    if (assignedHeroes.size === knownHeroNames.length) break
+  }
+
+  return assignments
+}
+
+// ============================================================
+// MAIN PIPELINE
+// ============================================================
 
 export async function processMatchPhotos(
   photoUrls: string[],
@@ -68,16 +231,16 @@ export async function processMatchPhotos(
     mapName: null, result: null, score: null,
     gameLengthSeconds: null, eliminations: null,
     assists: null, deaths: null, heroes: [],
+    heroBreakdowns: [],
     correctedRole: null,
     ocrRaw: {}, processingTimeMs: 0,
   }
 
-  // Step 1: Initialize OpenCV Web Worker
+  // Step 1: Initialize OpenCV
   onStatus({ stage: 'loading_opencv', progress: 0 })
   let opencvAvailable = false
   try {
     opencvAvailable = await initOpenCV()
-    console.log('OpenCV available:', opencvAvailable)
   } catch (e) {
     console.warn('OpenCV Worker failed:', e)
   }
@@ -85,23 +248,19 @@ export async function processMatchPhotos(
   // Step 2: Load hero bank
   onStatus({ stage: 'loading_heroes', progress: 10 })
   await preloadHeroBank()
+  if (roleFilter) console.log(`Role filter active: ${roleFilter}`)
 
-  if (roleFilter) {
-    console.log(`Role filter active: ${roleFilter}`)
-  }
-
-  // Step 3: Load all photos as Image elements
+  // Step 3: Load all photos
   const images: HTMLImageElement[] = []
   for (let i = 0; i < photoUrls.length; i++) {
     onStatus({
       stage: 'processing_photo',
-      progress: 15 + (i / photoUrls.length) * 20,
+      progress: 15 + (i / photoUrls.length) * 10,
       photoIndex: i,
       total: photoUrls.length,
     })
     try {
-      const img = await loadImage(photoUrls[i])
-      images.push(img)
+      images.push(await loadImage(photoUrls[i]))
     } catch (e) {
       console.warn(`Failed to load photo ${i}:`, e)
     }
@@ -113,12 +272,41 @@ export async function processMatchPhotos(
     return result
   }
 
-  // Step 4: Run OCR on all images (full-image approach)
-  onStatus({ stage: 'running_ocr', progress: 40 })
+  // Step 4: Auto-detect page types
+  onStatus({ stage: 'classifying_pages', progress: 28 })
+  let summaryImage: HTMLImageElement | null = null
+  const breakdownImages: HTMLImageElement[] = []
 
+  for (let i = 0; i < images.length; i++) {
+    onStatus({ stage: 'classifying_pages', progress: 28 + ((i / images.length) * 10) })
+    const pageType = await classifyImage(images[i])
+    console.log(`Image ${i + 1}: classified as "${pageType}"`)
+
+    if (pageType === 'summary' && !summaryImage) {
+      summaryImage = images[i]
+    } else if (pageType === 'breakdown') {
+      breakdownImages.push(images[i])
+    } else if (pageType === 'summary' && summaryImage) {
+      breakdownImages.push(images[i])
+    } else {
+      breakdownImages.push(images[i])
+    }
+  }
+
+  if (!summaryImage) {
+    summaryImage = images[0]
+    const idx = breakdownImages.indexOf(images[0])
+    if (idx >= 0) breakdownImages.splice(idx, 1)
+  }
+
+  await terminateClassifyWorker()
+  console.log(`Classification: 1 summary, ${breakdownImages.length} breakdown(s)`)
+
+  // Step 5: Summary page OCR
+  onStatus({ stage: 'running_ocr', progress: 40 })
   let summaryOcr: SummaryOcrResult | null = null
   try {
-    summaryOcr = await ocrSummaryPage(images[0])
+    summaryOcr = await ocrSummaryPage(summaryImage)
     result.mapName = summaryOcr.mapName
     result.score = summaryOcr.score
     result.gameLengthSeconds = summaryOcr.gameLengthSeconds
@@ -127,106 +315,104 @@ export async function processMatchPhotos(
     result.deaths = summaryOcr.deaths
     result.ocrRaw = summaryOcr.raw
 
-    // Derive result from score (primary method)
-    // Falls back to OCR-based detection if score isn't available
     const scoreResult = resultFromScore(result.score)
     if (scoreResult) {
       result.result = scoreResult
-      console.log(`Result derived from score "${result.score}": ${scoreResult}`)
     } else {
       result.result = summaryOcr.result
-      console.log(`Result from OCR fallback: ${result.result}`)
     }
-
-    console.log('OCR results:', {
-      map: result.mapName, result: result.result,
-      score: result.score, elims: result.eliminations,
-    })
   } catch (e) {
     console.warn('Summary OCR failed:', e)
   }
 
-  // Step 5: Run hero matching via Web Worker (with role filter)
-  onStatus({ stage: 'matching_heroes', progress: 60 })
-
+  // Step 6: Hero matching on summary page
+  onStatus({ stage: 'matching_heroes', progress: 55 })
   const allHeroMatches = new Map<string, { score: number; source: 'image' | 'ocr' | 'both' }>()
   let detectedCorrectedRole: RoleType | null = null
 
   if (opencvAvailable) {
-    // Summary page hero detection (with role filter)
     try {
-      const summaryHeroes = await detectAndMatchHeroes(images[0], 'summary', true, roleFilter)
+      const summaryHeroes = await detectAndMatchHeroes(summaryImage, 'summary', true, roleFilter)
       for (const match of summaryHeroes) {
         allHeroMatches.set(match.heroName, { score: match.score, source: 'image' })
-        // If any hero triggered auto-correct, capture the corrected role
         if (match.correctedRole && !detectedCorrectedRole) {
           detectedCorrectedRole = match.correctedRole
-          console.log(`Role auto-correct triggered: ${roleFilter} → ${match.correctedRole} (from hero ${match.heroName})`)
         }
       }
     } catch (e) {
       console.warn('Summary hero detection failed:', e)
     }
-
-    // Breakdown page hero detection (with role filter)
-    for (let i = 1; i < images.length; i++) {
-      onStatus({ stage: 'matching_heroes', progress: 60 + ((i / images.length) * 30) })
-      try {
-        const breakdownHeroes = await detectAndMatchHeroes(images[i], 'breakdown', true, roleFilter)
-        for (const match of breakdownHeroes) {
-          const existing = allHeroMatches.get(match.heroName)
-          if (existing) {
-            existing.source = 'both'
-            existing.score = Math.max(existing.score, match.score)
-          } else {
-            allHeroMatches.set(match.heroName, { score: match.score, source: 'image' })
-          }
-          // Capture auto-correct from breakdown pages too
-          if (match.correctedRole && !detectedCorrectedRole) {
-            detectedCorrectedRole = match.correctedRole
-            console.log(`Role auto-correct triggered: ${roleFilter} → ${match.correctedRole} (from hero ${match.heroName})`)
-          }
-        }
-      } catch (e) {
-        console.warn(`Breakdown hero detection failed for image ${i}:`, e)
-      }
-    }
-  } else {
-    console.warn('OpenCV not available — using OCR-only hero detection')
   }
 
-  // Add OCR hero names
   if (summaryOcr?.heroNames) {
     for (const ocrHero of summaryOcr.heroNames) {
       const existing = allHeroMatches.get(ocrHero)
-      if (existing) {
-        existing.source = 'both'
-      } else {
-        allHeroMatches.set(ocrHero, { score: 0.5, source: 'ocr' })
-      }
+      if (existing) existing.source = 'both'
+      else allHeroMatches.set(ocrHero, { score: 0.5, source: 'ocr' })
     }
   }
 
-  // Convert to sorted array, filter by confidence threshold
-  // Threshold 0.13: keeps all validated correct matches (lowest was 0.14)
-  // while filtering false positives (highest was 0.10)
   const HERO_CONFIDENCE_THRESHOLD = 0.13
-
   result.heroes = Array.from(allHeroMatches.entries())
     .map(([name, data]) => ({ name, confidence: data.score, source: data.source }))
     .filter(h => h.confidence >= HERO_CONFIDENCE_THRESHOLD || h.source === 'ocr')
     .sort((a, b) => b.confidence - a.confidence)
     .slice(0, 3)
 
-  // Set corrected role if auto-correct was triggered
   result.correctedRole = detectedCorrectedRole
+  const summaryHeroNames = new Set(result.heroes.map(h => h.name))
+  console.log(`Summary heroes: [${Array.from(summaryHeroNames).join(', ')}]`)
 
-  // Clean up
+  // Step 7: Assignment by elimination + catalog-driven OCR
+  if (breakdownImages.length > 0 && opencvAvailable) {
+    onStatus({ stage: 'reading_breakdowns', progress: 65 })
+
+    const knownHeroes = Array.from(summaryHeroNames)
+    const assignments = await assignBreakdownsToHeroes(
+      breakdownImages, knownHeroes, opencvAvailable,
+    )
+
+    for (const assignment of assignments) {
+      onStatus({
+        stage: 'reading_breakdowns',
+        progress: 75 + ((assignments.indexOf(assignment) / assignments.length) * 20),
+      })
+
+      try {
+        const breakdown = await ocrBreakdownPage(
+          breakdownImages[assignment.imageIndex],
+          assignment.heroName,
+        )
+
+        result.heroBreakdowns.push({
+          heroName: breakdown.heroName,
+          percentPlayed: breakdown.percentPlayed,
+          playTimeSeconds: breakdown.playTimeSeconds,
+          stats: breakdown.stats,
+          expectedStatCount: breakdown.expectedStatCount,
+          foundStatCount: breakdown.foundStatCount,
+          matchedToSummary: true,
+        })
+      } catch (e) {
+        console.warn(`Breakdown OCR failed for ${assignment.heroName}:`, e)
+      }
+    }
+
+    // Coverage check
+    const breakdownHeroNames = new Set(result.heroBreakdowns.map(b => b.heroName))
+    for (const hero of summaryHeroNames) {
+      if (!breakdownHeroNames.has(hero)) {
+        console.warn(`COVERAGE GAP: "${hero}" detected on summary but no breakdown assigned`)
+      }
+    }
+  }
+
+  // Cleanup
   await terminateOcr()
+  await terminateBreakdownOcr()
 
   result.processingTimeMs = Date.now() - startTime
   onStatus({ stage: 'complete', progress: 100 })
-
   return result
 }
 
