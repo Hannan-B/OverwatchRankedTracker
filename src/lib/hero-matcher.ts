@@ -263,8 +263,18 @@ export async function matchHero(
   portraitData: { data: number[]; width: number; height: number },
   useOrb: boolean,
   roleFilter?: RoleType,
+  candidateNames?: string[],
 ): Promise<MatchResult> {
   const allEntries = Array.from(heroBank.entries())
+
+  // If specific candidate names provided (e.g. from summary page),
+  // match only against those — fastest path, no sanity check needed
+  if (candidateNames && candidateNames.length > 0) {
+    const candidates = allEntries.filter(([name]) => candidateNames.includes(name))
+    console.log(`Candidate filter: [${candidateNames.join(', ')}] → ${candidates.length} heroes`)
+    const result = await matchAgainstCandidates(portraitData, candidates, useOrb)
+    return result
+  }
 
   // If no role filter, match against all heroes (original behaviour)
   if (!roleFilter) {
@@ -327,6 +337,7 @@ export async function detectAndMatchHeroes(
   pageType: 'summary' | 'breakdown',
   opencvAvailable: boolean,
   roleFilter?: RoleType,
+  candidateNames?: string[],
 ): Promise<MatchResult[]> {
   await loadHeroBank()
 
@@ -349,10 +360,10 @@ export async function detectAndMatchHeroes(
 
   console.log(`Detected ${portraits.length} portrait(s) on ${pageType} page`)
 
-  // Match each portrait (with role filter + sanity check)
+  // Match each portrait
   const results: MatchResult[] = []
   for (const portrait of portraits) {
-    const result = await matchHero(portrait, true, roleFilter)
+    const result = await matchHero(portrait, true, roleFilter, candidateNames)
     console.log(`Matched: ${result.heroName} (score: ${result.score.toFixed(4)}, margin: ${result.margin.toFixed(4)}${result.correctedRole ? `, ROLE CORRECTED → ${result.correctedRole}` : ''})`)
     results.push(result)
   }

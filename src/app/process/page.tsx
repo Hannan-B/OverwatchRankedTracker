@@ -29,8 +29,10 @@ const STATUS_MESSAGES: Record<string, string> = {
   loading_opencv: 'Loading image recognition engine...',
   loading_heroes: 'Loading hero bank (51 heroes)...',
   processing_photo: 'Loading photos...',
+  classifying_pages: 'Detecting page types...',
   running_ocr: 'Reading text from screenshots...',
   matching_heroes: 'Identifying heroes...',
+  reading_breakdowns: 'Extracting hero stats...',
   complete: 'Processing complete!',
 }
 
@@ -109,7 +111,6 @@ export default function ProcessPage() {
     setErrorMsg(null)
 
     try {
-      // Pass the role filter from metadata into processing
       const result = await processMatchPhotos(
         batch.photoUrls,
         (status) => setProcessingStatus(status),
@@ -118,11 +119,7 @@ export default function ProcessPage() {
 
       setProcessedResult(result)
       console.log('Processing result:', result)
-      if (result.correctedRole) {
-        console.log(`Role was auto-corrected: ${batch.metadata.role_played} → ${result.correctedRole}`)
-      }
 
-      // Auto-save to database
       setPageState('saving')
       await saveMatch(batch, result)
       setPageState('done')
@@ -137,15 +134,11 @@ export default function ProcessPage() {
   async function saveMatch(batch: PendingBatch, processed: ProcessedMatch) {
     const meta = batch.metadata
     const gameMode = processed.mapName ? getGameModeForMap(processed.mapName) : null
-
-    // Use corrected role if auto-correct fired, otherwise use what the user selected
     const finalRole = processed.correctedRole || meta.role_played
 
-    // Get season
     const { data: seasonId } = await supabase
       .rpc('get_season_for_date', { match_date: new Date().toISOString() })
 
-    // Insert match
     const { data: match, error: matchError } = await supabase
       .from('matches')
       .insert({
@@ -171,20 +164,61 @@ export default function ProcessPage() {
 
     if (matchError) throw matchError
 
-    // Insert hero performances
     if (match && processed.heroes.length > 0) {
-      const heroInserts = processed.heroes.map((hero, i) => ({
-        match_id: match.id,
-        hero_name: hero.name,
-        display_order: i + 1,
-      }))
-      const { error: heroError } = await supabase
+      const heroInserts = processed.heroes.map((hero, i) => {
+        const breakdown = processed.heroBreakdowns.find(b => b.heroName === hero.name)
+        return {
+          match_id: match.id,
+          hero_name: hero.name,
+          percent_played: breakdown?.percentPlayed ?? null,
+          play_time_seconds: breakdown?.playTimeSeconds ?? null,
+          display_order: i + 1,
+        }
+      })
+
+      const { data: heroPerfs, error: heroError } = await supabase
         .from('hero_performances')
         .insert(heroInserts)
+        .select('id, hero_name')
+
       if (heroError) throw heroError
+
+      if (heroPerfs && processed.heroBreakdowns.length > 0) {
+        const allStatInserts: {
+          hero_performance_id: number
+          stat_name: string
+          stat_value: string
+          avg_per_10_min: string | null
+        }[] = []
+
+        for (const perf of heroPerfs) {
+          const breakdown = processed.heroBreakdowns.find(b => b.heroName === perf.hero_name)
+          if (!breakdown) continue
+
+          for (const stat of breakdown.stats) {
+            allStatInserts.push({
+              hero_performance_id: perf.id,
+              stat_name: stat.statName,
+              stat_value: stat.statValue,
+              avg_per_10_min: stat.avgPer10Min,
+            })
+          }
+        }
+
+        if (allStatInserts.length > 0) {
+          const { error: statsError } = await supabase
+            .from('hero_stats')
+            .insert(allStatInserts)
+
+          if (statsError) {
+            console.warn('Failed to save hero stats:', statsError)
+          } else {
+            console.log(`Saved ${allStatInserts.length} hero stats to database`)
+          }
+        }
+      }
     }
 
-    // Clean up storage
     const allPaths = [
       `pending/${batch.batchId}/metadata.json`,
       ...batch.photoPaths,
@@ -202,6 +236,8 @@ export default function ProcessPage() {
 
   // ======================== DONE ========================
   if (pageState === 'done' && processedResult) {
+    const totalStats = processedResult.heroBreakdowns.reduce((sum, b) => sum + b.stats.length, 0)
+
     return (
       <div className="max-w-3xl mx-auto space-y-4">
         <div className="bg-ow-victory/10 border border-ow-victory/30 rounded-lg p-8 text-center">
@@ -209,10 +245,10 @@ export default function ProcessPage() {
           <p className="text-ow-victory font-display text-xl font-bold">MATCH SAVED</p>
           <p className="text-slate-400 text-sm mt-1">
             Processed in {(processedResult.processingTimeMs / 1000).toFixed(1)}s
+            {totalStats > 0 && ` · ${totalStats} hero stats extracted`}
           </p>
         </div>
 
-        {/* Role auto-correct notification */}
         {processedResult.correctedRole && currentBatch && (
           <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg px-5 py-4">
             <p className="text-ow-orange font-display font-bold text-sm">ROLE AUTO-CORRECTED</p>
@@ -224,9 +260,9 @@ export default function ProcessPage() {
           </div>
         )}
 
-        {/* Summary of what was extracted */}
+        {/* Summary extraction */}
         <div className="bg-ow-panel rounded-lg p-5 border border-white/5 space-y-3">
-          <p className="text-xs text-slate-400 font-display tracking-wider">EXTRACTED DATA</p>
+          <p className="text-xs text-slate-400 font-display tracking-wider">MATCH SUMMARY</p>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center">
             <div>
               <p className="text-xs text-slate-500">MAP</p>
@@ -252,22 +288,62 @@ export default function ProcessPage() {
               </p>
             </div>
           </div>
-          {processedResult.heroes.length > 0 && (
-            <div>
-              <p className="text-xs text-slate-500 mb-1">HEROES</p>
-              <div className="flex gap-2">
-                {processedResult.heroes.map((h, i) => (
-                  <span key={i} className="bg-ow-dark px-3 py-1.5 rounded text-sm text-white font-display">
-                    {h.name}
-                    <span className="text-xs text-slate-500 ml-1">
-                      ({h.source === 'both' ? '✓✓' : h.source === 'image' ? '📷' : '📝'})
-                    </span>
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
         </div>
+
+        {/* Hero breakdowns */}
+        {processedResult.heroBreakdowns.map((breakdown, i) => (
+          <div key={i} className="bg-ow-panel rounded-lg p-5 border border-white/5 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <p className="text-white font-display font-bold text-lg">{breakdown.heroName}</p>
+                {breakdown.percentPlayed !== null && (
+                  <span className="bg-ow-dark px-2 py-1 rounded text-xs text-slate-300 font-display">
+                    {breakdown.percentPlayed}%
+                  </span>
+                )}
+                {breakdown.playTimeSeconds !== null && (
+                  <span className="bg-ow-dark px-2 py-1 rounded text-xs text-slate-400">
+                    {Math.floor(breakdown.playTimeSeconds / 60)}:{String(breakdown.playTimeSeconds % 60).padStart(2, '0')}
+                  </span>
+                )}
+              </div>
+              {!breakdown.matchedToSummary && (
+                <span className="text-xs text-ow-orange bg-ow-orange/10 px-2 py-1 rounded font-display">
+                  NOT IN SUMMARY
+                </span>
+              )}
+              <span className={`text-xs px-2 py-1 rounded font-display ${
+                breakdown.foundStatCount === breakdown.expectedStatCount
+                  ? 'text-ow-victory bg-ow-victory/10'
+                  : 'text-ow-orange bg-ow-orange/10'
+              }`}>
+                {breakdown.foundStatCount}/{breakdown.expectedStatCount} STATS
+              </span>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
+              {breakdown.stats.map((stat, j) => (
+                <div key={j} className="bg-ow-dark rounded-lg px-3 py-2.5 border border-white/5">
+                  <p className="text-white text-lg font-display font-bold">{stat.statValue}</p>
+                  <p className="text-xs text-slate-400 leading-tight">{stat.statName}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+
+        {/* Heroes without breakdowns */}
+        {processedResult.heroes.length > 0 && processedResult.heroBreakdowns.length === 0 && (
+          <div className="bg-ow-panel rounded-lg p-5 border border-white/5">
+            <p className="text-xs text-slate-400 font-display tracking-wider mb-2">HEROES DETECTED</p>
+            <div className="flex gap-2">
+              {processedResult.heroes.map((h, i) => (
+                <span key={i} className="bg-ow-dark px-3 py-1.5 rounded text-sm text-white font-display">
+                  {h.name}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
 
         <div className="flex justify-center gap-3">
           <button onClick={handleDone}
@@ -312,15 +388,13 @@ export default function ProcessPage() {
 
   // ======================== PROCESSING / SAVING ========================
   if (pageState === 'processing' || pageState === 'saving') {
-    const progress = pageState === 'saving' ? 95 : (processingStatus?.progress || 0)
+    const progress = pageState === 'saving' ? 97 : (processingStatus?.progress || 0)
     const stage = processingStatus?.stage || 'loading_opencv'
 
-    // Update status message to reflect role filtering
     let message = pageState === 'saving'
       ? 'Saving to database...'
       : STATUS_MESSAGES[stage] || 'Processing...'
 
-    // Show filtered hero count when matching
     if (stage === 'matching_heroes' && currentBatch) {
       message = `Identifying heroes (${currentBatch.metadata.role_played} first)...`
     }
@@ -330,8 +404,6 @@ export default function ProcessPage() {
         <div className="bg-ow-panel rounded-lg p-12 text-center border border-white/5">
           <div className="w-12 h-12 border-3 border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-6" />
           <p className="text-white font-display text-lg">{message}</p>
-
-          {/* Progress bar */}
           <div className="mt-6 bg-ow-dark rounded-full h-2 overflow-hidden max-w-sm mx-auto">
             <div
               className="h-full bg-ow-orange transition-all duration-500 rounded-full"
