@@ -685,7 +685,7 @@ async function getTesseractWorker(): Promise<Tesseract.Worker> {
     tesseractWorker = await Tesseract.createWorker('eng')
     await tesseractWorker.setParameters({
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
-      tessedit_pageseg_mode: '7', // single text line
+      tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE, // single text line
     })
   }
   return tesseractWorker
