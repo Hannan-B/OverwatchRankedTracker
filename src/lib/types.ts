@@ -83,6 +83,24 @@ export interface UserSettings {
   updated_at: string
 }
 
+export interface ScoreboardPlayer {
+  id: number
+  match_id: number
+  slot: number
+  team: 'ally' | 'enemy'
+  hero_name: string | null
+  role: RoleType | null
+  is_user: boolean
+  user_match_method: 'ocr_auto' | 'ocr_confirmed' | 'manual_select' | 'hero_match' | null
+  eliminations: number | null
+  assists: number | null
+  deaths: number | null
+  damage: number | null
+  healing: number | null
+  mitigation: number | null
+  created_at: string
+}
+
 // ============================================================
 // VIEW TYPES — for dashboard queries
 // ============================================================
@@ -161,4 +179,108 @@ export interface HeroStatFormData {
   stat_name: string
   stat_value: string
   avg_per_10_min: string | null
+}
+
+// ============================================================
+// SCOREBOARD EXTRACTION TYPES
+// ============================================================
+
+/** Grid row layout extracted during scoreboard detection */
+export interface ScoreboardGridRow {
+  slot: number          // 1-5 ally, 6-10 enemy
+  team: 'ally' | 'enemy'
+  topY: number
+  centerY: number
+  bottomY: number
+}
+
+/** Full grid layout for a scoreboard image */
+export interface ScoreboardGrid {
+  ally: { startY: number; endY: number; rowHeight: number }
+  enemy: { startY: number; endY: number; rowHeight: number }
+  rows: ScoreboardGridRow[]
+  columns: {
+    roleIcon:  { x: number }
+    portrait:  { startX: number; endX: number }
+    username:  { startX: number; endX: number }
+    E:   { startX: number; endX: number; centerX: number }
+    A:   { startX: number; endX: number; centerX: number }
+    D:   { startX: number; endX: number; centerX: number }
+    DMG: { startX: number; endX: number; centerX: number }
+    H:   { startX: number; endX: number; centerX: number }
+    MIT: { startX: number; endX: number; centerX: number }
+  }
+}
+
+/** Step 1 — Is this image a scoreboard? */
+export interface ScoreboardDetectionResult {
+  imageType: 'scoreboard' | 'summary' | 'breakdown' | 'unknown'
+  confidence: number
+  signals: string[]
+  grid: ScoreboardGrid | null
+}
+
+/** Step 2 — Which hero is in each row? */
+export interface ScoreboardHeroIdentification {
+  slot: number        // 1-5 ally, 6-10 enemy
+  team: 'ally' | 'enemy'
+  heroName: string | null
+  confidence: number
+  portraitDataUrl: string | null // cropped portrait thumbnail
+}
+
+/** Step 3 — Which player is the user? */
+export interface ScoreboardPlayerLabel {
+  slot: number
+  team: 'ally' | 'enemy'
+  heroName: string | null
+  isUser: boolean
+  userMatchMethod: 'ocr_auto' | 'ocr_confirmed' | 'manual_select' | 'hero_match' | null
+  positionalLabel: string | null  // e.g. "Ally DPS 1", "Enemy Support 2"
+  displayName: string | null      // gamertag for user, positionalLabel for others
+}
+
+/** User identification candidate (one per ally slot) */
+export interface ScoreboardUserCandidate {
+  slot: number
+  heroName: string | null
+  heroPortraitUrl: string | null  // 64×64 hero portrait thumbnail
+  gamertagCropUrl: string | null  // raw gamertag crop from scoreboard
+  ocrSimilarity: number
+}
+
+/** OCR analysis result — may need manual confirmation */
+export interface ScoreboardOcrAnalysis {
+  resolved: boolean               // true = Tier 1 auto-accepted
+  userSlot: number | null         // set when resolved
+  bestCandidate: {
+    slot: number
+    similarity: number
+    margin: number
+  }
+  candidates: ScoreboardUserCandidate[]     // all 5 ally slots
+}
+
+/** Step 4 — What role is each player? */
+export interface ScoreboardRoleClassification {
+  slot: number
+  team: 'ally' | 'enemy'
+  heroName: string | null
+  role: 'tank' | 'dps' | 'support' | null
+  source: 'hero_lookup' | 'icon_detection' | null
+}
+
+/** Step 5 — What are the stats for each player? */
+export interface ScoreboardPlayerStats {
+  slot: number
+  team: 'ally' | 'enemy'
+  heroName: string | null
+  role: 'tank' | 'dps' | 'support' | null
+  isUser: boolean
+  eliminations: number | null
+  assists: number | null
+  deaths: number | null
+  damage: number | null
+  healing: number | null
+  mitigation: number | null
 }

@@ -1,9 +1,10 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
-import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus } from '@/lib/image-processor'
+import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus, type ScoreboardResult } from '@/lib/image-processor'
+import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
 import { getGameModeForMap, needsStartingSide } from '@/data/reference'
 import type { RoleType, MatchFeel, PerformanceFeel, NotableEvent } from '@/lib/types'
 
@@ -23,7 +24,7 @@ interface PendingBatch {
   photoPaths: string[]
 }
 
-type PageState = 'scanning' | 'idle' | 'processing' | 'saving' | 'done' | 'error'
+type PageState = 'scanning' | 'idle' | 'processing' | 'confirming' | 'saving' | 'done' | 'error'
 
 const STATUS_MESSAGES: Record<string, string> = {
   loading_opencv: 'Loading image recognition engine...',
@@ -33,6 +34,7 @@ const STATUS_MESSAGES: Record<string, string> = {
   running_ocr: 'Reading text from screenshots...',
   matching_heroes: 'Identifying heroes...',
   reading_breakdowns: 'Extracting hero stats...',
+  reading_scoreboard: 'Reading scoreboard data...',
   complete: 'Processing complete!',
 }
 
@@ -44,6 +46,23 @@ export default function ProcessPage() {
   const [processedResult, setProcessedResult] = useState<ProcessedMatch | null>(null)
   const [currentBatch, setCurrentBatch] = useState<PendingBatch | null>(null)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  const [gamertag, setGamertag] = useState<string>('')
+  const [confirmStep, setConfirmStep] = useState<'confirm' | 'select'>('confirm')
+
+  // Fetch gamertag from user_settings on mount
+  useEffect(() => {
+    async function loadGamertag() {
+      const { data } = await supabase
+        .from('user_settings')
+        .select('gamertag')
+        .limit(1)
+        .single()
+      if (data?.gamertag) {
+        setGamertag(data.gamertag)
+      }
+    }
+    loadGamertag()
+  }, [])
 
   useEffect(() => { scanForBatches() }, [])
 
@@ -115,11 +134,20 @@ export default function ProcessPage() {
         batch.photoUrls,
         (status) => setProcessingStatus(status),
         batch.metadata.role_played,
+        gamertag || undefined,
       )
 
       setProcessedResult(result)
       console.log('Processing result:', result)
 
+      // Check if scoreboard needs user confirmation
+      if (result.scoreboard?.ocrAnalysis && !result.scoreboard.ocrAnalysis.resolved) {
+        setConfirmStep('confirm')
+        setPageState('confirming')
+        return
+      }
+
+      // No confirmation needed — save directly
       setPageState('saving')
       await saveMatch(batch, result)
       setPageState('done')
@@ -130,6 +158,80 @@ export default function ProcessPage() {
       setPageState('error')
     }
   }
+
+  // Handle user confirming the OCR suggestion
+  const handleConfirmUser = useCallback((slot: number) => {
+    if (!processedResult?.scoreboard || !currentBatch) return
+
+    const sb = processedResult.scoreboard
+    const updatedPlayers = buildPlayerLabels(
+      sb.heroes, sb.roles, gamertag, slot, 'ocr_confirmed',
+    )
+
+    const updatedResult: ProcessedMatch = {
+      ...processedResult,
+      scoreboard: {
+        ...sb,
+        players: updatedPlayers,
+        ocrAnalysis: { ...sb.ocrAnalysis, resolved: true, userSlot: slot },
+      },
+    }
+
+    setProcessedResult(updatedResult)
+    setPageState('saving')
+    saveMatch(currentBatch, updatedResult)
+      .then(() => setPageState('done'))
+      .catch((err) => {
+        setErrorMsg(err.message || 'Save failed')
+        setPageState('error')
+      })
+  }, [processedResult, currentBatch, gamertag])
+
+  // Handle user selecting from all 5 options
+  const handleSelectUser = useCallback((slot: number) => {
+    if (!processedResult?.scoreboard || !currentBatch) return
+
+    const sb = processedResult.scoreboard
+    const updatedPlayers = buildPlayerLabels(
+      sb.heroes, sb.roles, gamertag, slot, 'manual_select',
+    )
+
+    const updatedResult: ProcessedMatch = {
+      ...processedResult,
+      scoreboard: {
+        ...sb,
+        players: updatedPlayers,
+        ocrAnalysis: { ...sb.ocrAnalysis, resolved: true, userSlot: slot },
+      },
+    }
+
+    setProcessedResult(updatedResult)
+    setPageState('saving')
+    saveMatch(currentBatch, updatedResult)
+      .then(() => setPageState('done'))
+      .catch((err) => {
+        setErrorMsg(err.message || 'Save failed')
+        setPageState('error')
+      })
+  }, [processedResult, currentBatch, gamertag])
+
+  // Decline → show all 5 options
+  const handleDeclineConfirm = useCallback(() => {
+    setConfirmStep('select')
+  }, [])
+
+  // Skip user identification entirely — save without marking any player as user
+  const handleSkipConfirm = useCallback(() => {
+    if (!processedResult || !currentBatch) return
+
+    setPageState('saving')
+    saveMatch(currentBatch, processedResult)
+      .then(() => setPageState('done'))
+      .catch((err) => {
+        setErrorMsg(err.message || 'Save failed')
+        setPageState('error')
+      })
+  }, [processedResult, currentBatch])
 
   async function saveMatch(batch: PendingBatch, processed: ProcessedMatch) {
     const meta = batch.metadata
@@ -164,6 +266,7 @@ export default function ProcessPage() {
 
     if (matchError) throw matchError
 
+    // Save hero performances + stats (existing logic)
     if (match && processed.heroes.length > 0) {
       const heroInserts = processed.heroes.map((hero, i) => {
         const breakdown = processed.heroBreakdowns.find(b => b.heroName === hero.name)
@@ -219,6 +322,40 @@ export default function ProcessPage() {
       }
     }
 
+    // Save scoreboard players (10 rows)
+    if (match && processed.scoreboard) {
+      const sb = processed.scoreboard
+      const scoreboardInserts = sb.stats.map(s => {
+        const player = sb.players.find(p => p.slot === s.slot)
+        return {
+          match_id: match.id,
+          slot: s.slot,
+          team: s.team,
+          hero_name: s.heroName,
+          role: s.role,
+          is_user: player?.isUser ?? false,
+          user_match_method: player?.userMatchMethod ?? null,
+          eliminations: s.eliminations,
+          assists: s.assists,
+          deaths: s.deaths,
+          damage: s.damage,
+          healing: s.healing,
+          mitigation: s.mitigation,
+        }
+      })
+
+      const { error: sbError } = await supabase
+        .from('scoreboard_players')
+        .insert(scoreboardInserts)
+
+      if (sbError) {
+        console.warn('Failed to save scoreboard players:', sbError)
+      } else {
+        console.log(`Saved ${scoreboardInserts.length} scoreboard players to database`)
+      }
+    }
+
+    // Clean up pending files
     const allPaths = [
       `pending/${batch.batchId}/metadata.json`,
       ...batch.photoPaths,
@@ -234,9 +371,140 @@ export default function ProcessPage() {
     scanForBatches()
   }
 
+  // ======================== CONFIRMING (Scoreboard User ID) ========================
+  if (pageState === 'confirming' && processedResult?.scoreboard) {
+    const sb = processedResult.scoreboard
+    const analysis = sb.ocrAnalysis
+    const bestCandidate = analysis.candidates.find(
+      c => c.slot === analysis.bestCandidate.slot
+    )
+
+    if (confirmStep === 'confirm' && bestCandidate) {
+      return (
+        <div className="max-w-3xl mx-auto space-y-4">
+          <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg p-8">
+            <p className="text-ow-orange font-display font-bold text-lg mb-1">
+              IS THIS YOU?
+            </p>
+            <p className="text-slate-400 text-xs mb-5">
+              OCR wasn&apos;t confident enough to auto-identify your player
+              ({(analysis.bestCandidate.similarity * 100).toFixed(0)}% similarity,
+              {(analysis.bestCandidate.margin * 100).toFixed(0)}% margin).
+            </p>
+
+            <div className="flex items-center gap-4 bg-ow-dark rounded-lg p-4 mb-5 border border-white/5">
+              {bestCandidate.heroPortraitUrl && (
+                <img
+                  src={bestCandidate.heroPortraitUrl}
+                  alt=""
+                  className="w-14 h-14 rounded border border-white/10"
+                />
+              )}
+              <div className="flex-1 min-w-0">
+                {bestCandidate.gamertagCropUrl && (
+                  <img
+                    src={bestCandidate.gamertagCropUrl}
+                    alt=""
+                    className="h-8 rounded mb-1"
+                    style={{ imageRendering: 'auto' }}
+                  />
+                )}
+                <p className="text-xs text-slate-500">
+                  Slot {bestCandidate.slot} · {bestCandidate.heroName || 'Unknown hero'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex gap-3">
+              <button
+                onClick={() => handleConfirmUser(bestCandidate.slot)}
+                className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
+                           px-5 py-2.5 rounded-lg tracking-wider text-sm transition-colors"
+              >
+                YES, THAT&apos;S ME
+              </button>
+              <button
+                onClick={handleDeclineConfirm}
+                className="bg-ow-panel border border-white/10 text-white font-display
+                           px-5 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors"
+              >
+                NO, SHOW ALL
+              </button>
+              <button
+                onClick={handleSkipConfirm}
+                className="text-slate-500 hover:text-slate-300 font-display
+                           px-4 py-2.5 text-sm tracking-wider transition-colors"
+              >
+                SKIP
+              </button>
+            </div>
+          </div>
+        </div>
+      )
+    }
+
+    // confirmStep === 'select' — show all 5 ally candidates
+    return (
+      <div className="max-w-3xl mx-auto space-y-4">
+        <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg p-8">
+          <p className="text-ow-orange font-display font-bold text-lg mb-1">
+            WHICH ONE IS YOU?
+          </p>
+          <p className="text-slate-400 text-xs mb-5">
+            Select your player from the ally team.
+          </p>
+
+          <div className="space-y-2">
+            {analysis.candidates.map(candidate => (
+              <button
+                key={candidate.slot}
+                onClick={() => handleSelectUser(candidate.slot)}
+                className="w-full flex items-center gap-4 bg-ow-dark hover:bg-ow-dark/80 rounded-lg p-3
+                           transition-colors text-left border border-white/5 hover:border-ow-orange/30"
+              >
+                {candidate.heroPortraitUrl && (
+                  <img
+                    src={candidate.heroPortraitUrl}
+                    alt=""
+                    className="w-12 h-12 rounded border border-white/10 flex-shrink-0"
+                  />
+                )}
+                <div className="flex-1 min-w-0">
+                  {candidate.gamertagCropUrl && (
+                    <img
+                      src={candidate.gamertagCropUrl}
+                      alt=""
+                      className="h-7 rounded mb-1"
+                      style={{ imageRendering: 'auto' }}
+                    />
+                  )}
+                  <p className="text-xs text-slate-500">
+                    Slot {candidate.slot} · {candidate.heroName || 'Unknown hero'}
+                  </p>
+                </div>
+                <span className="text-xs font-mono text-slate-600">
+                  {(candidate.ocrSimilarity * 100).toFixed(0)}%
+                </span>
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={handleSkipConfirm}
+            className="mt-4 text-slate-500 hover:text-slate-300 font-display
+                       text-sm tracking-wider transition-colors"
+          >
+            SKIP — SAVE WITHOUT USER ID
+          </button>
+        </div>
+      </div>
+    )
+  }
+
   // ======================== DONE ========================
   if (pageState === 'done' && processedResult) {
     const totalStats = processedResult.heroBreakdowns.reduce((sum, b) => sum + b.stats.length, 0)
+    const sb = processedResult.scoreboard
 
     return (
       <div className="max-w-3xl mx-auto space-y-4">
@@ -246,6 +514,7 @@ export default function ProcessPage() {
           <p className="text-slate-400 text-sm mt-1">
             Processed in {(processedResult.processingTimeMs / 1000).toFixed(1)}s
             {totalStats > 0 && ` · ${totalStats} hero stats extracted`}
+            {sb && ` · scoreboard saved`}
           </p>
         </div>
 
@@ -341,6 +610,119 @@ export default function ProcessPage() {
                   {h.name}
                 </span>
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* Scoreboard data */}
+        {sb && (
+          <div className="bg-ow-panel rounded-lg p-5 border border-white/5 space-y-4">
+            <div className="flex items-center justify-between">
+              <p className="text-xs text-slate-400 font-display tracking-wider">SCOREBOARD</p>
+              <span className="text-xs text-slate-500 font-display">
+                {sb.heroes.filter(h => h.heroName).length}/10 heroes
+                {' · '}
+                {sb.stats.filter(s => s.eliminations !== null).length}/10 stats
+              </span>
+            </div>
+
+            {/* Ally team */}
+            <div>
+              <p className="text-[10px] text-blue-400 font-display tracking-wider uppercase mb-2">Ally Team</p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/5">
+                      <th className="text-left py-1.5 px-2 font-medium">Player</th>
+                      <th className="text-left py-1.5 px-2 font-medium">Hero</th>
+                      <th className="text-left py-1.5 px-2 font-medium">Role</th>
+                      <th className="text-right py-1.5 px-2 font-medium">E</th>
+                      <th className="text-right py-1.5 px-2 font-medium">A</th>
+                      <th className="text-right py-1.5 px-2 font-medium">D</th>
+                      <th className="text-right py-1.5 px-2 font-medium">DMG</th>
+                      <th className="text-right py-1.5 px-2 font-medium">H</th>
+                      <th className="text-right py-1.5 px-2 font-medium">MIT</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sb.stats.filter(s => s.team === 'ally').map(s => {
+                      const player = sb.players.find(p => p.slot === s.slot)
+                      return (
+                        <tr
+                          key={s.slot}
+                          className={`border-b border-white/5 ${player?.isUser ? 'bg-ow-orange/5' : ''}`}
+                        >
+                          <td className={`py-1.5 px-2 font-display ${player?.isUser ? 'text-ow-orange font-bold' : 'text-slate-300'}`}>
+                            {player?.displayName || `Ally ${s.slot}`}
+                          </td>
+                          <td className="py-1.5 px-2 text-slate-300">{s.heroName || '—'}</td>
+                          <td className={`py-1.5 px-2 uppercase font-display text-[10px] font-bold ${
+                            s.role === 'tank' ? 'text-blue-300' :
+                            s.role === 'dps' ? 'text-red-300' :
+                            s.role === 'support' ? 'text-green-300' : 'text-slate-600'
+                          }`}>
+                            {s.role || '—'}
+                          </td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.eliminations ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.assists ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.deaths ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.damage?.toLocaleString() ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.healing?.toLocaleString() ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.mitigation?.toLocaleString() ?? '—'}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Enemy team */}
+            <div>
+              <p className="text-[10px] text-red-400 font-display tracking-wider uppercase mb-2">Enemy Team</p>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/5">
+                      <th className="text-left py-1.5 px-2 font-medium">Player</th>
+                      <th className="text-left py-1.5 px-2 font-medium">Hero</th>
+                      <th className="text-left py-1.5 px-2 font-medium">Role</th>
+                      <th className="text-right py-1.5 px-2 font-medium">E</th>
+                      <th className="text-right py-1.5 px-2 font-medium">A</th>
+                      <th className="text-right py-1.5 px-2 font-medium">D</th>
+                      <th className="text-right py-1.5 px-2 font-medium">DMG</th>
+                      <th className="text-right py-1.5 px-2 font-medium">H</th>
+                      <th className="text-right py-1.5 px-2 font-medium">MIT</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sb.stats.filter(s => s.team === 'enemy').map(s => {
+                      const player = sb.players.find(p => p.slot === s.slot)
+                      return (
+                        <tr key={s.slot} className="border-b border-white/5">
+                          <td className="py-1.5 px-2 text-slate-300 font-display">
+                            {player?.displayName || `Enemy ${s.slot - 5}`}
+                          </td>
+                          <td className="py-1.5 px-2 text-slate-300">{s.heroName || '—'}</td>
+                          <td className={`py-1.5 px-2 uppercase font-display text-[10px] font-bold ${
+                            s.role === 'tank' ? 'text-blue-300' :
+                            s.role === 'dps' ? 'text-red-300' :
+                            s.role === 'support' ? 'text-green-300' : 'text-slate-600'
+                          }`}>
+                            {s.role || '—'}
+                          </td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.eliminations ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.assists ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.deaths ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.damage?.toLocaleString() ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.healing?.toLocaleString() ?? '—'}</td>
+                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.mitigation?.toLocaleString() ?? '—'}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         )}
