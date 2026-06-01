@@ -6,6 +6,15 @@ export const metadata: Metadata = {
   title: 'OW Tracker',
   description: 'Track and analyse your Overwatch competitive matches',
   manifest: '/manifest.json',
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: 'black-translucent',
+    title: 'OW Tracker',
+  },
+  icons: {
+    icon: '/icon-192.png',
+    apple: '/icon-192.png',
+  },
 }
 
 export const viewport: Viewport = {
@@ -13,6 +22,7 @@ export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
   maximumScale: 1,
+  viewportFit: 'cover',
 }
 
 function NavLink({ href, label, icon }: { href: string; label: string; icon: string }) {
@@ -32,6 +42,19 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body className="pb-20 md:pb-0">
+        {/* Register the service worker so the app is installable on phones.
+            Inline script keeps this server-component layout unchanged otherwise. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              if ('serviceWorker' in navigator) {
+                window.addEventListener('load', function () {
+                  navigator.serviceWorker.register('/sw.js').catch(function () {});
+                });
+              }
+            `,
+          }}
+        />
         {/* Desktop top nav */}
         <nav className="hidden md:flex items-center justify-between px-6 py-3 
                         bg-ow-panel/80 backdrop-blur-sm border-b border-white/5 sticky top-0 z-50">
