@@ -328,7 +328,7 @@ function normalizeScoreDigits(scoreText: string): string {
 // MAP NAME MATCHING — fuzzy match against known maps
 // ============================================================
 
-function findMapName(upperText: string): string | null {
+export function findMapName(upperText: string): string | null {
   // Exact substring match against the canonical map list
   for (const map of MAPS) {
     if (upperText.includes(map.name.toUpperCase())) return map.name

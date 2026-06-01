@@ -2,7 +2,9 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { supabase } from '@/lib/supabase'
-import type { RoleType, MatchFeel, PerformanceFeel, NotableEvent } from '@/lib/types'
+import type { RoleType, MatchFeel, PerformanceFeel, NotableEvent, StartingSide } from '@/lib/types'
+import { detectMapFromPhotos } from '@/lib/phone-map-detect'
+import { needsStartingSide } from '@/data/reference'
 
 type UploadStep = 'questions' | 'photos' | 'uploading' | 'done'
 type FileStatus = 'idle' | 'uploading' | 'success' | 'error'
@@ -87,6 +89,18 @@ export default function UploadPage() {
   const [thoughts, setThoughts] = useState('')
   const [files, setFiles] = useState<FilePreview[]>([])
 
+  // --- Attack/Defend feature (phone-side map detection) ---
+  // detectState: 'idle' before any photos; 'detecting' while OCR runs;
+  // 'done' once we have a verdict. detectedMap is the matched map (or null).
+  // askStartingSide is true only when the detected map is hybrid/escort.
+  const [detectState, setDetectState] = useState<'idle' | 'detecting' | 'done'>('idle')
+  const [detectedMap, setDetectedMap] = useState<string | null>(null)
+  const [askStartingSide, setAskStartingSide] = useState(false)
+  const [startingSide, setStartingSide] = useState<StartingSide | null>(null)
+  // Tracks whether the user explicitly tapped "Unsure" (vs. never answered),
+  // so the question UI can show the choice as made while still storing null.
+  const [startingSideAnswered, setStartingSideAnswered] = useState(false)
+
   useEffect(() => {
     async function loadDefaults() {
       const { data } = await supabase
@@ -98,6 +112,42 @@ export default function UploadPage() {
     }
     loadDefaults()
   }, [])
+
+  // Run phone-side map detection once we're on the photos step with photos
+  // chosen. Re-runs if the set of photos changes. Detection is best-effort:
+  // if it can't read a map, we simply don't ask (the laptop still detects
+  // the map authoritatively during processing).
+  useEffect(() => {
+    if (step !== 'photos' || files.length === 0) {
+      // No photos (or not on photos step) → nothing to ask yet.
+      if (files.length === 0) {
+        setDetectState('idle')
+        setDetectedMap(null)
+        setAskStartingSide(false)
+      }
+      return
+    }
+
+    let cancelled = false
+    setDetectState('detecting')
+
+    detectMapFromPhotos(files.map(f => f.preview))
+      .then(({ mapName }) => {
+        if (cancelled) return
+        setDetectedMap(mapName)
+        setAskStartingSide(mapName ? needsStartingSide(mapName) : false)
+        setDetectState('done')
+      })
+      .catch(() => {
+        if (cancelled) return
+        setDetectedMap(null)
+        setAskStartingSide(false)
+        setDetectState('done')
+      })
+
+    return () => { cancelled = true }
+    // Re-run when the actual photo set changes (preview URLs are stable per file).
+  }, [step, files.map(f => f.preview).join('|')])
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const selected = e.target.files
@@ -161,6 +211,8 @@ export default function UploadPage() {
       notable_events: notableEvents,
       fun_rating: funRating,
       personal_thoughts: thoughts || null,
+      starting_side: startingSide,
+      detected_map: detectedMap,
       uploaded_at: new Date().toISOString(),
       photo_count: files.length,
     }
@@ -207,6 +259,11 @@ export default function UploadPage() {
     setThoughts('')
     files.forEach(f => URL.revokeObjectURL(f.preview))
     setFiles([])
+    setDetectState('idle')
+    setDetectedMap(null)
+    setAskStartingSide(false)
+    setStartingSide(null)
+    setStartingSideAnswered(false)
   }
 
   // ======================== DONE ========================
@@ -322,6 +379,53 @@ export default function UploadPage() {
                 </div>
               ))}
             </div>
+            {/* Map detection status + attack/defend question.
+                Only hybrid & escort maps need a starting side. Detection is
+                best-effort; if it fails we simply don't ask. "Unsure" stores
+                null. None of this blocks the upload. */}
+            {detectState === 'detecting' && (
+              <div className="flex items-center gap-2 text-xs text-slate-500 font-display">
+                <div className="w-3 h-3 border-2 border-ow-orange border-t-transparent rounded-full animate-spin" />
+                DETECTING MAP…
+              </div>
+            )}
+
+            {detectState === 'done' && askStartingSide && (
+              <div className="bg-ow-panel rounded-lg p-4 border border-ow-orange/30 space-y-3">
+                <div>
+                  <p className="text-sm text-white font-display tracking-wider">
+                    STARTING SIDE
+                  </p>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    <span className="text-ow-orange">{detectedMap}</span> needs a starting side — did you attack or defend first?
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {([
+                    ['attack', 'ATTACK FIRST'],
+                    ['defense', 'DEFEND FIRST'],
+                  ] as [StartingSide, string][]).map(([val, label]) => (
+                    <button key={val} type="button"
+                      onClick={() => { setStartingSide(val); setStartingSideAnswered(true) }}
+                      className={`px-4 py-2 rounded-lg text-sm font-display tracking-wider transition-all
+                        ${startingSide === val
+                          ? 'bg-ow-orange text-ow-dark font-bold'
+                          : 'bg-ow-dark text-slate-400 border border-white/10 hover:text-white hover:border-white/20'
+                        }`}
+                    >{label}</button>
+                  ))}
+                  <button type="button"
+                    onClick={() => { setStartingSide(null); setStartingSideAnswered(true) }}
+                    className={`px-4 py-2 rounded-lg text-sm font-display tracking-wider transition-all
+                      ${startingSideAnswered && startingSide === null
+                        ? 'bg-slate-600 text-white font-bold'
+                        : 'bg-ow-dark text-slate-400 border border-white/10 hover:text-white hover:border-white/20'
+                      }`}
+                  >UNSURE</button>
+                </div>
+              </div>
+            )}
+
             <button onClick={uploadAll}
               className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
                          py-3 rounded-lg tracking-wider transition-colors text-sm">

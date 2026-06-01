@@ -6,7 +6,7 @@ import { supabase } from '@/lib/supabase'
 import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus, type ScoreboardResult } from '@/lib/image-processor'
 import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
 import { getGameModeForMap, needsStartingSide } from '@/data/reference'
-import type { RoleType, MatchFeel, PerformanceFeel, NotableEvent } from '@/lib/types'
+import type { RoleType, MatchFeel, PerformanceFeel, NotableEvent, StartingSide } from '@/lib/types'
 import { buildConfirmationQuestions, type ConfirmInputs, type ConfirmationCandidate } from '@/lib/beta-confirmation'
 import { logConfirmationOutcome, logMatchSummary } from '@/lib/beta-issue-log'
 import { ConfirmationPanel, type ConfirmationResult } from '@/app/review/ConfirmationCard'
@@ -22,6 +22,8 @@ interface PendingBatch {
     notable_events: NotableEvent[]
     fun_rating: number | null
     personal_thoughts: string | null
+    starting_side?: StartingSide | null
+    detected_map?: string | null
     uploaded_at: string
     photo_count: number
   }
@@ -405,6 +407,16 @@ export default function ProcessPage() {
       ? meta.roles_played
       : [finalRole]
 
+    // starting_side: the phone asks attack/defend only on hybrid/escort maps
+    // and sends the answer in metadata. We only TRUST it if the laptop's own
+    // (authoritative) map detection agrees the map needs a starting side —
+    // this prevents a phone OCR mis-read from writing a bogus value. If the
+    // map is symmetric (control/push/flashpoint) or unknown, store null.
+    const startingSide: StartingSide | null =
+      processed.mapName && needsStartingSide(processed.mapName)
+        ? (meta.starting_side ?? null)
+        : null
+
     const { data: seasonId } = await supabase
       .rpc('get_season_for_date', { match_date: new Date().toISOString() })
 
@@ -421,7 +433,7 @@ export default function ProcessPage() {
         ally_team_comp: processed.allyComp,
         enemy_team_comp: processed.enemyComp,
         game_length_seconds: processed.gameLengthSeconds,
-        starting_side: null,
+        starting_side: startingSide,
         season_id: seasonId || null,
         total_eliminations: processed.eliminations,
         total_assists: processed.assists,
