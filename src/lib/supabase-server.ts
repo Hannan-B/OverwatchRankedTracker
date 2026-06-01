@@ -8,9 +8,15 @@ import { cookies } from 'next/headers'
 // server. It is separate from the browser client in supabase.ts on purpose:
 // the server reads cookies via next/headers, the browser reads them directly.
 //
-// You generally won't call this from your pages. It exists so the magic-link
-// callback route can complete the login on the server and set the session
+// You generally won't call this from your pages. It exists so the auth
+// callback route can complete a login on the server and set the session
 // cookie correctly.
+
+type CookieToSet = {
+  name: string
+  value: string
+  options?: Record<string, unknown>
+}
 
 export async function createSupabaseServerClient() {
   const cookieStore = await cookies()
@@ -23,7 +29,7 @@ export async function createSupabaseServerClient() {
         getAll() {
           return cookieStore.getAll()
         },
-        setAll(cookiesToSet) {
+        setAll(cookiesToSet: CookieToSet[]) {
           try {
             cookiesToSet.forEach(({ name, value, options }) =>
               cookieStore.set(name, value, options)
