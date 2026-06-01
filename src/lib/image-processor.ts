@@ -8,9 +8,15 @@
 // ============================================================
 
 import { initOpenCV, isOpenCVReady } from './opencv-loader'
-import { preloadHeroBank, detectAndMatchHeroes, matchHero } from './hero-matcher'
+import { preloadHeroBank, matchHero } from './hero-matcher'
 import { ocrSummaryPage, terminateOcr, type SummaryOcrResult } from './ocr-extractor'
-import { ocrBreakdownPage, terminateBreakdownOcr, type BreakdownOcrResult, type BreakdownStat } from './breakdown-ocr'
+import {
+  ocrBreakdownPage,
+  terminateBreakdownOcr,
+  getBreakdownPortraitLocation,
+  type BreakdownOcrResult,
+  type BreakdownStat,
+} from './breakdown-ocr'
 import {
   detectScoreboard,
   classifyRoles,
@@ -20,6 +26,7 @@ import {
   buildPlayerLabels,
   extractStats,
   terminateScoreboardOcr,
+  type SbCellConfidence,
 } from './scoreboard-extractor'
 import type { RoleType } from '@/lib/types'
 import type {
@@ -31,6 +38,134 @@ import type {
   ScoreboardPlayerStats,
 } from '@/lib/types'
 import Tesseract from 'tesseract.js'
+
+// ============================================================
+// FIXED-COORDINATE CONSTANTS (measured from 3840x2160 screenshots)
+// ============================================================
+// All values below were measured directly from the uploaded PS5 screenshots
+// (6v6: Test_3/5/9; 5v5: Test_1/4/6) and verified across every page in both
+// formats. See pixel_audit_6aiii_MEASURED.md for the full derivation.
+//
+// Guiding principle: UI elements sit at FIXED pixel locations. We locate
+// portraits and tabs by these fixed coordinates, never by detecting the
+// orange play-time ring (whose arc length varies with how long a hero was
+// played — a 30-second hero is a tiny sliver and cannot be located by it).
+
+// Native resolution these coordinates are defined in.
+const NATIVE_W = 3840
+const NATIVE_H = 2160
+
+// --- Page classification: active nav-tab fill boxes ---
+// The active tab (SUMMARY on summary pages, PERSONAL on breakdown pages) has a
+// bright-blue fill. These two boxes never both contain fill: one is always ~0.
+// Measured: summary pages -> SUMMARY box ~15812 fill px, PERSONAL box 0.
+//           breakdown pages -> PERSONAL box ~11915 fill px, SUMMARY box 0.
+const SUMMARY_TAB_BOX = { x0: 200, x1: 460, y0: 50, y1: 120 }
+const PERSONAL_TAB_BOX = { x0: 680, x1: 880, y0: 50, y1: 120 }
+// Minimum fill-pixel count to consider a tab "active". Real minimum seen is
+// ~11900; empty side is exactly 0. 1000 is a wide safety margin.
+const TAB_FILL_MIN = 1000
+
+// --- Summary page: 3 fixed portrait-circle centers ---
+// Y-centers do NOT change with hero count (a 1- or 2-hero match leaves the
+// lower slot(s) as empty black discs). Center-x is constant at 355.
+const SUMMARY_PORTRAIT_CENTERS = [
+  { x: 355, y: 720 },
+  { x: 355, y: 1200 },
+  { x: 355, y: 1680 },
+]
+// Half-size of the square portrait art crop. Art inner radius ~99px; orange
+// ring at r102-118. 95 stays safely inside the art. Same value used for
+// breakdown portraits (PORTRAIT_ART_HALF lives in breakdown-ocr.ts too).
+const SUMMARY_PORTRAIT_HALF = 95
+// Empty-slot test: count orange ring-band pixels at the fixed center. A filled
+// slot has >=~1491 (smallest real arc seen); an empty slot has exactly 0.
+const RING_BAND_MIN_R = 95
+const RING_BAND_MAX_R = 130
+const SLOT_FILLED_MIN_RING_PX = 300 // >= this => filled; below => empty slot
+
+// ============================================================
+// FIXED-COORDINATE PIXEL HELPERS
+// ============================================================
+
+/** Draw an image to a canvas once and return its RGBA pixel data. */
+function getImagePixels(img: HTMLImageElement): {
+  data: Uint8ClampedArray
+  width: number
+  height: number
+} {
+  const canvas = document.createElement('canvas')
+  canvas.width = img.naturalWidth
+  canvas.height = img.naturalHeight
+  const ctx = canvas.getContext('2d')!
+  ctx.drawImage(img, 0, 0)
+  const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height)
+  return { data, width: canvas.width, height: canvas.height }
+}
+
+/**
+ * Crop a fixed RGBA box out of full-image pixel data into the flat
+ * { data, width, height } shape matchHero() expects (RGBA, 4 bytes/px).
+ * Coordinates are clamped to the image bounds.
+ */
+function cropRGBA(
+  src: Uint8ClampedArray,
+  srcW: number,
+  srcH: number,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): { data: number[]; width: number; height: number } {
+  const out = new Array<number>(w * h * 4)
+  let o = 0
+  for (let yy = 0; yy < h; yy++) {
+    const sy = Math.min(srcH - 1, Math.max(0, y + yy))
+    for (let xx = 0; xx < w; xx++) {
+      const sx = Math.min(srcW - 1, Math.max(0, x + xx))
+      const si = (sy * srcW + sx) * 4
+      out[o++] = src[si]
+      out[o++] = src[si + 1]
+      out[o++] = src[si + 2]
+      out[o++] = src[si + 3]
+    }
+  }
+  return { data: out, width: w, height: h }
+}
+
+/**
+ * Count orange ring-band pixels around a fixed center, used ONLY to decide
+ * whether a summary portrait slot is filled or empty (an empty slot is a
+ * near-black disc with no ring). This does not locate anything — the center
+ * is already fixed; it just checks presence. Orange test and band radii are
+ * the measured values.
+ */
+function countRingBandPixels(
+  src: Uint8ClampedArray,
+  srcW: number,
+  srcH: number,
+  cx: number,
+  cy: number,
+): number {
+  let count = 0
+  const rMinSq = RING_BAND_MIN_R * RING_BAND_MIN_R
+  const rMaxSq = RING_BAND_MAX_R * RING_BAND_MAX_R
+  for (let yy = -RING_BAND_MAX_R; yy <= RING_BAND_MAX_R; yy++) {
+    const py = cy + yy
+    if (py < 0 || py >= srcH) continue
+    for (let xx = -RING_BAND_MAX_R; xx <= RING_BAND_MAX_R; xx++) {
+      const dsq = xx * xx + yy * yy
+      if (dsq < rMinSq || dsq > rMaxSq) continue
+      const px = cx + xx
+      if (px < 0 || px >= srcW) continue
+      const si = (py * srcW + px) * 4
+      const r = src[si], g = src[si + 1], b = src[si + 2]
+      // measured orange-ring test
+      if (r > 190 && g >= 60 && g <= 175 && b < 95 && r - b > 110) count++
+    }
+  }
+  return count
+}
 
 // ============================================================
 // PAGE TYPE DETECTION
@@ -59,35 +194,47 @@ async function classifyImage(img: HTMLImageElement): Promise<{
   pageType: PageType
   scoreboardDetection: ScoreboardDetectionResult | null
 }> {
-  // Fast path: try pixel-based scoreboard detection first (no OCR needed)
+  // Step 1 (fast, no OCR): pixel-based scoreboard detection.
   const sbDetection = await detectScoreboard(img)
   if (sbDetection.imageType === 'scoreboard') {
     console.log('Page classification: scoreboard (pixel detection)')
     return { pageType: 'scoreboard', scoreboardDetection: sbDetection }
   }
 
-  // Slow path: OCR-based classification for summary vs breakdown
-  const worker = await getClassifyWorker()
+  // Step 2 (fast, no OCR): summary vs breakdown via the active nav-tab fill.
+  // The active tab's bright-blue fill sits in one of two fixed, non-overlapping
+  // boxes. This replaces the old full-page Tesseract keyword scan.
+  const { data, width, height } = getImagePixels(img)
+  const summaryFill = countTabFill(data, width, height, SUMMARY_TAB_BOX)
+  const personalFill = countTabFill(data, width, height, PERSONAL_TAB_BOX)
+  console.log(`Page classification (tab fill): summary=${summaryFill}, personal=${personalFill}`)
 
+  if (summaryFill >= TAB_FILL_MIN && summaryFill > personalFill) {
+    return { pageType: 'summary', scoreboardDetection: null }
+  }
+  if (personalFill >= TAB_FILL_MIN && personalFill > summaryFill) {
+    return { pageType: 'breakdown', scoreboardDetection: null }
+  }
+
+  // Step 3 (last resort): if neither tab box read as active (unexpected crop,
+  // overlay, or future UI change), fall back to the old OCR keyword scan so we
+  // degrade gracefully rather than returning 'unknown'.
+  console.warn('Tab-fill classification inconclusive; falling back to OCR keyword scan')
+  const worker = await getClassifyWorker()
   const canvas = document.createElement('canvas')
   canvas.width = img.naturalWidth
   canvas.height = img.naturalHeight
   canvas.getContext('2d')!.drawImage(img, 0, 0)
 
-  const { data } = await worker.recognize(canvas)
-  const text = data.text.toUpperCase()
+  const { data: ocr } = await worker.recognize(canvas)
+  const text = ocr.text.toUpperCase()
 
   let summaryScore = 0
   let breakdownScore = 0
+  for (const kw of SUMMARY_KEYWORDS) if (text.includes(kw)) summaryScore++
+  for (const kw of BREAKDOWN_KEYWORDS) if (text.includes(kw)) breakdownScore++
 
-  for (const kw of SUMMARY_KEYWORDS) {
-    if (text.includes(kw)) summaryScore++
-  }
-  for (const kw of BREAKDOWN_KEYWORDS) {
-    if (text.includes(kw)) breakdownScore++
-  }
-
-  console.log(`Page classification: summary=${summaryScore}, breakdown=${breakdownScore}`)
+  console.log(`Page classification (OCR fallback): summary=${summaryScore}, breakdown=${breakdownScore}`)
 
   if (summaryScore >= 2 && summaryScore > breakdownScore) return { pageType: 'summary', scoreboardDetection: null }
   if (breakdownScore >= 1 && breakdownScore >= summaryScore) return { pageType: 'breakdown', scoreboardDetection: null }
@@ -95,6 +242,132 @@ async function classifyImage(img: HTMLImageElement): Promise<{
   if (breakdownScore >= 1) return { pageType: 'breakdown', scoreboardDetection: null }
 
   return { pageType: 'unknown', scoreboardDetection: null }
+}
+
+// ============================================================
+// EXPORTED CLASSIFICATION HELPERS (for grouping callers)
+// ------------------------------------------------------------
+// These let the testing page (and the production upload page) group an
+// arbitrary pile of screenshots into matches BEFORE processing, using the
+// EXACT same page classifier the pipeline uses internally. This is what
+// makes content-based grouping safe for phone uploads whose filenames carry
+// no semantic info (IMG_1898, IMG_1899, ...): we never trust the filename to
+// decide what a page is — we look at the pixels.
+// ============================================================
+
+export type { PageType }
+
+/**
+ * Classify a single already-loaded image into 'summary' | 'breakdown' |
+ * 'scoreboard' | 'unknown'. Thin wrapper over the internal classifier so
+ * callers share one source of truth (no drift between grouping and the
+ * pipeline's own bucketing).
+ */
+export async function classifyPageType(img: HTMLImageElement): Promise<PageType> {
+  const { pageType } = await classifyImage(img)
+  return pageType
+}
+
+/** Canonical within-match processing order: summary first, then breakdown(s), then scoreboard. */
+const PAGE_ORDER: Record<PageType, number> = {
+  summary: 0,
+  breakdown: 1,
+  scoreboard: 2,
+  unknown: 3,
+}
+
+/** A photo paired with its classified page type, used for ordering/grouping. */
+export interface ClassifiedPhoto<T> {
+  item: T
+  pageType: PageType
+}
+
+/**
+ * Sort a set of classified photos into canonical order:
+ *   Summary → Breakdown(s) → Scoreboard → (unknown last)
+ * Ties within a page type preserve the caller's original order (stable),
+ * so multiple breakdown pages keep their capture/filename sequence.
+ *
+ * The pipeline buckets by type internally, so it is order-insensitive — but
+ * ordering here makes the logs, the test report, and the production review
+ * screen read in the order the user asked for, and makes content-based
+ * grouping deterministic.
+ */
+export function orderByPageType<T>(photos: ClassifiedPhoto<T>[]): ClassifiedPhoto<T>[] {
+  return photos
+    .map((p, i) => ({ p, i }))
+    .sort((a, b) => {
+      const d = PAGE_ORDER[a.p.pageType] - PAGE_ORDER[b.p.pageType]
+      return d !== 0 ? d : a.i - b.i
+    })
+    .map(({ p }) => p)
+}
+
+/**
+ * Group an ordered (by capture/filename) sequence of classified photos into
+ * matches using PAGE CONTENT, not filenames. This is the phone-upload path.
+ *
+ * Cut rule: each match owns exactly one summary page, so a summary page
+ * starts a new match. Breakdown and scoreboard pages attach to the current
+ * match. A scoreboard also closes the current match (a new page after it
+ * begins a fresh group even if no summary appeared yet), which keeps two
+ * back-to-back matches from merging when a summary is missing.
+ *
+ * Leading pages with no summary yet (e.g. a stray breakdown uploaded first)
+ * start their own group rather than being dropped. Each returned group is
+ * re-sorted into canonical order via orderByPageType().
+ */
+export function groupPhotosByContent<T>(
+  photosInCaptureOrder: ClassifiedPhoto<T>[],
+): ClassifiedPhoto<T>[][] {
+  const groups: ClassifiedPhoto<T>[][] = []
+  let current: ClassifiedPhoto<T>[] = []
+  let currentHasScoreboard = false
+
+  const flush = () => {
+    if (current.length > 0) {
+      groups.push(orderByPageType(current))
+      current = []
+      currentHasScoreboard = false
+    }
+  }
+
+  for (const photo of photosInCaptureOrder) {
+    const startsNewMatch =
+      // a summary always begins a new match
+      photo.pageType === 'summary' ||
+      // anything arriving after we've already seen this match's scoreboard
+      // belongs to the next match
+      currentHasScoreboard
+    if (startsNewMatch) flush()
+
+    current.push(photo)
+    if (photo.pageType === 'scoreboard') currentHasScoreboard = true
+  }
+  flush()
+
+  return groups
+}
+
+/**
+ * Count active-tab fill pixels inside a fixed box. The active nav tab's fill is
+ * a bright blue: blue>90, blue-red>55, green>=red, blue>green (measured).
+ */
+function countTabFill(
+  src: Uint8ClampedArray,
+  srcW: number,
+  srcH: number,
+  box: { x0: number; x1: number; y0: number; y1: number },
+): number {
+  let count = 0
+  for (let y = box.y0; y <= box.y1 && y < srcH; y++) {
+    for (let x = box.x0; x <= box.x1 && x < srcW; x++) {
+      const si = (y * srcW + x) * 4
+      const r = src[si], g = src[si + 1], b = src[si + 2]
+      if (b > 90 && b - r > 55 && g >= r && b > g) count++
+    }
+  }
+  return count
 }
 
 async function terminateClassifyWorker() {
@@ -116,9 +389,11 @@ export interface HeroBreakdownResult {
   expectedStatCount: number
   foundStatCount: number
   matchedToSummary: boolean
+  /** 6f: source image URL of this breakdown photo (for confirmation display). */
+  imageUrl?: string
 }
 
-/** Scoreboard extraction results (10-player data from TEAMS tab) */
+/** Scoreboard extraction results (10 or 12 player data from TEAMS tab) */
 export interface ScoreboardResult {
   detection: ScoreboardDetectionResult
   heroes: ScoreboardHeroIdentification[]
@@ -126,6 +401,10 @@ export interface ScoreboardResult {
   players: ScoreboardPlayerLabel[]
   stats: ScoreboardPlayerStats[]
   ocrAnalysis: ScoreboardOcrAnalysis
+  /** 6f: per-cell scoreboard confidence + vote-split flags (for beta confirmation). */
+  cellConfidence?: SbCellConfidence[]
+  /** 6f: source image URL of the scoreboard photo (for confirmation highlights). */
+  imageUrl?: string
 }
 
 export interface ProcessedMatch {
@@ -145,6 +424,12 @@ export interface ProcessedMatch {
   correctedRole: RoleType | null
   ocrRaw: Record<string, string>
   scoreboard: ScoreboardResult | null
+  allyComp: string | null
+  enemyComp: string | null
+  /** Detected match format from scoreboard pixel analysis ('5v5' or '6v6') */
+  matchFormat: '5v5' | '6v6' | null
+  /** 6f: source image URL of the summary photo (for confirmation display). */
+  summaryImageUrl?: string
   processingTimeMs: number
 }
 
@@ -198,32 +483,26 @@ async function assignBreakdownsToHeroes(
 
   console.log(`Assignment by elimination: ${breakdownImages.length} images × ${knownHeroNames.length} heroes`)
 
-  // Score each image's portrait against each known hero individually
-  // This builds the full matrix needed for optimal greedy assignment
+  // Score each image's portrait against each known hero individually.
+  // This builds the full matrix used for greedy assignment.
   const fullScoreMatrix: { imageIndex: number; heroName: string; score: number }[] = []
 
   for (let i = 0; i < breakdownImages.length; i++) {
-    // Detect portrait from this image
-    const canvas = document.createElement('canvas')
-    canvas.width = breakdownImages[i].naturalWidth
-    canvas.height = breakdownImages[i].naturalHeight
-    canvas.getContext('2d')!.drawImage(breakdownImages[i], 0, 0)
-    const imgData = canvas.getContext('2d')!.getImageData(0, 0, canvas.width, canvas.height)
-
-    // Import portrait detection
-    const { detectPortraits } = await import('./opencv-loader')
-    const portraits = await detectPortraits(
-      imgData.data, canvas.width, canvas.height, 'breakdown',
+    // Crop the R1C1 hero portrait at its FIXED location (variant-aware center
+    // from breakdown-ocr.ts, the single source of truth for the grid layout).
+    // This replaces OpenCV detectPortraits, which previously had to *find* the
+    // portrait and could fail or drift; the location is fixed, so we just crop.
+    const { data, width, height } = getImagePixels(breakdownImages[i])
+    const loc = getBreakdownPortraitLocation(breakdownImages[i])
+    const portrait = cropRGBA(
+      data, width, height,
+      loc.cropBox.x, loc.cropBox.y, loc.cropBox.w, loc.cropBox.h,
     )
+    console.log(`Breakdown ${i + 1}: variant ${loc.variant}, portrait center (${loc.centerX},${loc.centerY})`)
 
-    if (portraits.length === 0) {
-      console.warn(`Breakdown ${i + 1}: no portrait detected`)
-      continue
-    }
-
-    // Score this portrait against each known hero
+    // Score this fixed-crop portrait against each known hero.
     for (const heroName of knownHeroNames) {
-      const result = await matchHero(portraits[0], true, undefined, [heroName])
+      const result = await matchHero(portrait, true, undefined, [heroName])
       fullScoreMatrix.push({
         imageIndex: i,
         heroName,
@@ -237,7 +516,9 @@ async function assignBreakdownsToHeroes(
     }).join(', ')}`)
   }
 
-  // Greedy assignment: pick highest-confidence pair, assign, remove both, repeat
+  // Greedy assignment: pick highest-confidence pair, assign, remove both, repeat.
+  // (Confirmed adequate for the 1-3 hero case, which is all that can appear on
+  // the summary shortlist. The >3 case is handled separately by the caller.)
   const assignments: BreakdownAssignment[] = []
   const assignedImages = new Set<number>()
   const assignedHeroes = new Set<string>()
@@ -283,6 +564,9 @@ export async function processMatchPhotos(
     correctedRole: null,
     ocrRaw: {},
     scoreboard: null,
+    allyComp: null,
+    enemyComp: null,
+    matchFormat: null,
     processingTimeMs: 0,
   }
 
@@ -371,6 +655,7 @@ export async function processMatchPhotos(
 
   // Step 5: Summary page OCR
   if (summaryImage) {
+    result.summaryImageUrl = summaryImage.src
     onStatus({ stage: 'running_ocr', progress: 40 })
     let summaryOcr: SummaryOcrResult | null = null
     try {
@@ -400,9 +685,36 @@ export async function processMatchPhotos(
 
     if (opencvAvailable) {
       try {
-        const summaryHeroes = await detectAndMatchHeroes(summaryImage, 'summary', true, roleFilter)
-        for (const match of summaryHeroes) {
-          allHeroMatches.set(match.heroName, { score: match.score, source: 'image' })
+        // Crop each of the 3 FIXED summary portrait slots and match it.
+        // Slots have fixed centers; their Y does not move with hero count.
+        // An unplayed slot is an empty black disc (no orange ring) — detected
+        // by zero ring-band pixels — and is skipped so we never match a phantom.
+        const { data, width, height } = getImagePixels(summaryImage)
+
+        for (let s = 0; s < SUMMARY_PORTRAIT_CENTERS.length; s++) {
+          const { x: cx, y: cy } = SUMMARY_PORTRAIT_CENTERS[s]
+
+          // Filled-vs-empty check at the fixed center (presence of ring), NOT
+          // a way of locating the portrait — the center is already fixed.
+          const ringPx = countRingBandPixels(data, width, height, cx, cy)
+          if (ringPx < SLOT_FILLED_MIN_RING_PX) {
+            console.log(`Summary slot ${s} @(${cx},${cy}): empty (ring px=${ringPx}) — skipped`)
+            continue
+          }
+
+          const portrait = cropRGBA(
+            data, width, height,
+            cx - SUMMARY_PORTRAIT_HALF, cy - SUMMARY_PORTRAIT_HALF,
+            SUMMARY_PORTRAIT_HALF * 2, SUMMARY_PORTRAIT_HALF * 2,
+          )
+          const match = await matchHero(portrait, true, roleFilter)
+          console.log(`Summary slot ${s} @(${cx},${cy}): ${match.heroName} (score ${match.score.toFixed(4)}, ring px=${ringPx})`)
+
+          // Keep the best score if the same hero somehow appears twice.
+          const existing = allHeroMatches.get(match.heroName)
+          if (!existing || match.score > existing.score) {
+            allHeroMatches.set(match.heroName, { score: match.score, source: 'image' })
+          }
           if (match.correctedRole && !detectedCorrectedRole) {
             detectedCorrectedRole = match.correctedRole
           }
@@ -425,7 +737,6 @@ export async function processMatchPhotos(
       .map(([name, data]) => ({ name, confidence: data.score, source: data.source }))
       .filter(h => h.confidence >= HERO_CONFIDENCE_THRESHOLD || h.source === 'ocr')
       .sort((a, b) => b.confidence - a.confidence)
-      .slice(0, 3)
 
     result.correctedRole = detectedCorrectedRole
   }
@@ -464,6 +775,7 @@ export async function processMatchPhotos(
           expectedStatCount: breakdown.expectedStatCount,
           foundStatCount: breakdown.foundStatCount,
           matchedToSummary: true,
+          imageUrl: breakdownImages[assignment.imageIndex].src,
         })
       } catch (e) {
         console.warn(`Breakdown OCR failed for ${assignment.heroName}:`, e)
@@ -492,11 +804,18 @@ export async function processMatchPhotos(
       onStatus({ stage: 'reading_scoreboard', progress: 91 })
       const heroes = await identifyHeroes(scoreboardImage, scoreboardDetection, roles)
 
-      // Backfill hero names into roles
-      for (const role of roles) {
-        const hero = heroes.find(h => h.slot === role.slot)
-        role.heroName = hero?.heroName ?? null
+      // Compute team compositions AFTER role overrides so comps reflect actual heroes
+      const computeTeamComp = (team: 'ally' | 'enemy'): string => {
+        const teamRoles = roles.filter(r => r.team === team && r.role)
+        const tanks = teamRoles.filter(r => r.role === 'tank').length
+        const dps = teamRoles.filter(r => r.role === 'dps').length
+        const support = teamRoles.filter(r => r.role === 'support').length
+        return `${tanks}-${dps}-${support}`
       }
+      result.allyComp = computeTeamComp('ally')
+      result.enemyComp = computeTeamComp('enemy')
+      result.matchFormat = scoreboardDetection.format as '5v5' | '6v6' | null
+      console.log(`Team comps: Ally ${result.allyComp}, Enemy ${result.enemyComp} (format: ${result.matchFormat})`)
 
       // Step 3: User identification — Tier 2 hero-match first, then OCR fallback
       onStatus({ stage: 'reading_scoreboard', progress: 93 })
@@ -551,7 +870,8 @@ export async function processMatchPhotos(
 
       // Step 5: Stats extraction via template matching
       onStatus({ stage: 'reading_scoreboard', progress: 95 })
-      const stats = await extractStats(scoreboardImage, heroes, roles, players, scoreboardDetection)
+      const cellConfidence: SbCellConfidence[] = []
+      const stats = await extractStats(scoreboardImage, heroes, roles, players, scoreboardDetection, cellConfidence)
 
       result.scoreboard = {
         detection: scoreboardDetection,
@@ -560,14 +880,18 @@ export async function processMatchPhotos(
         players,
         stats,
         ocrAnalysis,
+        cellConfidence,
+        imageUrl: scoreboardImage.src,
       }
 
+      const totalSlots = scoreboardDetection.grid ? scoreboardDetection.grid.rowsPerTeam * 2 : 10
       console.log(
-        `Scoreboard extraction complete: ` +
-        `${heroes.filter(h => h.heroName).length}/10 heroes, ` +
-        `${roles.filter(r => r.role).length}/10 roles, ` +
-        `${stats.filter(s => s.eliminations !== null).length}/10 stats, ` +
-        `user ${ocrAnalysis.resolved ? 'auto-resolved' : 'needs confirmation'}`
+        `Scoreboard extraction complete (${scoreboardDetection.format ?? '5v5'}): ` +
+        `${heroes.filter(h => h.heroName).length}/${totalSlots} heroes, ` +
+        `${roles.filter(r => r.role).length}/${totalSlots} roles, ` +
+        `${stats.filter(s => s.eliminations !== null).length}/${totalSlots} stats, ` +
+        `user ${ocrAnalysis.resolved ? 'auto-resolved' : 'needs confirmation'}, ` +
+        `comps: Ally ${result.allyComp} / Enemy ${result.enemyComp}`
       )
     } catch (e) {
       console.warn('Scoreboard extraction failed:', e)

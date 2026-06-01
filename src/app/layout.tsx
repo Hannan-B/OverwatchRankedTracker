@@ -54,6 +54,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <Link href="/heroes" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
               HEROES
             </Link>
+            <Link href="/issue-log" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              ISSUE LOG
+            </Link>
             <Link href="/settings" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
               SETTINGS
             </Link>
@@ -73,6 +76,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <NavLink href="/upload" label="UPLOAD" icon="📷" />
           <NavLink href="/matches" label="MATCHES" icon="⚔️" />
           <NavLink href="/heroes" label="HEROES" icon="🎯" />
+          <NavLink href="/issue-log" label="ISSUES" icon="🩺" />
           <NavLink href="/settings" label="SETTINGS" icon="⚙️" />
         </nav>
       </body>

@@ -78,6 +78,8 @@ export default function UploadPage() {
   const inputRef = useRef<HTMLInputElement>(null)
 
   const [role, setRole] = useState<RoleType | null>(null)
+  const [rolesPlayed, setRolesPlayed] = useState<RoleType[]>([])
+  const [matchFormat, setMatchFormat] = useState<'5v5' | '6v6'>('5v5')
   const [matchFeel, setMatchFeel] = useState<MatchFeel | null>(null)
   const [perfFeel, setPerfFeel] = useState<PerformanceFeel | null>(null)
   const [notableEvents, setNotableEvents] = useState<NotableEvent[]>([])
@@ -144,13 +146,16 @@ export default function UploadPage() {
   }
 
   async function uploadAll() {
-    if (files.length === 0 || !role) return
+    const hasRole = matchFormat === '5v5' ? !!role : rolesPlayed.length > 0
+    if (files.length === 0 || !hasRole) return
     setStep('uploading')
     const batchId = Date.now().toString()
     const updated = [...files]
 
     const metadata = {
+      match_format: matchFormat,
       role_played: role,
+      roles_played: matchFormat === '6v6' ? rolesPlayed : (role ? [role] : []),
       match_feel: matchFeel,
       performance_feel: perfFeel,
       notable_events: notableEvents,
@@ -193,6 +198,8 @@ export default function UploadPage() {
   function resetForm() {
     setStep('questions')
     setRole(null)
+    setRolesPlayed([])
+    setMatchFormat('5v5')
     setMatchFeel(null)
     setPerfFeel(null)
     setNotableEvents([])
@@ -258,7 +265,7 @@ export default function UploadPage() {
       <div className="max-w-lg mx-auto space-y-6">
         <div>
           <h1 className="text-3xl text-ow-orange">Upload Photos</h1>
-          <p className="text-sm text-slate-400 mt-1">Select your Summary and Breakdown screenshots</p>
+          <p className="text-sm text-slate-400 mt-1">Select your Summary, Scoreboard, and Breakdown screenshots (up to 8)</p>
           <button onClick={() => setStep('questions')}
             className="text-xs text-slate-500 hover:text-ow-orange transition-colors mt-1">
             ← Back to questions
@@ -266,7 +273,17 @@ export default function UploadPage() {
         </div>
 
         <div className="bg-ow-panel rounded-lg p-3 border border-white/5 flex flex-wrap gap-2 text-xs">
-          <span className="bg-ow-dark px-2 py-1 rounded text-slate-300 font-display">{role?.toUpperCase()}</span>
+          <span className={`px-2 py-1 rounded font-display ${
+            matchFormat === '6v6' ? 'bg-purple-900/60 text-purple-300' : 'bg-ow-dark text-slate-300'
+          }`}>{matchFormat.toUpperCase()}</span>
+          {matchFormat === '5v5' && role && (
+            <span className="bg-ow-dark px-2 py-1 rounded text-slate-300 font-display">{role.toUpperCase()}</span>
+          )}
+          {matchFormat === '6v6' && rolesPlayed.length > 0 && (
+            <span className="bg-ow-dark px-2 py-1 rounded text-slate-300 font-display">
+              {rolesPlayed.map(r => r.toUpperCase()).join(' + ')}
+            </span>
+          )}
           {matchFeel && <span className="bg-ow-dark px-2 py-1 rounded text-slate-300 font-display">
             {matchFeel === 'stomped_them' ? 'STOMPED' : matchFeel === 'close_game' ? 'CLOSE' : 'GOT STOMPED'}
           </span>}
@@ -285,7 +302,7 @@ export default function UploadPage() {
           <span className="text-slate-400 group-hover:text-slate-300 font-display tracking-wider">
             TAP TO SELECT PHOTOS
           </span>
-          <span className="block text-xs text-slate-600 mt-1">Summary page + Personal/Breakdown page(s)</span>
+          <span className="block text-xs text-slate-600 mt-1">Summary + Scoreboard + Breakdown page(s)</span>
         </button>
 
         {files.length > 0 && (
@@ -326,10 +343,34 @@ export default function UploadPage() {
 
       <div>
         <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">
-          ROLE PLAYED <span className="text-ow-defeat">*</span>
+          MATCH FORMAT <span className="text-ow-defeat">*</span>
         </label>
-        <ChipSelect options={['tank', 'dps', 'support'] as RoleType[]} value={role} onChange={setRole}
-          labels={{ tank: 'TANK', dps: 'DPS', support: 'SUPPORT' }} />
+        <ChipSelect options={['5v5', '6v6'] as ('5v5' | '6v6')[]} value={matchFormat} onChange={(v) => {
+          if (v) {
+            setMatchFormat(v)
+            // Reset role selection when switching formats
+            if (v === '5v5') { setRolesPlayed([]); }
+            else { setRole(null); }
+          }
+        }}
+          labels={{ '5v5': '5V5', '6v6': '6V6' }}
+          colors={{ '5v5': 'bg-ow-orange text-ow-dark', '6v6': 'bg-purple-600 text-white' }} />
+      </div>
+
+      <div>
+        <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">
+          {matchFormat === '6v6' ? 'ROLES PLAYED' : 'ROLE PLAYED'} <span className="text-ow-defeat">*</span>
+        </label>
+        {matchFormat === '5v5' ? (
+          <ChipSelect options={['tank', 'dps', 'support'] as RoleType[]} value={role} onChange={setRole}
+            labels={{ tank: 'TANK', dps: 'DPS', support: 'SUPPORT' }} />
+        ) : (
+          <>
+            <MultiChipSelect options={['tank', 'dps', 'support'] as RoleType[]} value={rolesPlayed} onChange={setRolesPlayed}
+              labels={{ tank: 'TANK', dps: 'DPS', support: 'SUPPORT' }} />
+            <p className="text-xs text-slate-500 mt-1.5">Select all roles you played this match (1-3)</p>
+          </>
+        )}
       </div>
 
       <div>
@@ -364,7 +405,8 @@ export default function UploadPage() {
                      focus:outline-none transition-colors resize-none" />
       </div>
 
-      <button onClick={() => setStep('photos')} disabled={!role}
+      <button onClick={() => setStep('photos')}
+        disabled={matchFormat === '5v5' ? !role : rolesPlayed.length === 0}
         className="w-full bg-ow-orange hover:bg-ow-accent disabled:bg-slate-700
                    disabled:text-slate-500 text-ow-dark font-display font-bold
                    py-3 rounded-lg tracking-wider transition-colors text-sm">

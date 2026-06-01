@@ -259,6 +259,39 @@ async function matchAgainstCandidates(
 // PUBLIC API
 // ============================================================
 
+// ------------------------------------------------------------
+// CROP SELECTION SCORER (Step 6b — Phase 1)
+// ------------------------------------------------------------
+// Cheap structural+color-only scoring of ONE crop against ALL heroes,
+// with NO role filter, NO ORB, and NO sanity-check recursion.
+//
+// This is the primitive used by the two-phase crop selection in
+// scoreboard-extractor.ts to decide which of a slot's crop variants is
+// "cleanest" (least corrupted by decorative overlays) BEFORE spending a
+// full matchHero() pipeline on the winner.
+//
+// IMPORTANT — it scores against all 51 heroes on purpose:
+//   - The role icon classifier is the weakest input in the pipeline, so
+//     restricting Phase 1 to the role-filtered subset risks the correct
+//     hero not even being in the comparison set when the icon role is
+//     wrong. Scoring against all heroes guarantees the correct hero is
+//     always a candidate, so the crop that best surfaces it can win.
+//   - This reuses the exact same basis as matchHero()'s internal sanity
+//     check (matchAgainstCandidates with useOrb=false), so Phase 1's
+//     notion of a "good crop" is measured on the same yardstick that
+//     final correctness depends on.
+//
+// Returns the best-matching hero name and its score. The score is only
+// meaningful for ranking crops against EACH OTHER for the same slot —
+// it is NOT calibrated against ORB_THRESHOLD and must not be used as the
+// low-confidence gate (that gate uses the role-filtered matchHero score).
+export async function scoreCropAgainstAllHeroes(
+  portraitData: { data: number[]; width: number; height: number },
+): Promise<{ heroName: string; score: number; margin: number; runnerUp: string }> {
+  const allEntries = Array.from(heroBank.entries())
+  return matchAgainstCandidates(portraitData, allEntries, false)
+}
+
 export async function matchHero(
   portraitData: { data: number[]; width: number; height: number },
   useOrb: boolean,

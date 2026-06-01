@@ -27,6 +27,10 @@ export interface Match {
   result: MatchResult
   score: string | null
   role_played: RoleType
+  roles_played: RoleType[] | null          // Array for 6v6 multi-role; single-element for 5v5
+  match_format: '5v5' | '6v6'             // Which format this match was played in
+  ally_team_comp: string | null            // e.g. "2-2-2", "1-4-1" (tank-dps-support)
+  enemy_team_comp: string | null           // same format
   game_length_seconds: number | null
   starting_side: StartingSide | null
   total_eliminations: number | null
@@ -86,7 +90,7 @@ export interface UserSettings {
 export interface ScoreboardPlayer {
   id: number
   match_id: number
-  slot: number
+  slot: number          // 1-10 (5v5) or 1-12 (6v6)
   team: 'ally' | 'enemy'
   hero_name: string | null
   role: RoleType | null
@@ -154,6 +158,8 @@ export interface MatchFormData {
   result: MatchResult
   score: string
   role_played: RoleType
+  roles_played: RoleType[]                 // Array for 6v6 multi-role; single-element for 5v5
+  match_format: '5v5' | '6v6'
   game_length_seconds: number | null
   starting_side: StartingSide | null
   total_eliminations: number | null
@@ -187,7 +193,7 @@ export interface HeroStatFormData {
 
 /** Grid row layout extracted during scoreboard detection */
 export interface ScoreboardGridRow {
-  slot: number          // 1-5 ally, 6-10 enemy
+  slot: number          // 1-5/6 ally, 6-10/7-12 enemy (depends on format)
   team: 'ally' | 'enemy'
   topY: number
   centerY: number
@@ -199,6 +205,7 @@ export interface ScoreboardGrid {
   ally: { startY: number; endY: number; rowHeight: number }
   enemy: { startY: number; endY: number; rowHeight: number }
   rows: ScoreboardGridRow[]
+  rowsPerTeam: number  // 5 for 5v5, 6 for 6v6
   columns: {
     roleIcon:  { x: number }
     portrait:  { startX: number; endX: number }
@@ -218,11 +225,12 @@ export interface ScoreboardDetectionResult {
   confidence: number
   signals: string[]
   grid: ScoreboardGrid | null
+  format: '5v5' | '6v6' | null  // Derived from row count auto-detection
 }
 
 /** Step 2 — Which hero is in each row? */
 export interface ScoreboardHeroIdentification {
-  slot: number        // 1-5 ally, 6-10 enemy
+  slot: number        // 1-N ally, (N+1)-2N enemy
   team: 'ally' | 'enemy'
   heroName: string | null
   confidence: number

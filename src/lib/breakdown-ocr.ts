@@ -227,15 +227,29 @@ function getStatTiles(
   width: number,
   height: number,
   variant: 'A' | 'B'
-): Array<{ x: number; y: number }> {
+): Array<{ x: number; y: number; row: number; col: number; catalogIndex: number }> {
   const cols = VARIANTS[variant].col_starts
-  const tiles: Array<{ x: number; y: number }> = []
+  const tiles: Array<{ x: number; y: number; row: number; col: number; catalogIndex: number }> = []
+
+  // The breakdown grid is read ROW-MAJOR (left-to-right across each row, then
+  // top-to-bottom), with the hero-info tile occupying R1C1 (ri=0, ci=0). The
+  // catalog's stats[] array is stored in this same row-major order, excluding
+  // the hero-info tile. So a tile at grid position (ri, ci) corresponds to
+  // catalog index = ri * numCols + ci - 1 (the -1 accounts for the skipped
+  // hero-info tile). Verified against all 51 heroes' real breakdown screenshots.
+  const numCols = cols.length
 
   for (let ri = 0; ri < ROW_TOPS.length; ri++) {
     for (let ci = 0; ci < cols.length; ci++) {
       if (ri === 0 && ci === 0) continue // Skip hero info tile
       if (checkBar(data, width, height, cols[ci] + 81, ROW_TOPS[ri])) {
-        tiles.push({ x: cols[ci], y: ROW_TOPS[ri] })
+        tiles.push({
+          x: cols[ci],
+          y: ROW_TOPS[ri],
+          row: ri,
+          col: ci,
+          catalogIndex: ri * numCols + ci - 1,
+        })
       }
     }
   }
@@ -1129,6 +1143,92 @@ async function ocrTileLabel(
 }
 
 // ============================================================
+// COUNT-DEPENDENT STAT GRAMMAR
+// ------------------------------------------------------------
+// In-game, several stat labels change between singular and plural with
+// the tile's value: "FINAL BLOW" at 1, "FINAL BLOWS" otherwise;
+// "ENEMY FROZEN" at 1, "ENEMIES FROZEN" otherwise. The catalog stores ONE
+// fixed (and inconsistent) form per stat, so two things follow:
+//
+//   1) MATCHING must be plural-agnostic, or an "ENEMIES FROZEN" screenshot
+//      fails to match the catalog's "ENEMY FROZEN" and the tile reads
+//      UNKNOWN (observed: Mei tile 1 at value≠1).
+//
+//   2) The EMITTED statName should reflect the screenshot's grammar
+//      (singular at value 1, plural otherwise) rather than the catalog's
+//      arbitrary stored form — otherwise the label silently disagrees with
+//      what the user sees (observed: ~21 plural-drift labels across 6v6/5v5).
+//
+// We handle two locations of the count-bearing noun:
+//   - trailing head noun: KILL(S) / BLOW(S) / HIT(S) / ASSIST(S)
+//   - leading subject:    ENEMY/ENEMIES, PLAYER/PLAYERS  (e.g. "ENEMY FROZEN",
+//     "PLAYERS SAVED", "PLAYER KNOCKED BACK")
+// A leading ENEMY/PLAYER is only treated as count-bearing when the phrase is
+// not a rate/quality stat (so "ENEMY COALESCENCE EFFICIENCY" is left alone).
+// ============================================================
+
+/** Stat tails that are never count-dependent (rates, qualities, durations). */
+const NON_COUNT_TAILS = new Set([
+  'ACCURACY', 'HEALING', 'DAMAGE', 'TIME', 'PERCENTAGE', 'USAGE', 'EFFICIENCY',
+  'RATE', 'MULTIPLIER', 'CREATED', 'PROVIDED', 'PREVENTED', 'AMPLIFIED',
+  'NEGATED', 'DONE', 'GAINED', 'ENERGY', 'AURA', 'UPTIME',
+])
+
+const LEADING_COUNT_WORDS = new Set(['ENEMY', 'ENEMIES', 'PLAYER', 'PLAYERS'])
+const TRAILING_SINGULAR = new Set(['KILL', 'BLOW', 'HIT', 'ASSIST'])
+const TRAILING_PLURAL = new Set(['KILLS', 'BLOWS', 'HITS', 'ASSISTS'])
+
+const TO_SINGULAR: Record<string, string> = {
+  ENEMIES: 'ENEMY', PLAYERS: 'PLAYER',
+  KILLS: 'KILL', BLOWS: 'BLOW', HITS: 'HIT', ASSISTS: 'ASSIST',
+}
+const TO_PLURAL: Record<string, string> = {
+  ENEMY: 'ENEMIES', PLAYER: 'PLAYERS',
+  KILL: 'KILLS', BLOW: 'BLOWS', HIT: 'HITS', ASSIST: 'ASSISTS',
+}
+
+/**
+ * Return the count-correct display form of a (catalog) stat name given the
+ * tile's extracted value. Singular when the value is exactly 1, plural
+ * otherwise. Non-count stats are returned unchanged. Operates on the
+ * UPPER-CASE catalog form (the only form we store).
+ */
+function applyCountGrammar(statName: string, statValue: string): string {
+  // Determine singular vs plural from the numeric value. Non-numeric values
+  // (e.g. accuracy "%", time "MM:SS") never reach a count-bearing noun, but
+  // guard anyway: treat unparseable as plural (the safer default form).
+  const numeric = parseInt(statValue.replace(/[^\d-]/g, ''), 10)
+  const isOne = numeric === 1
+
+  const words = statName.split(/\s+/)
+  if (words.length === 0) return statName
+  const tail = words[words.length - 1]
+
+  if (TRAILING_SINGULAR.has(tail) || TRAILING_PLURAL.has(tail)) {
+    words[words.length - 1] = isOne
+      ? (TO_SINGULAR[tail] ?? tail)
+      : (TO_PLURAL[tail] ?? tail)
+  } else if (LEADING_COUNT_WORDS.has(words[0]) && !NON_COUNT_TAILS.has(tail)) {
+    words[0] = isOne
+      ? (TO_SINGULAR[words[0]] ?? words[0])
+      : (TO_PLURAL[words[0]] ?? words[0])
+  }
+  return words.join(' ')
+}
+
+/**
+ * Normalize a single word to a canonical form for plural-agnostic matching:
+ * fold the known count-bearing inflections to their singular root so that
+ * "ENEMIES"/"ENEMY", "KILLS"/"KILL", etc. compare equal. Other words are
+ * returned unchanged (upper-cased, alphanumerics only).
+ */
+function normalizePluralWord(word: string): string {
+  const w = word.toUpperCase().replace(/[^A-Z0-9]/g, '')
+  if (TO_SINGULAR[w]) return TO_SINGULAR[w]
+  return w
+}
+
+// ============================================================
 // STAT LABEL MATCHING
 // ============================================================
 
@@ -1157,14 +1257,40 @@ function matchStatLabel(ocrText: string, expectedStats: string[]): string | null
   for (const stat of expectedStats) {
     if (upperText.includes(stat)) return stat
   }
-  // Try fuzzy word-by-word matching
+
+  // Plural-agnostic comparison: fold count-bearing inflections to a canonical
+  // root on BOTH sides so "ENEMIES FROZEN" matches catalog "ENEMY FROZEN"
+  // (and any singular/plural OCR matches any singular/plural catalog form).
   const ocrWords = upperText.split(/\s+/)
+  const ocrNorm = ocrWords.map(normalizePluralWord)
+
+  // Exact (normalized) word-sequence containment: every catalog word has a
+  // normalized OCR word equal to it. Prefer the MOST SPECIFIC (longest) such
+  // catalog stat so a stacked pair like "ICICLE ACCURACY" vs
+  // "ICICLE CRITICAL ACCURACY" never resolves to the shorter one when the
+  // longer also fully matches (6a-ii stacked-accuracy guard).
+  let bestContain: string | null = null
+  let bestContainLen = -1
+  for (const stat of expectedStats) {
+    const statNorm = stat.split(/\s+/).map(normalizePluralWord)
+    const allPresent = statNorm.every((sw) => ocrNorm.includes(sw))
+    if (allPresent && statNorm.length > bestContainLen) {
+      bestContain = stat
+      bestContainLen = statNorm.length
+    }
+  }
+  if (bestContain) return bestContain
+
+  // Try fuzzy word-by-word matching (now also plural-normalized).
   for (const stat of expectedStats) {
     const statWords = stat.split(/\s+/)
     let matchCount = 0
     for (const sw of statWords) {
-      for (const ow of ocrWords) {
-        if (fuzzyWordMatch(ow, sw)) {
+      const swNorm = normalizePluralWord(sw)
+      for (let oi = 0; oi < ocrWords.length; oi++) {
+        // match either on the normalized root (handles plurals) or via the
+        // original fuzzy single-edit tolerance (handles OCR noise).
+        if (ocrNorm[oi] === swNorm || fuzzyWordMatch(ocrWords[oi], sw)) {
           matchCount++
           break
         }
@@ -1267,7 +1393,7 @@ export async function ocrBreakdownPage(
   const matchedStats = new Set<string>()
 
   for (let i = 0; i < tiles.length; i++) {
-    const { x: tx, y: ty } = tiles[i]
+    const { x: tx, y: ty, row, col, catalogIndex } = tiles[i]
 
     // Template matching for value (with multi-threshold retry for edge cases)
     const green = hasGreenBar(data, width, tx, ty)
@@ -1275,7 +1401,7 @@ export async function ocrBreakdownPage(
 
     // OCR for label (stat name matching)
     const labelText = await ocrTileLabel(canvas, tx, ty, TILE_W, ROW_H)
-    result.raw += `--- Tile ${i} (${tx},${ty}) green=${green} ---\nValue: ${value} (conf=${confidence.toFixed(3)})\nLabel OCR:\n${labelText}\n\n`
+    result.raw += `--- Tile ${i} R${row + 1}C${col + 1} (${tx},${ty}) green=${green} ---\nValue: ${value} (conf=${confidence.toFixed(3)})\nLabel OCR:\n${labelText}\n\n`
 
     // Match label against expected stats
     const unmatchedStats = expectedStats.filter(s => !matchedStats.has(s))
@@ -1287,33 +1413,205 @@ export async function ocrBreakdownPage(
     if (matchedLabel) {
       matchedStats.add(matchedLabel)
       result.stats.push({
-        statName: matchedLabel,
+        statName: applyCountGrammar(matchedLabel, value),
         statValue: value,
         avgPer10Min: avgPer10,
       })
     } else {
-      // Position-based fallback: tile i maps to expectedStats[i]
-      // (tiles are in order: R1C2, R1C3, R2C1, R2C2, R2C3, R3C1, R3C2, R3C3)
-      if (i < expectedStats.length && !matchedStats.has(expectedStats[i])) {
-        matchedStats.add(expectedStats[i])
+      // Coordinate-based fallback: map this tile to its catalog stat by its
+      // actual (row, col) grid position rather than by sequential emission index.
+      // This is robust to interior gaps — if a tile in the middle of the grid is
+      // absent (bar check fails), the remaining tiles still resolve to the correct
+      // catalog entry because each carries its own row-major catalogIndex.
+      // (Sequential indexing would shift every subsequent tile by one after a gap.)
+      if (
+        catalogIndex >= 0 &&
+        catalogIndex < expectedStats.length &&
+        !matchedStats.has(expectedStats[catalogIndex])
+      ) {
+        matchedStats.add(expectedStats[catalogIndex])
         result.stats.push({
-          statName: expectedStats[i],
+          statName: applyCountGrammar(expectedStats[catalogIndex], value),
           statValue: value,
           avgPer10Min: avgPer10,
         })
       } else {
         result.stats.push({
-          statName: `UNKNOWN_TILE_${i}`,
+          statName: `UNKNOWN_TILE_R${row + 1}C${col + 1}`,
           statValue: value,
           avgPer10Min: avgPer10,
         })
       }
     }
 
-    console.log(`[breakdown-ocr] Tile ${i}: "${matchedLabel || 'UNKNOWN'}" = ${value} (conf=${confidence.toFixed(3)})${green ? ' [GREEN BAR]' : ''}`)
+    console.log(`[breakdown-ocr] Tile ${i} R${row + 1}C${col + 1} (catalogIndex=${catalogIndex}): "${matchedLabel || 'UNKNOWN'}" = ${value} (conf=${confidence.toFixed(3)})${green ? ' [GREEN BAR]' : ''}`)
   }
 
   result.foundStatCount = result.stats.filter(s => !s.statName.startsWith('UNKNOWN')).length
 
   return result
+}
+
+// ============================================================
+// EXPORTED GRID-VARIANT / PORTRAIT-LOCATION API
+// Lets image-processor.ts locate the R1C1 hero portrait on a breakdown
+// page using the SAME variant detection the OCR uses, so the two never
+// disagree about the grid layout (single source of truth).
+//
+// The portrait sits at a FIXED location in every breakdown screenshot.
+// Its center-x is tied to the grid's first column start:
+//   center_x = col_starts[0] + R1C1_PORTRAIT_DX   (959 for A, 973 for B)
+//   center_y = R1C1_PORTRAIT_CY                    (644, same for both)
+// These offsets were measured directly from 3840x2160 screenshots:
+//   - 16 screenshots, every hero, both formats (all variant A in the test set)
+//   - verified by fitting the orange ring: it clusters tightly (std ~4.4px)
+//     about this fixed center regardless of how long the orange arc is.
+// We crop by this FIXED center, NEVER by detecting the (variable-length)
+// orange play-time arc.
+//
+// NOTE: variant B's center-x (973) is derived arithmetically (col_starts[0]
+// shift of +14). No variant-B screenshot was available to measure directly;
+// confirm against a real B capture if one is ever obtained.
+// ============================================================
+
+// Measured offset from the grid's first-column start (col_starts[0]) to the
+// portrait center-x: 959 - 790 = 169 (variant A) and 973 - 804 = 169 (variant B).
+const R1C1_PORTRAIT_DX = 169
+// Measured portrait center-y on the breakdown page (identical for A and B).
+const R1C1_PORTRAIT_CY = 644
+// Half-size of the square art crop. Portrait art inner radius ~99px; the
+// orange ring sits at r102-118. 95 stays safely inside the art on all sides.
+const PORTRAIT_ART_HALF = 95
+
+export interface BreakdownPortraitLocation {
+  variant: 'A' | 'B'
+  centerX: number
+  centerY: number
+  /** Square art-crop box [x, y, width, height], safe inside the ring. */
+  cropBox: { x: number; y: number; w: number; h: number }
+}
+
+/**
+ * Detect the breakdown grid variant for an image and return the fixed
+ * R1C1 portrait center + a safe square art-crop box. Uses the same
+ * detectVariant() as the stat OCR, so layout decisions never diverge.
+ */
+export function getBreakdownPortraitLocation(
+  img: HTMLImageElement
+): BreakdownPortraitLocation {
+  const canvas = imageToCanvas(img)
+  const { data, width, height } = getPixelArray(canvas)
+  const variant = detectVariant(data, width, height)
+  const centerX = VARIANTS[variant].col_starts[0] + R1C1_PORTRAIT_DX
+  const centerY = R1C1_PORTRAIT_CY
+  return {
+    variant,
+    centerX,
+    centerY,
+    cropBox: {
+      x: centerX - PORTRAIT_ART_HALF,
+      y: centerY - PORTRAIT_ART_HALF,
+      w: PORTRAIT_ART_HALF * 2,
+      h: PORTRAIT_ART_HALF * 2,
+    },
+  }
+}
+
+// ============================================================
+// EXPORTED TEMPLATE MATCHING API
+// Used by ocr-extractor.ts for summary page digit extraction.
+// Provides access to the proven template matching engine without
+// exposing internal implementation details.
+// ============================================================
+
+/**
+ * Read a numeric value from a rectangular region of an image.
+ * Binarizes the region at the given threshold, then runs the full
+ * template matching pipeline (connected components → smart segmentation
+ * → NCC matching → post-processing).
+ *
+ * @param data - Full image pixel data (RGBA Uint8ClampedArray)
+ * @param imgWidth - Full image width
+ * @param cropX - Left edge of region to read
+ * @param cropY - Top edge of region to read
+ * @param cropW - Width of region
+ * @param cropH - Height of region
+ * @param threshold - Binarization threshold (default 120)
+ * @returns { value, confidence } — e.g. { value: "30", confidence: 0.95 }
+ */
+export function readRegionValue(
+  data: Uint8ClampedArray,
+  imgWidth: number,
+  cropX: number,
+  cropY: number,
+  cropW: number,
+  cropH: number,
+  threshold: number = THRESH
+): { value: string; confidence: number } {
+  const binary = new Uint8Array(cropW * cropH)
+
+  for (let y = 0; y < cropH; y++) {
+    for (let x = 0; x < cropW; x++) {
+      const srcX = cropX + x
+      const srcY = cropY + y
+      const idx = (srcY * imgWidth + srcX) * 4
+      const r = data[idx], g = data[idx + 1], b = data[idx + 2]
+      const gray = 0.299 * r + 0.587 * g + 0.114 * b
+      binary[y * cropW + x] = gray > threshold ? 255 : 0
+    }
+  }
+
+  return readValue(binary, cropW, cropH)
+}
+
+/**
+ * Read a numeric value using multi-threshold voting (120, 130, 140).
+ * Runs readRegionValue at three thresholds and uses majority vote
+ * to resolve ambiguous digits (e.g. "2" vs "9" at boundary thresholds).
+ *
+ * Same parameters as readRegionValue minus threshold.
+ */
+export function readRegionValueMultiThreshold(
+  data: Uint8ClampedArray,
+  imgWidth: number,
+  cropX: number,
+  cropY: number,
+  cropW: number,
+  cropH: number
+): { value: string; confidence: number } {
+  const results = ALL_THRESHOLDS.map(thresh =>
+    readRegionValue(data, imgWidth, cropX, cropY, cropW, cropH, thresh)
+  )
+
+  const values = results.map(r => r.value)
+  const confs = results.map(r => r.confidence)
+
+  // If all three agree, return immediately
+  if (values[0] === values[1] && values[1] === values[2]) {
+    return results[0]
+  }
+
+  // Instability detected — majority vote
+  console.log(`[template-api] Instability: ${ALL_THRESHOLDS.map((t, i) => `t${t}="${values[i]}"`).join(', ')}`)
+
+  if (values[0].length === values[1].length && values[1].length === values[2].length) {
+    const voted: string[] = []
+    for (let i = 0; i < values[0].length; i++) {
+      const c0 = values[0][i], c1 = values[1][i], c2 = values[2][i]
+      if (c0 === c1 || c0 === c2) voted.push(c0)
+      else if (c1 === c2) voted.push(c1)
+      else voted.push(values[confs.indexOf(Math.max(...confs))][i])
+    }
+    return { value: voted.join(''), confidence: Math.max(...confs) }
+  }
+
+  // Different lengths — pick most common
+  const countMap = new Map<string, number>()
+  for (const v of values) countMap.set(v, (countMap.get(v) || 0) + 1)
+  let bestValue = values[0], bestCount = 0
+  for (const [v, count] of countMap) {
+    if (count > bestCount) { bestCount = count; bestValue = v }
+  }
+  const matchIdx = values.indexOf(bestValue)
+  return { value: bestValue, confidence: confs[matchIdx] }
 }

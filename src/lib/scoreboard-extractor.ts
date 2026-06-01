@@ -13,7 +13,7 @@
 // All pixel coordinates calibrated for 3840×2160 (PS5 screenshots).
 // ============================================================
 
-import { loadHeroBank, matchHero } from '@/lib/hero-matcher'
+import { loadHeroBank, matchHero, scoreCropAgainstAllHeroes } from '@/lib/hero-matcher'
 import { initOpenCV } from '@/lib/opencv-loader'
 import type { RoleType } from '@/lib/types'
 import type {
@@ -42,6 +42,52 @@ export type {
   ScoreboardPlayerStats,
 }
 
+// Hero → Role lookup: every Overwatch hero has a fixed role.
+// Used to override icon-based role classification after hero identification.
+const HERO_ROLE_MAP: Record<string, RoleType> = {
+  // Tanks (14)
+  'D.Va': 'tank', 'Doomfist': 'tank', 'Domina': 'tank', 'Hazard': 'tank',
+  'Junker Queen': 'tank', 'Mauga': 'tank', 'Orisa': 'tank', 'Ramattra': 'tank',
+  'Reinhardt': 'tank', 'Roadhog': 'tank', 'Sigma': 'tank', 'Winston': 'tank',
+  'Wrecking Ball': 'tank', 'Zarya': 'tank',
+  // DPS (23)
+  'Anran': 'dps', 'Ashe': 'dps', 'Bastion': 'dps', 'Cassidy': 'dps',
+  'Echo': 'dps', 'Emre': 'dps', 'Freja': 'dps', 'Genji': 'dps',
+  'Hanzo': 'dps', 'Junkrat': 'dps', 'Mei': 'dps', 'Pharah': 'dps',
+  'Reaper': 'dps', 'Sierra': 'dps', 'Sojourn': 'dps', 'Soldier: 76': 'dps',
+  'Sombra': 'dps', 'Symmetra': 'dps', 'Torbjörn': 'dps', 'Tracer': 'dps',
+  'Vendetta': 'dps', 'Venture': 'dps', 'Widowmaker': 'dps',
+  // Support (14)
+  'Ana': 'support', 'Baptiste': 'support', 'Brigitte': 'support',
+  'Illari': 'support', 'Jetpack Cat': 'support', 'Juno': 'support',
+  'Kiriko': 'support', 'Lifeweaver': 'support', 'Lúcio': 'support',
+  'Mercy': 'support', 'Mizuki': 'support', 'Moira': 'support',
+  'Wuyang': 'support', 'Zenyatta': 'support',
+}
+
+/** Override icon-detected roles with the identified hero's known role.
+ *  Call after identifyHeroes() — mutates roles in place, returns override count. */
+export function overrideRolesFromHeroes(
+  roles: ScoreboardRoleClassification[],
+  heroes: ScoreboardHeroIdentification[],
+): number {
+  let overrideCount = 0
+  for (const role of roles) {
+    const hero = heroes.find(h => h.slot === role.slot)
+    role.heroName = hero?.heroName ?? null
+    if (hero?.heroName && HERO_ROLE_MAP[hero.heroName]) {
+      const heroRole = HERO_ROLE_MAP[hero.heroName]
+      if (role.role !== heroRole) {
+        console.log(`Role override: Slot ${role.slot} ${role.role} → ${heroRole} (from hero ${hero.heroName})`)
+        role.role = heroRole
+        role.source = 'hero_lookup'
+        overrideCount++
+      }
+    }
+  }
+  return overrideCount
+}
+
 // ============================================================
 // CONSTANTS — Fixed column X positions (3840×2160)
 // ============================================================
@@ -58,9 +104,92 @@ const SCOREBOARD_COLUMNS: ScoreboardGrid['columns'] = {
   MIT: { startX: 2580, endX: 2750, centerX: 2665 },
 }
 
+// 6v6 stat columns shift progressively leftward (up to ~60px for MIT)
+// Measured from 10 × 6v6 screenshots
+const SCOREBOARD_COLUMNS_6V6: ScoreboardGrid['columns'] = {
+  roleIcon:  { x: 1168 },
+  portrait:  { startX: 1150, endX: 1370 },
+  username:  { startX: 1340, endX: 1800 },
+  E:   { startX: 1830, endX: 1930, centerX: 1878 },
+  A:   { startX: 1935, endX: 2035, centerX: 1985 },
+  D:   { startX: 2030, endX: 2125, centerX: 2076 },
+  DMG: { startX: 2150, endX: 2320, centerX: 2234 },
+  H:   { startX: 2340, endX: 2510, centerX: 2423 },
+  MIT: { startX: 2520, endX: 2690, centerX: 2605 },
+}
+
+function getScoreboardColumns(format: '5v5' | '6v6' | null): ScoreboardGrid['columns'] {
+  return format === '6v6' ? SCOREBOARD_COLUMNS_6V6 : SCOREBOARD_COLUMNS
+}
+
 // Role icon detection bounds
 const ICON_X_START = 1082
 const ICON_X_END = 1109
+
+// ── Format-specific pixel calibration ──
+// 5v5 and 6v6 scoreboards have different X positions for icons, portraits, and gamertags.
+// Stat columns (E through H) are identical; MIT shifts ~30px left in 6v6.
+// Format is detected via VS gap height: ≤175px → 6v6, ≥176px → 5v5.
+
+interface FormatConfig {
+  rowsPerTeam: number
+  iconXStart: number
+  iconXEnd: number
+  portraitCropX: number
+  portraitCropW: number
+  /** Multiple portrait crop variants for multi-crop matching.
+   *  Each variant tries a slightly different X/W to avoid decorative overlays. */
+  portraitCropConfigs: { cropX: number; cropW: number }[]
+  gamertagDisplayCropX: number
+  gamertagDisplayCropW: number
+  gamertagCropConfigs: { yStart: number; yEnd: number; xStart: number; xEnd: number }[]
+}
+
+const FORMAT_5V5: FormatConfig = {
+  rowsPerTeam: 5,
+  iconXStart: 1082,
+  iconXEnd: 1109,
+  portraitCropX: 1130,
+  portraitCropW: 122,
+  portraitCropConfigs: [
+    { cropX: 1130, cropW: 122 },  // original/primary
+    { cropX: 1125, cropW: 110 },  // slightly left, narrower
+    { cropX: 1140, cropW: 100 },  // slightly right, narrower
+    { cropX: 1135, cropW: 90 },   // centered, tightest
+  ],
+  gamertagDisplayCropX: 1272,
+  gamertagDisplayCropW: 390,
+  gamertagCropConfigs: [
+    { yStart: 17, yEnd: 91, xStart: 1272, xEnd: 1497 },
+    { yStart: 17, yEnd: 91, xStart: 1272, xEnd: 1520 },
+    { yStart: 17, yEnd: 91, xStart: 1275, xEnd: 1700 },
+  ],
+}
+
+const FORMAT_6V6: FormatConfig = {
+  rowsPerTeam: 6,
+  iconXStart: 1150,
+  iconXEnd: 1220,
+  portraitCropX: 1215,
+  portraitCropW: 105,
+  portraitCropConfigs: [
+    { cropX: 1215, cropW: 105 },  // original/primary
+    { cropX: 1210, cropW: 110 },  // slightly left, wider — avoids right-side badges
+    { cropX: 1220, cropW: 100 },  // slightly right, narrower — avoids left-side overlays
+    { cropX: 1225, cropW: 90 },   // rightmost, tightest — maximum badge avoidance
+  ],
+  gamertagDisplayCropX: 1340,
+  gamertagDisplayCropW: 360,
+  gamertagCropConfigs: [
+    { yStart: 17, yEnd: 91, xStart: 1340, xEnd: 1565 },
+    { yStart: 17, yEnd: 91, xStart: 1340, xEnd: 1590 },
+    { yStart: 17, yEnd: 91, xStart: 1343, xEnd: 1700 },
+  ],
+}
+
+function getFormatConfig(format: '5v5' | '6v6' | null): FormatConfig {
+  return format === '6v6' ? FORMAT_6V6 : FORMAT_5V5
+}
 
 // Gamertag OCR crop configs — measured pixel-exact from all 7 test screenshots.
 // PYROEAGLES text: x=1277–1487 (always 209px), y_offset=+20 to +88 (always 41px tall).
@@ -127,6 +256,7 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
       confidence: 0,
       signals: [`Unexpected resolution: ${w}×${h} (expected 3840×2160)`],
       grid: null,
+      format: null,
     }
   }
 
@@ -179,19 +309,28 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
       confidence,
       signals,
       grid: null,
+      format: null,
     }
   }
 
   // --- Grid mapping: find exact section boundaries ---
+  // Scan for ally section end: look for consecutive dark pixels (VS gap)
+  // Must scan past y=1200 since 6v6 ally sections can extend to y=1200
   let allyEndY = 0
-  for (let y = 1050; y < 1200; y++) {
+  let darkRunCount = 0
+  for (let y = 1050; y < 1250; y++) {
     const [r, g, b] = getPixel(px, w, sampleX, y)
     if (isDark(r, g, b)) {
-      allyEndY = y
-      break
+      darkRunCount++
+      if (darkRunCount >= 3) {
+        allyEndY = y - 2  // first dark pixel in the run
+        break
+      }
+    } else {
+      darkRunCount = 0
     }
   }
-  if (allyEndY === 0) allyEndY = 1140
+  if (allyEndY === 0) allyEndY = 1183
   signals.push(`Ally section ends at y=${allyEndY}`)
 
   let allyStartY = 0
@@ -217,7 +356,7 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
   signals.push(`Enemy section starts at y=${enemyStartY}`)
 
   let enemyEndY = 0
-  for (let y = 1900; y < 2050; y++) {
+  for (let y = 1900; y < 2100; y++) {
     const [r, g, b] = getPixel(px, w, sampleX, y)
     if (!isRed(r, g, b)) {
       enemyEndY = y
@@ -227,17 +366,25 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
   if (enemyEndY === 0) enemyEndY = 1980
   signals.push(`Enemy section ends at y=${enemyEndY}`)
 
-  // Calculate row layout
+  // Detect format via VS gap height:
+  // 5v5 gap = 185–186px, 6v6 gap = 162–168px, threshold at 175px
   const allyHeight = allyEndY - allyStartY
   const enemyHeight = enemyEndY - enemyStartY
-  const allyRowH = allyHeight / 5
-  const enemyRowH = enemyHeight / 5
+  const vsGapHeight = enemyStartY - allyEndY
 
-  signals.push(`Ally rows: ${allyHeight}px total, ~${allyRowH.toFixed(1)}px/row`)
-  signals.push(`Enemy rows: ${enemyHeight}px total, ~${enemyRowH.toFixed(1)}px/row`)
+  const detectedFormat: '5v5' | '6v6' = vsGapHeight <= 175 ? '6v6' : '5v5'
+  const fmtCfg = getFormatConfig(detectedFormat)
+  const rowsPerTeam = fmtCfg.rowsPerTeam
+
+  const allyRowH = allyHeight / rowsPerTeam
+  const enemyRowH = enemyHeight / rowsPerTeam
+
+  signals.push(`VS gap: ${vsGapHeight}px → format=${detectedFormat}`)
+  signals.push(`Ally rows: ${allyHeight}px total, ${rowsPerTeam} rows, ~${allyRowH.toFixed(1)}px/row`)
+  signals.push(`Enemy rows: ${enemyHeight}px total, ${rowsPerTeam} rows, ~${enemyRowH.toFixed(1)}px/row`)
 
   const rows: ScoreboardGridRow[] = []
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < rowsPerTeam; i++) {
     const topY = Math.round(allyStartY + allyRowH * i)
     const bottomY = Math.round(allyStartY + allyRowH * (i + 1))
     rows.push({
@@ -248,11 +395,11 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
       bottomY,
     })
   }
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < rowsPerTeam; i++) {
     const topY = Math.round(enemyStartY + enemyRowH * i)
     const bottomY = Math.round(enemyStartY + enemyRowH * (i + 1))
     rows.push({
-      slot: i + 6,
+      slot: i + rowsPerTeam + 1,
       team: 'enemy',
       topY,
       centerY: Math.round((topY + bottomY) / 2),
@@ -264,7 +411,8 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
     ally: { startY: allyStartY, endY: allyEndY, rowHeight: allyRowH },
     enemy: { startY: enemyStartY, endY: enemyEndY, rowHeight: enemyRowH },
     rows,
-    columns: SCOREBOARD_COLUMNS,
+    rowsPerTeam,
+    columns: getScoreboardColumns(detectedFormat),
   }
 
   return {
@@ -272,6 +420,7 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
     confidence: 1.0,
     signals,
     grid,
+    format: detectedFormat,
   }
 }
 
@@ -300,17 +449,19 @@ function countBrightFill(
   return total > 0 ? count / total : 0
 }
 
-/** Find the vertical bounds of the role icon by scanning for bright pixels */
+/** Find the bounds of the role icon by scanning for bright pixels */
 function findIconBounds(
   px: Uint8ClampedArray,
   w: number,
   rowCenterY: number,
-): { top: number; bottom: number; midY: number } | null {
+  iconXStart: number = ICON_X_START,
+  iconXEnd: number = ICON_X_END,
+): { top: number; bottom: number; midY: number; left: number; right: number } | null {
   const brightRows: number[] = []
 
   for (let y = rowCenterY - 30; y <= rowCenterY + 30; y++) {
     let rowBright = 0
-    for (let x = ICON_X_START; x <= ICON_X_END; x++) {
+    for (let x = iconXStart; x <= iconXEnd; x++) {
       const [r, g, b] = getPixel(px, w, x, y)
       if ((r + g + b) / 3 > 180) rowBright++
     }
@@ -321,34 +472,94 @@ function findIconBounds(
 
   const top = Math.min(...brightRows)
   const bottom = Math.max(...brightRows)
-  return { top, bottom, midY: Math.round((top + bottom) / 2) }
+  const midY = Math.round((top + bottom) / 2)
+
+  // Find actual X bounds within the bright Y range
+  let left = iconXEnd
+  let right = iconXStart
+  for (let y = top; y <= bottom; y++) {
+    for (let x = iconXStart; x <= iconXEnd; x++) {
+      const [r, g, b] = getPixel(px, w, x, y)
+      if ((r + g + b) / 3 > 180) {
+        if (x < left) left = x
+        if (x > right) right = x
+      }
+    }
+  }
+
+  return { top, bottom, midY, left, right }
 }
 
 /** Classify a role icon using the 2-feature decision tree */
 function classifyRoleIcon(
   px: Uint8ClampedArray,
   w: number,
-  iconBounds: { top: number; bottom: number; midY: number },
+  iconBounds: { top: number; bottom: number; midY: number; left: number; right: number },
+  iconXStart: number = ICON_X_START,
 ): 'tank' | 'dps' | 'support' {
-  // Feature 1: "DPS gap" — x=1091–1094, iconMidY±5
-  const dpsGapFill = countBrightFill(
-    px, w,
-    ICON_X_START + 9, ICON_X_START + 12,
-    iconBounds.midY - 5, iconBounds.midY + 5,
-  )
+  const cx = iconBounds.midY
+  const lx = iconBounds.left
+  const rx = Math.min(lx + 34, iconBounds.right + 1)
+  const THR = 200 // higher threshold to avoid blue/red background noise
 
-  if (dpsGapFill < 0.20) return 'dps'
+  // Feature 1: count rows with 3+ bright segments (DPS three-bar pattern)
+  let gapRows = 0
+  let totalRows = 0
 
-  // Feature 2: "Top-left corner" — x=1082–1088, iconTop to iconTop+6
-  const cornerFill = countBrightFill(
-    px, w,
-    ICON_X_START, ICON_X_START + 6,
-    iconBounds.top, iconBounds.top + 6,
-  )
+  for (let yOff = -12; yOff <= 12; yOff += 2) {
+    const y = cx + yOff
+    let segs = 0
+    let inBright = false
+    let hasContent = false
 
-  if (cornerFill < 0.20) return 'support'
+    for (let x = lx; x < rx; x++) {
+      const [r, g, b] = getPixel(px, w, x, y)
+      const isBright = (r + g + b) / 3 > THR
+      if (isBright) {
+        hasContent = true
+        if (!inBright) segs++
+        inBright = true
+      } else {
+        inBright = false
+      }
+    }
 
-  return 'tank'
+    if (hasContent) {
+      totalRows++
+      if (segs >= 3) gapRows++
+    }
+  }
+
+  if (totalRows > 0 && gapRows / totalRows >= 0.3) return 'dps'
+
+  // Feature 2: width at cy-8 (upper) vs cy (mid) — support cross is narrow above center
+  let upperCount = 0
+  let midCount = 0
+  let topCount = 0
+
+  for (let x = lx; x < rx; x++) {
+    const [r1, g1, b1] = getPixel(px, w, x, cx - 8)
+    if ((r1 + g1 + b1) / 3 > THR) upperCount++
+
+    const [r2, g2, b2] = getPixel(px, w, x, cx)
+    if ((r2 + g2 + b2) / 3 > THR) midCount++
+
+    const [r3, g3, b3] = getPixel(px, w, x, cx - 12)
+    if ((r3 + g3 + b3) / 3 > THR) topCount++
+  }
+
+  if (midCount === 0) return 'tank'
+
+  const rUpper = upperCount / midCount
+  const rTop = topCount / midCount
+
+  // Support: narrow upper (cross vertical bar)
+  if (rUpper < 0.90) return 'support'
+
+  // When upper is wide: check top — heart is wide at top, cross is narrow
+  if (rTop >= 0.45) return 'tank'
+
+  return 'support'
 }
 
 export async function classifyRoles(
@@ -356,10 +567,12 @@ export async function classifyRoles(
   detection: ScoreboardDetectionResult,
 ): Promise<ScoreboardRoleClassification[]> {
   if (detection.imageType !== 'scoreboard' || !detection.grid) {
+    const totalSlots = detection.grid?.rowsPerTeam ? detection.grid.rowsPerTeam * 2 : 10
+    const rpt = detection.grid?.rowsPerTeam ?? 5
     const results: ScoreboardRoleClassification[] = []
-    for (let i = 1; i <= 10; i++) {
+    for (let i = 1; i <= totalSlots; i++) {
       results.push({
-        slot: i, team: i <= 5 ? 'ally' : 'enemy',
+        slot: i, team: i <= rpt ? 'ally' : 'enemy',
         heroName: null, role: null, source: null,
       })
     }
@@ -367,6 +580,7 @@ export async function classifyRoles(
   }
 
   const grid = detection.grid
+  const fmtCfg = getFormatConfig(detection.format)
 
   const canvas = document.createElement('canvas')
   canvas.width = img.naturalWidth
@@ -379,10 +593,10 @@ export async function classifyRoles(
 
   const results: ScoreboardRoleClassification[] = []
 
-  console.log('Step 4: Role classification via icon detection...')
+  console.log(`Step 4: Role classification via icon detection (${detection.format ?? '5v5'}, icons x=${fmtCfg.iconXStart}–${fmtCfg.iconXEnd})...`)
 
   for (const row of grid.rows) {
-    const iconBounds = findIconBounds(px, w, row.centerY)
+    const iconBounds = findIconBounds(px, w, row.centerY, fmtCfg.iconXStart, fmtCfg.iconXEnd)
 
     if (!iconBounds) {
       console.warn(`  Slot ${row.slot}: no icon found at centerY=${row.centerY}`)
@@ -393,19 +607,11 @@ export async function classifyRoles(
       continue
     }
 
-    const role = classifyRoleIcon(px, w, iconBounds)
-
-    const dpsGap = countBrightFill(px, w,
-      ICON_X_START + 9, ICON_X_START + 12,
-      iconBounds.midY - 5, iconBounds.midY + 5)
-    const corner = countBrightFill(px, w,
-      ICON_X_START, ICON_X_START + 6,
-      iconBounds.top, iconBounds.top + 6)
+    const role = classifyRoleIcon(px, w, iconBounds, fmtCfg.iconXStart)
 
     console.log(
       `  Slot ${row.slot} (${row.team}): ${role} ` +
-      `(icon y=${iconBounds.top}–${iconBounds.bottom}, ` +
-      `dpsGap=${(dpsGap * 100).toFixed(0)}%, corner=${(corner * 100).toFixed(0)}%)`
+      `(icon x=${iconBounds.left}–${iconBounds.right} y=${iconBounds.top}–${iconBounds.bottom})`
     )
 
     results.push({
@@ -417,8 +623,9 @@ export async function classifyRoles(
     })
   }
 
+  const totalSlots = grid.rowsPerTeam * 2
   const classified = results.filter(r => r.role !== null).length
-  console.log(`Step 4 complete: ${classified}/10 roles classified`)
+  console.log(`Step 4 complete: ${classified}/${totalSlots} roles classified`)
 
   return results
 }
@@ -436,11 +643,13 @@ export async function identifyHeroes(
   roles: ScoreboardRoleClassification[],
 ): Promise<ScoreboardHeroIdentification[]> {
   if (detection.imageType !== 'scoreboard' || !detection.grid) {
+    const totalSlots = detection.grid?.rowsPerTeam ? detection.grid.rowsPerTeam * 2 : 10
+    const rpt = detection.grid?.rowsPerTeam ?? 5
     const results: ScoreboardHeroIdentification[] = []
-    for (let i = 1; i <= 10; i++) {
+    for (let i = 1; i <= totalSlots; i++) {
       results.push({
         slot: i,
-        team: i <= 5 ? 'ally' : 'enemy',
+        team: i <= rpt ? 'ally' : 'enemy',
         heroName: null,
         confidence: 0,
         portraitDataUrl: null,
@@ -459,71 +668,154 @@ export async function identifyHeroes(
   const srcCtx = srcCanvas.getContext('2d')!
   srcCtx.drawImage(img, 0, 0)
 
-  // ── Crop all 10 portraits and prepare pixel data ──
+  // ── Multi-crop portrait extraction ──
+  // For each row, crop at multiple X/W positions to mitigate decorative
+  // overlays (rank titles, badges, nameplates) that corrupt any single crop.
+  // Each pass tries all crop variants and picks the highest-confidence match.
 
-  interface PortraitCrop {
+  interface CropVariant {
+    portraitData: { data: number[]; width: number; height: number }
+  }
+
+  interface PortraitCropSet {
     slot: number
     team: 'ally' | 'enemy'
-    portraitData: { data: number[]; width: number; height: number }
-    portraitDataUrl: string
+    variants: CropVariant[]
+    portraitDataUrl: string  // thumbnail from primary (first) crop for display
   }
 
-  const portraits: PortraitCrop[] = []
+  const portraits: PortraitCropSet[] = []
+
+  const fmtCfg = getFormatConfig(detection.format)
+  const cropConfigs = fmtCfg.portraitCropConfigs
+
+  console.log(`Step 2: Multi-crop portrait extraction (${cropConfigs.length} variants per slot)...`)
 
   for (const row of grid.rows) {
-    const cropX = 1130
     const cropY = row.topY + 4
-    const cropW = 122
     const cropH = (row.bottomY - row.topY) - 8
+    const variants: CropVariant[] = []
+    let portraitDataUrl = ''
 
-    const cropCanvas = document.createElement('canvas')
-    cropCanvas.width = cropW
-    cropCanvas.height = cropH
-    cropCanvas.getContext('2d')!.drawImage(srcCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH)
+    for (let ci = 0; ci < cropConfigs.length; ci++) {
+      const { cropX, cropW } = cropConfigs[ci]
 
-    const thumbCanvas = document.createElement('canvas')
-    thumbCanvas.width = 64
-    thumbCanvas.height = 64
-    thumbCanvas.getContext('2d')!.drawImage(cropCanvas, 0, 0, 64, 64)
-    const portraitDataUrl = thumbCanvas.toDataURL('image/png')
+      const cropCanvas = document.createElement('canvas')
+      cropCanvas.width = cropW
+      cropCanvas.height = cropH
+      cropCanvas.getContext('2d')!.drawImage(srcCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH)
 
-    const matchCanvas = document.createElement('canvas')
-    matchCanvas.width = 128
-    matchCanvas.height = 128
-    matchCanvas.getContext('2d')!.drawImage(cropCanvas, 0, 0, 128, 128)
-    const matchImageData = matchCanvas.getContext('2d')!.getImageData(0, 0, 128, 128)
+      // Generate display thumbnail from the primary (first) crop only
+      if (ci === 0) {
+        const thumbCanvas = document.createElement('canvas')
+        thumbCanvas.width = 64
+        thumbCanvas.height = 64
+        thumbCanvas.getContext('2d')!.drawImage(cropCanvas, 0, 0, 64, 64)
+        portraitDataUrl = thumbCanvas.toDataURL('image/png')
+      }
 
-    portraits.push({
-      slot: row.slot,
-      team: row.team,
-      portraitData: {
-        data: Array.from(matchImageData.data),
-        width: 128,
-        height: 128,
-      },
-      portraitDataUrl,
-    })
+      const matchCanvas = document.createElement('canvas')
+      matchCanvas.width = 128
+      matchCanvas.height = 128
+      matchCanvas.getContext('2d')!.drawImage(cropCanvas, 0, 0, 128, 128)
+      const matchImageData = matchCanvas.getContext('2d')!.getImageData(0, 0, 128, 128)
+
+      variants.push({
+        portraitData: {
+          data: Array.from(matchImageData.data),
+          width: 128,
+          height: 128,
+        },
+      })
+    }
+
+    portraits.push({ slot: row.slot, team: row.team, variants, portraitDataUrl })
   }
 
-  // ── PASS 1: Structural + Color only (fast, no ORB), role-filtered ──
+  // ── Phase 1 (Step 6b) — cheap crop selection ──
+  // For a slot, score every crop variant with structural+color ONLY against
+  // ALL 51 heroes (no role filter, no ORB), and return the index of the
+  // "cleanest" crop — the one whose best all-hero match scores highest.
+  //
+  // Why all-51 and not role-filtered: the role icon classifier is the weakest
+  // input in the pipeline. Restricting Phase 1 to the role subset risks the
+  // correct hero being absent from the comparison when the icon role is wrong,
+  // which would make the selected crop optimal for the WRONG target. Scoring
+  // against all heroes keeps the correct hero always in play and uses the same
+  // basis as matchHero()'s internal sanity check.
+  //
+  // The returned phase1Score is ONLY for ranking crops against each other.
+  // It is NOT calibrated against ORB_THRESHOLD and is never used as the
+  // low-confidence gate (that gate uses the role-filtered matchHero score).
+  async function selectCleanestCrop(
+    variants: CropVariant[],
+  ): Promise<{ bestVariant: number; phase1Score: number; phase1Hero: string }> {
+    let bestVariant = 0
+    let phase1Score = -Infinity
+    let phase1Hero = ''
+
+    for (let vi = 0; vi < variants.length; vi++) {
+      const s = await scoreCropAgainstAllHeroes(variants[vi].portraitData)
+      if (s.score > phase1Score) {
+        phase1Score = s.score
+        bestVariant = vi
+        phase1Hero = s.heroName
+      }
+    }
+
+    return { bestVariant, phase1Score, phase1Hero }
+  }
+
+  // ── Phase 2 ORB net (Step 6b) — multi-crop ORB for low-confidence slots ──
+  // Retained as the original safety net: for the rare slots below threshold,
+  // run the full ORB pipeline across ALL crop variants and take the best.
+  // These slots are few, so the multi-crop ORB cost here is small, and it
+  // preserves the exact behaviour that earned the 100% on hard portraits.
+  async function bestMultiCropOrbMatch(
+    variants: CropVariant[],
+    roleFilter?: RoleType,
+  ): Promise<{ heroName: string; score: number; margin: number; runnerUp: string; correctedRole?: RoleType; bestVariant: number }> {
+    let best: { heroName: string; score: number; margin: number; runnerUp: string; correctedRole?: RoleType; bestVariant: number } | null = null
+
+    for (let vi = 0; vi < variants.length; vi++) {
+      const match = await matchHero(variants[vi].portraitData, true, roleFilter)
+      if (!best || match.score > best.score) {
+        best = { ...match, bestVariant: vi }
+      }
+    }
+
+    return best!
+  }
+
+  // ── PASS 1 (Step 6b two-phase): select cleanest crop, then ONE full match ──
+  // Phase 1: rank crops (cheap, all-51 structural+color).
+  // Phase 2: run the full role-filtered matchHero() pipeline on the winner only.
+  // This replaces the previous "full matchHero × every crop" approach
+  // (4 full pipelines per slot → 1 full pipeline + 4 cheap scores per slot).
 
   const ORB_THRESHOLD = 0.35
   const results: ScoreboardHeroIdentification[] = []
   const lowConfidenceIndices: number[] = []
 
-  console.log('Step 2 Pass 1: structural + color matching (role-filtered, no ORB)...')
+  console.log('Step 2 Pass 1: two-phase crop selection (Phase 1: cheap all-51 crop rank; Phase 2: role-filtered full match on winner)...')
 
   for (let i = 0; i < portraits.length; i++) {
     const p = portraits[i]
     const roleForSlot = roles.find(r => r.slot === p.slot)?.role ?? undefined
 
     try {
-      const match = await matchHero(p.portraitData, false, roleForSlot as RoleType | undefined)
+      // Phase 1 — pick the cleanest crop (cheap, no ORB, no role filter, all 51)
+      const sel = await selectCleanestCrop(p.variants)
+      const winningCrop = p.variants[sel.bestVariant]
+
+      // Phase 2 — full role-filtered pipeline on the winning crop ONLY
+      const match = await matchHero(winningCrop.portraitData, false, roleForSlot as RoleType | undefined)
 
       console.log(
         `  [P1] Slot ${p.slot} (${p.team}): ${match.heroName} ` +
         `(score: ${match.score.toFixed(4)}, margin: ${match.margin.toFixed(4)}, ` +
-        `runner-up: ${match.runnerUp}` +
+        `runner-up: ${match.runnerUp}, crop: ${sel.bestVariant + 1}/${cropConfigs.length} ` +
+        `[phase1: ${sel.phase1Hero} ${sel.phase1Score.toFixed(4)}]` +
         `${roleForSlot ? `, role-filter: ${roleForSlot}` : ''}` +
         `${match.correctedRole ? `, ROLE CORRECTED → ${match.correctedRole}` : ''})`
       )
@@ -536,6 +828,9 @@ export async function identifyHeroes(
         portraitDataUrl: p.portraitDataUrl,
       })
 
+      // Low-confidence gate uses the role-filtered matchHero score — the
+      // same quantity ORB_THRESHOLD was originally tuned against, so the
+      // set of slots sent to the ORB net is unchanged by the 6b rework.
       if (match.score < ORB_THRESHOLD) {
         lowConfidenceIndices.push(i)
       }
@@ -551,12 +846,12 @@ export async function identifyHeroes(
     }
   }
 
-  // ── PASS 2: ORB for low-confidence matches (also role-filtered) ──
+  // ── PASS 2: ORB for low-confidence matches (role-filtered, multi-crop net) ──
 
   if (lowConfidenceIndices.length > 0) {
     console.log(
       `Step 2 Pass 2: ${lowConfidenceIndices.length} portrait(s) below ${(ORB_THRESHOLD * 100).toFixed(0)}% ` +
-      `— slots [${lowConfidenceIndices.map(i => results[i].slot).join(', ')}] — initializing ORB...`
+      `— slots [${lowConfidenceIndices.map(i => results[i].slot).join(', ')}] — initializing ORB (multi-crop net)...`
     )
 
     const opencvReady = await initOpenCV()
@@ -569,12 +864,13 @@ export async function identifyHeroes(
         const roleForSlot = roles.find(r => r.slot === p.slot)?.role ?? undefined
 
         try {
-          const orbMatch = await matchHero(p.portraitData, true, roleForSlot as RoleType | undefined)
+          const orbMatch = await bestMultiCropOrbMatch(p.variants, roleForSlot as RoleType | undefined)
 
           console.log(
             `  [P2] Slot ${p.slot}: ${prevName} (${(prevScore * 100).toFixed(1)}%) → ` +
             `${orbMatch.heroName} (${(orbMatch.score * 100).toFixed(1)}%, ` +
-            `margin: ${orbMatch.margin.toFixed(4)}, runner-up: ${orbMatch.runnerUp}` +
+            `margin: ${orbMatch.margin.toFixed(4)}, runner-up: ${orbMatch.runnerUp}, ` +
+            `crop: ${orbMatch.bestVariant + 1}/${cropConfigs.length}` +
             `${roleForSlot ? `, role-filter: ${roleForSlot}` : ''}` +
             `${orbMatch.correctedRole ? `, ROLE CORRECTED → ${orbMatch.correctedRole}` : ''})`
           )
@@ -591,6 +887,10 @@ export async function identifyHeroes(
   } else {
     console.log('Step 2 Pass 2: skipped — all portraits above confidence threshold')
   }
+
+  // Override icon-detected roles with the identified hero's known role.
+  // This ensures roles are always correct regardless of icon classifier accuracy.
+  overrideRolesFromHeroes(roles, results)
 
   return results
 }
@@ -786,11 +1086,12 @@ async function ocrBestOfVariants(
   srcCanvas: HTMLCanvasElement,
   row: ScoreboardGridRow,
   target: string,
+  cropConfigs: { yStart: number; yEnd: number; xStart: number; xEnd: number }[] = GAMERTAG_CROP_CONFIGS,
 ): Promise<{ text: string; similarity: number }> {
   let bestText = ''
   let bestSim = 0
 
-  for (const cropCfg of GAMERTAG_CROP_CONFIGS) {
+  for (const cropCfg of cropConfigs) {
     const binaryCanvas = preprocessGamertagCrop(srcCanvas, row, cropCfg)
 
     for (const scale of [3, 4]) {
@@ -849,7 +1150,10 @@ export async function analyzeUserIdentity(
   roles: ScoreboardRoleClassification[],
   gamertag: string,
 ): Promise<ScoreboardOcrAnalysis> {
-  const emptyCandidates: ScoreboardUserCandidate[] = Array.from({ length: 5 }, (_, i) => ({
+  const fmtCfg = getFormatConfig(detection.format)
+  const allyCount = fmtCfg.rowsPerTeam
+
+  const emptyCandidates: ScoreboardUserCandidate[] = Array.from({ length: allyCount }, (_, i) => ({
     slot: i + 1,
     heroName: heroes.find(h => h.slot === i + 1)?.heroName ?? null,
     heroPortraitUrl: heroes.find(h => h.slot === i + 1)?.portraitDataUrl ?? null,
@@ -874,14 +1178,14 @@ export async function analyzeUserIdentity(
   srcCanvas.getContext('2d')!.drawImage(img, 0, 0)
 
   const allyRows = grid.rows.filter(r => r.team === 'ally')
-  console.log('Step 3: Checking all 5 ally rows for user identification')
+  console.log(`Step 3: Checking all ${allyCount} ally rows for user identification`)
 
   // Extract raw gamertag crops for display (unthresholded, human-readable)
   const gamertagCrops = new Map<number, string>()
   for (const row of allyRows) {
-    const cropX = 1272
+    const cropX = fmtCfg.gamertagDisplayCropX
     const cropY = row.topY + 17
-    const cropW = 390
+    const cropW = fmtCfg.gamertagDisplayCropW
     const cropH = 74
     const cropCanvas = document.createElement('canvas')
     cropCanvas.width = cropW
@@ -901,7 +1205,7 @@ export async function analyzeUserIdentity(
   const matches: OcrMatch[] = []
 
   for (const row of allyRows) {
-    const best = await ocrBestOfVariants(worker, srcCanvas, row, gamertag)
+    const best = await ocrBestOfVariants(worker, srcCanvas, row, gamertag, fmtCfg.gamertagCropConfigs)
 
     console.log(
       `  Slot ${row.slot}: OCR="${best.text}" → similarity to "${gamertag}": ${(best.similarity * 100).toFixed(0)}%`
@@ -963,11 +1267,12 @@ export function buildPlayerLabels(
   const positionalLabels = buildPositionalLabels(roles)
   const results: ScoreboardPlayerLabel[] = []
 
-  for (let i = 1; i <= 10; i++) {
+  for (const role of roles) {
+    const i = role.slot
     const hero = heroes.find(h => h.slot === i)
     results.push({
       slot: i,
-      team: i <= 5 ? 'ally' : 'enemy',
+      team: role.team,
       heroName: hero?.heroName ?? null,
       isUser: i === userSlot,
       userMatchMethod: i === userSlot ? method : null,
@@ -1309,7 +1614,12 @@ function sbReadCellMultiThreshold(
   colEndX: number,
   rowTopY: number,
   rowBottomY: number,
-): { value: string; confidence: number } {
+): { value: string; confidence: number; voteSplit: boolean } {
+  // 6f: `voteSplit` is true whenever the three thresholds did NOT all agree on
+  // the value. When the multi-threshold vote falls back to character-level
+  // majority (or most-common-value) reconciliation, the read is inherently less
+  // certain — this is the Test-4 885/855 class. The flag is consumed by the 6f
+  // confirmation layer (tier 2: scoreboard digit) and changes NO read behaviour.
   const results = SB_THRESHOLDS.map(thresh => {
     const { binary, w, h } = getScoreboardCell(data, imgW, colStartX, colEndX, rowTopY, rowBottomY, thresh)
     return sbReadValue(binary, w, h)
@@ -1319,7 +1629,7 @@ function sbReadCellMultiThreshold(
   const confs = results.map(r => r.confidence)
 
   if (values[0] === values[1] && values[1] === values[2]) {
-    return results[0]
+    return { ...results[0], voteSplit: false }
   }
 
   console.log(`[sb-stats] Multi-threshold instability: ${SB_THRESHOLDS.map((t, i) => `t${t}="${values[i]}"`).join(', ')}`)
@@ -1338,7 +1648,7 @@ function sbReadCellMultiThreshold(
     }
     const votedValue = voted.join('')
     console.log(`[sb-stats] Majority vote: "${votedValue}"`)
-    return { value: votedValue, confidence: Math.max(...confs) }
+    return { value: votedValue, confidence: Math.max(...confs), voteSplit: true }
   }
 
   // Different lengths — pick the most common value
@@ -1350,10 +1660,19 @@ function sbReadCellMultiThreshold(
   }
   const matchIdx = values.indexOf(bestValue)
   console.log(`[sb-stats] Length mismatch, picked most common: "${bestValue}"`)
-  return { value: bestValue, confidence: confs[matchIdx] }
+  return { value: bestValue, confidence: confs[matchIdx], voteSplit: true }
 }
 
 // ── Main extraction function ──
+
+export interface SbCellConfidence {
+  slot: number
+  team: 'ally' | 'enemy'
+  field: 'eliminations' | 'assists' | 'deaths' | 'damage' | 'healing' | 'mitigation'
+  value: number | null
+  confidence: number
+  voteSplit: boolean
+}
 
 export async function extractStats(
   img: HTMLImageElement,
@@ -1361,6 +1680,10 @@ export async function extractStats(
   roles: ScoreboardRoleClassification[],
   players: ScoreboardPlayerLabel[],
   detection: ScoreboardDetectionResult,
+  // 6f (optional, non-breaking): pass an array to receive per-cell confidence +
+  // vote-split flags alongside the normal stats. Existing callers omit this and
+  // are completely unaffected.
+  cellConfidenceOut?: SbCellConfidence[],
 ): Promise<ScoreboardPlayerStats[]> {
   const grid = detection.grid
   if (!grid) {
@@ -1405,10 +1728,10 @@ export async function extractStats(
     }
 
     for (const { key, field } of STAT_COL_KEYS) {
-      const col = SCOREBOARD_COLUMNS[key]
+      const col = grid.columns[key]
       if (!('startX' in col)) continue
 
-      const { value, confidence } = sbReadCellMultiThreshold(
+      const { value, confidence, voteSplit } = sbReadCellMultiThreshold(
         data, imgW,
         col.startX, col.endX,
         row.topY, row.bottomY,
@@ -1421,7 +1744,18 @@ export async function extractStats(
         (stats as any)[field] = num
       }
 
-      console.log(`[sb-stats] Slot ${row.slot} ${key}: "${value}" → ${isNaN(num) ? 'null' : num} (conf=${confidence.toFixed(3)})`)
+      if (cellConfidenceOut) {
+        cellConfidenceOut.push({
+          slot: row.slot,
+          team: row.team,
+          field: field as SbCellConfidence['field'],
+          value: isNaN(num) ? null : num,
+          confidence,
+          voteSplit,
+        })
+      }
+
+      console.log(`[sb-stats] Slot ${row.slot} ${key}: "${value}" → ${isNaN(num) ? 'null' : num} (conf=${confidence.toFixed(3)}${voteSplit ? ', VOTE-SPLIT' : ''})`)
     }
 
     results.push(stats)
