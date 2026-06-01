@@ -100,8 +100,6 @@ export default function UploadPage() {
   // Tracks whether the user explicitly tapped "Unsure" (vs. never answered),
   // so the question UI can show the choice as made while still storing null.
   const [startingSideAnswered, setStartingSideAnswered] = useState(false)
-  // On-screen diagnostics for map detection (visible while we debug on phone).
-  const [detectDebug, setDetectDebug] = useState<string[]>([])
 
   useEffect(() => {
     async function loadDefaults() {
@@ -134,16 +132,14 @@ export default function UploadPage() {
     setDetectState('detecting')
 
     detectMapFromPhotos(files.map(f => f.preview))
-      .then(({ mapName, debug }) => {
+      .then(({ mapName }) => {
         if (cancelled) return
-        setDetectDebug(debug)
         setDetectedMap(mapName)
         setAskStartingSide(mapName ? needsStartingSide(mapName) : false)
         setDetectState('done')
       })
-      .catch((e) => {
+      .catch(() => {
         if (cancelled) return
-        setDetectDebug([`effect catch: ${e instanceof Error ? e.message : String(e)}`])
         setDetectedMap(null)
         setAskStartingSide(false)
         setDetectState('done')
@@ -268,7 +264,6 @@ export default function UploadPage() {
     setAskStartingSide(false)
     setStartingSide(null)
     setStartingSideAnswered(false)
-    setDetectDebug([])
   }
 
   // ======================== DONE ========================
@@ -395,14 +390,11 @@ export default function UploadPage() {
               </div>
             )}
 
-            {/* TEMPORARY on-screen diagnostics — remove once detection is confirmed. */}
-            {detectDebug.length > 0 && (
-              <div className="bg-black/40 rounded-lg p-3 border border-white/10 text-[10px] text-slate-400 font-mono space-y-0.5">
-                <p className="text-slate-500 uppercase tracking-wider mb-1">map detect debug</p>
-                {detectDebug.map((line, i) => (
-                  <div key={i}>{line}</div>
-                ))}
-              </div>
+            {/* Subtle confirmation of what the phone detected. */}
+            {detectState === 'done' && detectedMap && (
+              <p className="text-[11px] text-slate-500 font-display tracking-wider">
+                MAP DETECTED: <span className="text-slate-300">{detectedMap}</span>
+              </p>
             )}
 
             {detectState === 'done' && askStartingSide && (
