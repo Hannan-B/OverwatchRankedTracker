@@ -34,6 +34,8 @@ interface DetectResult {
   mapName: string | null
   /** Which photo index the map was read from, or -1 if none matched. */
   sourceIndex: number
+  /** Human-readable diagnostics for on-screen debugging. */
+  debug: string[]
 }
 
 function scaleRegion(imgW: number, imgH: number) {
@@ -66,22 +68,25 @@ function cropMapName(img: HTMLImageElement, scale = 3): HTMLCanvasElement | null
   if (!w || !h) return null
 
   const r = scaleRegion(w, h)
-  // Guard: crop must sit inside the image.
-  if (r.x < 0 || r.y < 0 || r.x + r.w > w || r.y + r.h > h || r.w <= 0 || r.h <= 0) {
-    return null
-  }
+  // Clamp the crop to the image bounds rather than bailing out — phone
+  // screenshots may be a slightly different resolution, and a clamped crop
+  // still captures the map-name header in practice.
+  const x = Math.max(0, Math.min(r.x, w - 1))
+  const y = Math.max(0, Math.min(r.y, h - 1))
+  const cw = Math.max(1, Math.min(r.w, w - x))
+  const ch = Math.max(1, Math.min(r.h, h - y))
 
   const crop = document.createElement('canvas')
-  crop.width = r.w
-  crop.height = r.h
+  crop.width = cw
+  crop.height = ch
   const cctx = crop.getContext('2d')
   if (!cctx) return null
-  cctx.drawImage(img, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h)
+  cctx.drawImage(img, x, y, cw, ch, 0, 0, cw, ch)
 
   // Scale up for cleaner OCR on small text (same trick as ocr-extractor).
   const scaled = document.createElement('canvas')
-  scaled.width = r.w * scale
-  scaled.height = r.h * scale
+  scaled.width = cw * scale
+  scaled.height = ch * scale
   const sctx = scaled.getContext('2d')
   if (!sctx) return null
   sctx.imageSmoothingEnabled = true
@@ -104,11 +109,14 @@ export async function detectMapFromPhotos(
   photoUrls: string[],
   onProgress?: (fraction: number) => void,
 ): Promise<DetectResult> {
-  if (photoUrls.length === 0) return { mapName: null, sourceIndex: -1 }
+  const debug: string[] = []
+  if (photoUrls.length === 0) return { mapName: null, sourceIndex: -1, debug: ['no photos'] }
 
   let worker: Tesseract.Worker | null = null
   try {
+    debug.push(`creating OCR worker for ${photoUrls.length} photo(s)…`)
     worker = await Tesseract.createWorker('eng')
+    debug.push('worker ready')
 
     for (let i = 0; i < photoUrls.length; i++) {
       onProgress?.(i / photoUrls.length)
@@ -116,27 +124,39 @@ export async function detectMapFromPhotos(
       try {
         img = await loadImage(photoUrls[i])
       } catch {
-        continue // unreadable photo — skip
+        debug.push(`photo ${i + 1}: failed to load`)
+        continue
       }
 
+      debug.push(`photo ${i + 1}: ${img.naturalWidth}×${img.naturalHeight}`)
+
       const canvas = cropMapName(img)
-      if (!canvas) continue
+      if (!canvas) {
+        debug.push(`photo ${i + 1}: crop failed`)
+        continue
+      }
 
       let text = ''
       try {
         const { data } = await worker.recognize(canvas)
         text = (data.text || '').trim()
-      } catch {
-        continue // OCR hiccup on this photo — try the next
+      } catch (e) {
+        debug.push(`photo ${i + 1}: OCR error`)
+        continue
       }
+
+      debug.push(`photo ${i + 1}: read "${text.slice(0, 40)}"`)
 
       const map = findMapName(text.toUpperCase())
       if (map) {
+        debug.push(`photo ${i + 1}: matched → ${map}`)
         onProgress?.(1)
-        return { mapName: map, sourceIndex: i }
+        return { mapName: map, sourceIndex: i, debug }
       }
     }
+    debug.push('no map matched on any photo')
   } catch (e) {
+    debug.push(`fatal: ${e instanceof Error ? e.message : String(e)}`)
     console.warn('[phone-map-detect] detection failed:', e)
   } finally {
     if (worker) {
@@ -145,5 +165,5 @@ export async function detectMapFromPhotos(
   }
 
   onProgress?.(1)
-  return { mapName: null, sourceIndex: -1 }
+  return { mapName: null, sourceIndex: -1, debug }
 }
