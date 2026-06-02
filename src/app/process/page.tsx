@@ -6,7 +6,7 @@ import { supabase } from '@/lib/supabase'
 import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus, type ScoreboardResult } from '@/lib/image-processor'
 import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
 import { getGameModeForMap, needsStartingSide } from '@/data/reference'
-import type { RoleType, MatchFeel, PerformanceFeel, NotableEvent, StartingSide } from '@/lib/types'
+import type { RoleType, MatchFeel, PerformanceFeel, StartingSide } from '@/lib/types'
 import { buildConfirmationQuestions, type ConfirmInputs, type ConfirmationCandidate } from '@/lib/beta-confirmation'
 import { logConfirmationOutcome, logMatchSummary } from '@/lib/beta-issue-log'
 import { ConfirmationPanel, type ConfirmationResult } from '@/app/review/ConfirmationCard'
@@ -19,7 +19,15 @@ interface PendingBatch {
     roles_played?: RoleType[]
     match_feel: MatchFeel | null
     performance_feel: PerformanceFeel | null
-    notable_events: NotableEvent[]
+    tilt_mood: string | null
+    team_tempo: string | null
+    team_coordination: string | null
+    team_leaver: boolean
+    team_thrower: boolean
+    enemy_tempo: string | null
+    enemy_coordination: string | null
+    enemy_leaver: boolean
+    enemy_thrower: boolean
     fun_rating: number | null
     personal_thoughts: string | null
     starting_side?: StartingSide | null
@@ -270,6 +278,8 @@ export default function ProcessPage() {
           ? `${Math.floor(result.gameLengthSeconds / 60)}:${String(result.gameLengthSeconds % 60).padStart(2, '0')}`
           : null,
         gameLengthSeconds: result.gameLengthSeconds,
+        matchTimestamp: result.matchTimestamp,
+        matchDateText: null,
         eliminations: result.eliminations,
         assists: result.assists,
         deaths: result.deaths,
@@ -417,8 +427,17 @@ export default function ProcessPage() {
         ? (meta.starting_side ?? null)
         : null
 
+    // Real match time, OCR'd from the summary screenshot. If the date couldn't
+    // be read (null), fall back to NOW so processing never breaks — but log it,
+    // since a fallback means session/season for this match are approximate.
+    const playedAtDate: Date = processed.matchTimestamp ?? new Date()
+    if (!processed.matchTimestamp) {
+      console.warn('[process] No match timestamp from OCR — falling back to process time for played_at/season')
+    }
+    const playedAtISO = playedAtDate.toISOString()
+
     const { data: seasonId } = await supabase
-      .rpc('get_season_for_date', { match_date: new Date().toISOString() })
+      .rpc('get_season_for_date', { match_date: playedAtISO })
 
     const { data: match, error: matchError } = await supabase
       .from('matches')
@@ -435,12 +454,21 @@ export default function ProcessPage() {
         game_length_seconds: processed.gameLengthSeconds,
         starting_side: startingSide,
         season_id: seasonId || null,
+        played_at: playedAtISO,
         total_eliminations: processed.eliminations,
         total_assists: processed.assists,
         total_deaths: processed.deaths,
         match_feel: meta.match_feel,
         performance_feel: meta.performance_feel,
-        notable_events: meta.notable_events.length > 0 ? meta.notable_events : null,
+        tilt_mood: meta.tilt_mood ?? null,
+        team_tempo: meta.team_tempo ?? null,
+        team_coordination: meta.team_coordination ?? null,
+        team_leaver: meta.team_leaver ?? false,
+        team_thrower: meta.team_thrower ?? false,
+        enemy_tempo: meta.enemy_tempo ?? null,
+        enemy_coordination: meta.enemy_coordination ?? null,
+        enemy_leaver: meta.enemy_leaver ?? false,
+        enemy_thrower: meta.enemy_thrower ?? false,
         fun_rating: meta.fun_rating,
         personal_thoughts: meta.personal_thoughts,
       })

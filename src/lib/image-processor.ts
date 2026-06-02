@@ -412,6 +412,8 @@ export interface ProcessedMatch {
   result: 'victory' | 'defeat' | 'draw' | null
   score: string | null
   gameLengthSeconds: number | null
+  /** Real match time OCR'd from the summary screenshot; null if unreadable. */
+  matchTimestamp: Date | null
   eliminations: number | null
   assists: number | null
   deaths: number | null
@@ -558,7 +560,7 @@ export async function processMatchPhotos(
 
   const result: ProcessedMatch = {
     mapName: null, result: null, score: null,
-    gameLengthSeconds: null, eliminations: null,
+    gameLengthSeconds: null, matchTimestamp: null, eliminations: null,
     assists: null, deaths: null, heroes: [],
     heroBreakdowns: [],
     correctedRole: null,
@@ -663,6 +665,7 @@ export async function processMatchPhotos(
       result.mapName = summaryOcr.mapName
       result.score = summaryOcr.score
       result.gameLengthSeconds = summaryOcr.gameLengthSeconds
+      result.matchTimestamp = summaryOcr.matchTimestamp
       result.eliminations = summaryOcr.eliminations
       result.assists = summaryOcr.assists
       result.deaths = summaryOcr.deaths

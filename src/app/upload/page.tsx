@@ -1,153 +1,165 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
-import type { RoleType, MatchFeel, PerformanceFeel, NotableEvent, StartingSide } from '@/lib/types'
+import type { RoleType, MatchFeel, PerformanceFeel, StartingSide } from '@/lib/types'
 import { detectMapFromPhotos } from '@/lib/phone-map-detect'
 import { needsStartingSide } from '@/data/reference'
 
-type UploadStep = 'questions' | 'photos' | 'uploading' | 'done'
+// ============================================================
+// MOBILE UPLOAD — one-thing-per-screen flow (Phase 2 rebuild v2)
+//
+// v2 changes:
+//   - Rounded buttons (reverted from angular cut)
+//   - Full words on team/enemy scales (stacked full-width rows)
+//   - Auto-advance on single-select questions (~250ms delay so the
+//     selection highlight is visible). EXCEPTIONS that keep NEXT:
+//     6v6 roles (multi), team feel, enemy feel, thoughts, photos.
+//   - Back button on every step.
+//
+// Preserves phone-side map detection + attack/defend. No default_role.
+// ============================================================
+
+const ADVANCE_DELAY = 250 // ms — lets the highlight show before moving on
+
+type Tempo = 'aggressive' | 'balanced' | 'passive'
+type Coordination = 'coordinated' | 'average' | 'chaotic'
+type TiltMood = 'tilted' | 'annoyed' | 'fine' | 'good' | 'hyped'
+
+type Step =
+  | 'format' | 'role' | 'vibe' | 'performance' | 'fun'
+  | 'tilt' | 'team' | 'enemy' | 'thoughts'
+  | 'photos' | 'checking' | 'confirm_side' | 'uploading' | 'done'
+
 type FileStatus = 'idle' | 'uploading' | 'success' | 'error'
+interface FilePreview { file: File; preview: string; status: FileStatus }
 
-interface FilePreview {
-  file: File
-  preview: string
-  status: FileStatus
+function OptionButton({
+  label, selected, onClick, big = false,
+}: { label: string; selected: boolean; onClick: () => void; big?: boolean }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full ${big ? 'py-6 text-2xl' : 'py-4 text-base'} px-5 rounded-xl
+        font-display tracking-[0.15em] uppercase transition-colors text-center
+        ${selected
+          ? 'bg-ow-orange text-ow-dark font-bold'
+          : 'bg-ow-panel text-slate-300 border border-white/10 hover:border-ow-orange/40 hover:text-white'}`}
+    >
+      {label}
+    </button>
+  )
 }
 
-function ChipSelect<T extends string>({
-  options, value, onChange, labels, colors,
+function StepShell({
+  title, hint, children, onBack, onNext, nextLabel = 'NEXT', nextDisabled = false, onSkip,
 }: {
-  options: T[]; value: T | null; onChange: (v: T | null) => void
-  labels: Record<T, string>; colors?: Record<T, string>
+  title: string; hint?: string; children: React.ReactNode
+  onBack?: () => void; onNext?: () => void; nextLabel?: string
+  nextDisabled?: boolean; onSkip?: () => void
 }) {
   return (
-    <div className="flex flex-wrap gap-2">
-      {options.map(opt => (
-        <button key={opt} type="button"
-          onClick={() => onChange(value === opt ? null : opt)}
-          className={`px-4 py-2 rounded-lg text-sm font-display tracking-wider transition-all
-            ${value === opt
-              ? `${colors?.[opt] || 'bg-ow-orange text-ow-dark'} font-bold`
-              : 'bg-ow-dark text-slate-400 border border-white/10 hover:text-white hover:border-white/20'
-            }`}
-        >{labels[opt]}</button>
-      ))}
+    <div className="min-h-[100dvh] flex flex-col px-5 pt-[max(env(safe-area-inset-top),20px)] pb-[max(env(safe-area-inset-bottom),20px)] bg-ow-dark relative overflow-hidden">
+      <div aria-hidden className="absolute inset-0 opacity-50 pointer-events-none"
+        style={{ background: 'radial-gradient(60% 40% at 50% 0%, rgba(249,158,26,0.08), transparent 70%), radial-gradient(50% 50% at 80% 100%, rgba(30,58,95,0.4), transparent 70%)' }} />
+
+      <div className="relative flex items-center justify-between h-10 shrink-0">
+        {onBack
+          ? <button onClick={onBack} className="text-slate-500 hover:text-ow-orange text-sm font-display tracking-wider transition-colors">← BACK</button>
+          : <span />}
+        {onSkip && <button onClick={onSkip} className="text-slate-600 hover:text-slate-400 text-xs font-display tracking-wider transition-colors">SKIP</button>}
+      </div>
+
+      <div className="relative flex-1 flex flex-col justify-center max-w-md mx-auto w-full">
+        <div className="h-1 w-12 bg-ow-orange mb-5 rounded-full" />
+        <h1 className="font-display text-2xl tracking-[0.15em] text-slate-100 uppercase leading-tight">{title}</h1>
+        {hint ? <p className="text-sm text-slate-500 mt-2 mb-6">{hint}</p> : <div className="mb-6" />}
+        <div className="space-y-3">{children}</div>
+      </div>
+
+      {onNext && (
+        <div className="relative shrink-0 max-w-md mx-auto w-full pt-4">
+          <button
+            onClick={onNext}
+            disabled={nextDisabled}
+            className="w-full rounded-xl bg-ow-orange hover:bg-ow-accent disabled:bg-slate-800
+              disabled:text-slate-600 text-ow-dark font-display font-bold py-4
+              tracking-[0.2em] uppercase text-sm transition-colors"
+          >
+            {nextLabel}
+          </button>
+        </div>
+      )}
     </div>
   )
 }
 
-function MultiChipSelect<T extends string>({
-  options, value, onChange, labels,
-}: {
-  options: T[]; value: T[]; onChange: (v: T[]) => void; labels: Record<T, string>
-}) {
-  const toggle = (opt: T) => {
-    onChange(value.includes(opt) ? value.filter(v => v !== opt) : [...value, opt])
-  }
+function ScaleRow<T extends string>({
+  label, options, value, onChange, labels,
+}: { label: string; options: T[]; value: T | null; onChange: (v: T | null) => void; labels: Record<T, string> }) {
   return (
-    <div className="flex flex-wrap gap-2">
-      {options.map(opt => (
-        <button key={opt} type="button" onClick={() => toggle(opt)}
-          className={`px-4 py-2 rounded-lg text-sm font-display tracking-wider transition-all
-            ${value.includes(opt)
-              ? 'bg-ow-orange text-ow-dark font-bold'
-              : 'bg-ow-dark text-slate-400 border border-white/10 hover:text-white hover:border-white/20'
-            }`}
-        >{labels[opt]}</button>
-      ))}
+    <div>
+      <p className="text-xs font-display tracking-[0.2em] text-slate-500 uppercase mb-2">{label}</p>
+      <div className="space-y-2">
+        {options.map(opt => (
+          <button key={opt} type="button"
+            onClick={() => onChange(value === opt ? null : opt)}
+            className={`w-full py-3 rounded-xl text-sm font-display tracking-[0.12em] uppercase transition-colors
+              ${value === opt ? 'bg-ow-orange text-ow-dark font-bold'
+                : 'bg-ow-panel text-slate-400 border border-white/10 hover:text-white'}`}
+          >{labels[opt]}</button>
+        ))}
+      </div>
     </div>
   )
 }
 
-function StarRating({ value, onChange }: { value: number | null; onChange: (v: number | null) => void }) {
+function TogglePill({ label, on, onToggle }: { label: string; on: boolean; onToggle: () => void }) {
   return (
-    <div className="flex gap-1">
-      {[1, 2, 3, 4, 5].map(star => (
-        <button key={star} type="button"
-          onClick={() => onChange(value === star ? null : star)}
-          className={`text-2xl transition-colors ${
-            value && star <= value ? 'text-ow-orange' : 'text-slate-600 hover:text-slate-400'
-          }`}
-        >★</button>
-      ))}
-    </div>
+    <button type="button" onClick={onToggle}
+      className={`flex-1 px-4 py-3 rounded-xl text-xs font-display tracking-wider uppercase transition-colors
+        ${on ? 'bg-ow-defeat text-white font-bold' : 'bg-ow-panel text-slate-400 border border-white/10 hover:text-white'}`}
+    >{label}</button>
   )
 }
 
 export default function UploadPage() {
-  const [step, setStep] = useState<UploadStep>('questions')
+  const [step, setStep] = useState<Step>('format')
   const inputRef = useRef<HTMLInputElement>(null)
 
+  const [matchFormat, setMatchFormat] = useState<'5v5' | '6v6' | null>(null)
   const [role, setRole] = useState<RoleType | null>(null)
   const [rolesPlayed, setRolesPlayed] = useState<RoleType[]>([])
-  const [matchFormat, setMatchFormat] = useState<'5v5' | '6v6'>('5v5')
+
   const [matchFeel, setMatchFeel] = useState<MatchFeel | null>(null)
   const [perfFeel, setPerfFeel] = useState<PerformanceFeel | null>(null)
-  const [notableEvents, setNotableEvents] = useState<NotableEvent[]>([])
   const [funRating, setFunRating] = useState<number | null>(null)
+  const [tiltMood, setTiltMood] = useState<TiltMood | null>(null)
+  const [teamTempo, setTeamTempo] = useState<Tempo | null>(null)
+  const [teamCoord, setTeamCoord] = useState<Coordination | null>(null)
+  const [teamLeaver, setTeamLeaver] = useState(false)
+  const [teamThrower, setTeamThrower] = useState(false)
+  const [enemyTempo, setEnemyTempo] = useState<Tempo | null>(null)
+  const [enemyCoord, setEnemyCoord] = useState<Coordination | null>(null)
+  const [enemyLeaver, setEnemyLeaver] = useState(false)
+  const [enemyThrower, setEnemyThrower] = useState(false)
   const [thoughts, setThoughts] = useState('')
+
   const [files, setFiles] = useState<FilePreview[]>([])
 
-  // --- Attack/Defend feature (phone-side map detection) ---
-  // detectState: 'idle' before any photos; 'detecting' while OCR runs;
-  // 'done' once we have a verdict. detectedMap is the matched map (or null).
-  // askStartingSide is true only when the detected map is hybrid/escort.
-  const [detectState, setDetectState] = useState<'idle' | 'detecting' | 'done'>('idle')
   const [detectedMap, setDetectedMap] = useState<string | null>(null)
-  const [askStartingSide, setAskStartingSide] = useState(false)
   const [startingSide, setStartingSide] = useState<StartingSide | null>(null)
-  // Tracks whether the user explicitly tapped "Unsure" (vs. never answered),
-  // so the question UI can show the choice as made while still storing null.
-  const [startingSideAnswered, setStartingSideAnswered] = useState(false)
 
-  useEffect(() => {
-    async function loadDefaults() {
-      const { data } = await supabase
-        .from('user_settings')
-        .select('default_role')
-        .limit(1)
-        .single()
-      if (data?.default_role && !role) setRole(data.default_role)
-    }
-    loadDefaults()
-  }, [])
+  // auto-advance: set value, then move to next step after a brief beat
+  function pickAndAdvance<T>(setter: (v: T) => void, value: T, next: Step) {
+    setter(value)
+    window.setTimeout(() => setStep(next), ADVANCE_DELAY)
+  }
 
-  // Run phone-side map detection once we're on the photos step with photos
-  // chosen. Re-runs if the set of photos changes. Detection is best-effort:
-  // if it can't read a map, we simply don't ask (the laptop still detects
-  // the map authoritatively during processing).
-  useEffect(() => {
-    if (step !== 'photos' || files.length === 0) {
-      // No photos (or not on photos step) → nothing to ask yet.
-      if (files.length === 0) {
-        setDetectState('idle')
-        setDetectedMap(null)
-        setAskStartingSide(false)
-      }
-      return
-    }
-
-    let cancelled = false
-    setDetectState('detecting')
-
-    detectMapFromPhotos(files.map(f => f.preview))
-      .then(({ mapName }) => {
-        if (cancelled) return
-        setDetectedMap(mapName)
-        setAskStartingSide(mapName ? needsStartingSide(mapName) : false)
-        setDetectState('done')
-      })
-      .catch(() => {
-        if (cancelled) return
-        setDetectedMap(null)
-        setAskStartingSide(false)
-        setDetectState('done')
-      })
-
-    return () => { cancelled = true }
-    // Re-run when the actual photo set changes (preview URLs are stable per file).
-  }, [step, files.map(f => f.preview).join('|')])
+  // Map detection now runs when the user presses UPLOAD ALL (see beginUpload),
+  // NOT automatically when photos change — this guarantees the attack/defend
+  // question gets a chance to appear and can't be raced past.
 
   function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     const selected = e.target.files
@@ -167,7 +179,6 @@ export default function UploadPage() {
     })
   }
 
-  // Convert any image to JPEG blob (handles HEIC on iPhone)
   async function convertToJpeg(file: File): Promise<Blob> {
     return new Promise((resolve, reject) => {
       const img = new Image()
@@ -183,21 +194,45 @@ export default function UploadPage() {
             if (blob) resolve(blob)
             else reject(new Error('Failed to convert image'))
           },
-          'image/jpeg',
-          0.92 // High quality
+          'image/jpeg', 0.92,
         )
       }
-      img.onerror = () => {
-        URL.revokeObjectURL(img.src)
-        reject(new Error('Failed to load image for conversion'))
-      }
+      img.onerror = () => { URL.revokeObjectURL(img.src); reject(new Error('Failed to load image')) }
       img.src = URL.createObjectURL(file)
     })
   }
 
-  async function uploadAll() {
+  // PHASE 1 — pressed UPLOAD ALL. Run map detection FIRST (with a visible
+  // "checking" step so it can't be raced past). If the map is hybrid/escort,
+  // go ask attack/defend (blocking). Otherwise — or if the map can't be read —
+  // go straight to committing the upload.
+  async function beginUpload() {
     const hasRole = matchFormat === '5v5' ? !!role : rolesPlayed.length > 0
     if (files.length === 0 || !hasRole) return
+
+    setStep('checking')
+    let mapName: string | null = null
+    try {
+      const res = await detectMapFromPhotos(files.map(f => f.preview))
+      mapName = res.mapName
+    } catch {
+      mapName = null
+    }
+    setDetectedMap(mapName)
+    const needsSide = mapName ? needsStartingSide(mapName) : false
+
+    if (needsSide) {
+      // Ask the question and WAIT — commitUpload runs after the user answers.
+      setStep('confirm_side')
+    } else {
+      // Map not hybrid/escort, or not detected → upload straight away.
+      await commitUpload()
+    }
+  }
+
+  // PHASE 2 — actually upload photos + metadata, then show success.
+  // startingSide is whatever's in state (set by the question, or null).
+  async function commitUpload() {
     setStep('uploading')
     const batchId = Date.now().toString()
     const updated = [...files]
@@ -208,8 +243,16 @@ export default function UploadPage() {
       roles_played: matchFormat === '6v6' ? rolesPlayed : (role ? [role] : []),
       match_feel: matchFeel,
       performance_feel: perfFeel,
-      notable_events: notableEvents,
       fun_rating: funRating,
+      tilt_mood: tiltMood,
+      team_tempo: teamTempo,
+      team_coordination: teamCoord,
+      team_leaver: teamLeaver,
+      team_thrower: teamThrower,
+      enemy_tempo: enemyTempo,
+      enemy_coordination: enemyCoord,
+      enemy_leaver: enemyLeaver,
+      enemy_thrower: enemyThrower,
       personal_thoughts: thoughts || null,
       starting_side: startingSide,
       detected_map: detectedMap,
@@ -226,16 +269,12 @@ export default function UploadPage() {
     for (let i = 0; i < updated.length; i++) {
       updated[i].status = 'uploading'
       setFiles([...updated])
-
       try {
-        // Convert to JPEG (handles HEIC from iPhone)
         const jpegBlob = await convertToJpeg(updated[i].file)
         const path = `pending/${batchId}/photo_${i + 1}.jpg`
-
         const { error } = await supabase.storage
           .from('match-images')
           .upload(path, jpegBlob, { contentType: 'image/jpeg' })
-
         updated[i].status = error ? 'error' : 'success'
       } catch (err) {
         console.warn(`Failed to convert/upload photo ${i}:`, err)
@@ -248,42 +287,173 @@ export default function UploadPage() {
   }
 
   function resetForm() {
-    setStep('questions')
-    setRole(null)
-    setRolesPlayed([])
-    setMatchFormat('5v5')
-    setMatchFeel(null)
-    setPerfFeel(null)
-    setNotableEvents([])
-    setFunRating(null)
+    setStep('format')
+    setMatchFormat(null); setRole(null); setRolesPlayed([])
+    setMatchFeel(null); setPerfFeel(null); setFunRating(null); setTiltMood(null)
+    setTeamTempo(null); setTeamCoord(null); setTeamLeaver(false); setTeamThrower(false)
+    setEnemyTempo(null); setEnemyCoord(null); setEnemyLeaver(false); setEnemyThrower(false)
     setThoughts('')
     files.forEach(f => URL.revokeObjectURL(f.preview))
     setFiles([])
-    setDetectState('idle')
-    setDetectedMap(null)
-    setAskStartingSide(false)
-    setStartingSide(null)
-    setStartingSideAnswered(false)
+    setDetectedMap(null); setStartingSide(null)
   }
 
-  // ======================== DONE ========================
-  if (step === 'done') {
+  // ======================== FORMAT (auto-advance) ========================
+  if (step === 'format') {
     return (
-      <div className="max-w-lg mx-auto">
-        <div className="bg-ow-victory/10 border border-ow-victory/30 rounded-lg p-8 text-center">
-          <span className="text-4xl block mb-3">✓</span>
-          <p className="text-ow-victory font-display text-xl font-bold">MATCH UPLOADED</p>
-          <p className="text-slate-400 text-sm mt-2">
-            Open the tracker on your laptop to process and review
-          </p>
-          <button onClick={resetForm}
-            className="mt-6 bg-ow-panel border border-white/10 text-white font-display
-                       px-6 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30
-                       transition-colors">
-            UPLOAD ANOTHER MATCH
-          </button>
+      <div className="min-h-[100dvh] flex flex-col items-center justify-center px-6 bg-ow-dark relative overflow-hidden">
+        <div aria-hidden className="absolute inset-0 opacity-60 pointer-events-none"
+          style={{ background: 'radial-gradient(60% 45% at 50% 0%, rgba(249,158,26,0.10), transparent 70%), radial-gradient(50% 50% at 80% 100%, rgba(30,58,95,0.45), transparent 70%)' }} />
+        <div className="relative w-full max-w-sm">
+          <div className="h-1 w-14 bg-ow-orange mb-5 mx-auto rounded-full" />
+          <h1 className="font-display text-3xl tracking-[0.18em] text-center text-slate-100 uppercase">Overwatch</h1>
+          <p className="font-display text-xs tracking-[0.4em] text-center text-ow-orange uppercase mt-1 mb-10">Ranked Tracker</p>
+          <p className="text-center text-xs font-display tracking-[0.25em] text-slate-500 uppercase mb-5">Select Format</p>
+          <div className="space-y-4">
+            <OptionButton big label="5V5" selected={matchFormat === '5v5'}
+              onClick={() => { setRolesPlayed([]); pickAndAdvance(setMatchFormat, '5v5', 'role') }} />
+            <OptionButton big label="6V6" selected={matchFormat === '6v6'}
+              onClick={() => { setRole(null); pickAndAdvance(setMatchFormat, '6v6', 'role') }} />
+          </div>
         </div>
       </div>
+    )
+  }
+
+  // ======================== ROLE ========================
+  if (step === 'role') {
+    const fivev5 = matchFormat === '5v5'
+    const toggleMulti = (r: RoleType) =>
+      setRolesPlayed(prev => prev.includes(r) ? prev.filter(x => x !== r) : [...prev, r])
+    return (
+      <StepShell
+        title={fivev5 ? 'Role Played' : 'Roles Played'}
+        hint={fivev5 ? undefined : 'Select all roles you played (1–3)'}
+        onBack={() => setStep('format')}
+        onNext={fivev5 ? undefined : () => setStep('vibe')}
+        nextDisabled={rolesPlayed.length === 0}
+      >
+        {(['tank', 'dps', 'support'] as RoleType[]).map(r => (
+          <OptionButton key={r} label={r.toUpperCase()}
+            selected={fivev5 ? role === r : rolesPlayed.includes(r)}
+            onClick={() => fivev5 ? pickAndAdvance(setRole, r, 'vibe') : toggleMulti(r)} />
+        ))}
+      </StepShell>
+    )
+  }
+
+  // ======================== MATCH VIBE (auto-advance) ========================
+  if (step === 'vibe') {
+    return (
+      <StepShell title="How was the match?" onBack={() => setStep('role')} onSkip={() => setStep('performance')}>
+        {(['stomped_them', 'close_game', 'got_stomped'] as MatchFeel[]).map(v => (
+          <OptionButton key={v}
+            label={v === 'stomped_them' ? 'STOMPED THEM' : v === 'close_game' ? 'CLOSE GAME' : 'GOT STOMPED'}
+            selected={matchFeel === v}
+            onClick={() => pickAndAdvance(setMatchFeel, v, 'performance')} />
+        ))}
+      </StepShell>
+    )
+  }
+
+  // ======================== PERFORMANCE (auto-advance) ========================
+  if (step === 'performance') {
+    return (
+      <StepShell title="Your performance" onBack={() => setStep('vibe')} onSkip={() => setStep('fun')}>
+        {(['carried', 'did_my_job', 'struggled'] as PerformanceFeel[]).map(v => (
+          <OptionButton key={v}
+            label={v === 'did_my_job' ? 'DID MY JOB' : v.toUpperCase()}
+            selected={perfFeel === v}
+            onClick={() => pickAndAdvance(setPerfFeel, v, 'fun')} />
+        ))}
+      </StepShell>
+    )
+  }
+
+  // ======================== FUN (stars — brief pause then auto-advance) ========================
+  if (step === 'fun') {
+    const pickStar = (s: number) => {
+      setFunRating(s)
+      window.setTimeout(() => setStep('tilt'), ADVANCE_DELAY)
+    }
+    return (
+      <StepShell title="Fun rating" onBack={() => setStep('performance')} onSkip={() => setStep('tilt')}>
+        <div className="flex justify-center gap-2 py-2">
+          {[1, 2, 3, 4, 5].map(s => (
+            <button key={s} type="button"
+              onClick={() => pickStar(s)}
+              className={`text-4xl transition-colors ${funRating && s <= funRating ? 'text-ow-orange' : 'text-slate-700 hover:text-slate-500'}`}
+            >★</button>
+          ))}
+        </div>
+      </StepShell>
+    )
+  }
+
+  // ======================== TILT / MOOD (auto-advance) ========================
+  if (step === 'tilt') {
+    const moods: TiltMood[] = ['tilted', 'annoyed', 'fine', 'good', 'hyped']
+    return (
+      <StepShell title="How do you feel?" hint="Worst → best"
+        onBack={() => setStep('fun')} onSkip={() => setStep('team')}>
+        {moods.map(m => (
+          <OptionButton key={m} label={m.toUpperCase()}
+            selected={tiltMood === m}
+            onClick={() => pickAndAdvance(setTiltMood, m, 'team')} />
+        ))}
+      </StepShell>
+    )
+  }
+
+  // ======================== TEAM (multi-input → keep NEXT) ========================
+  if (step === 'team') {
+    return (
+      <StepShell title="Your team" onBack={() => setStep('tilt')}
+        onNext={() => setStep('enemy')} onSkip={() => setStep('enemy')}>
+        <ScaleRow label="Tempo" options={['aggressive', 'balanced', 'passive'] as Tempo[]}
+          value={teamTempo} onChange={setTeamTempo}
+          labels={{ aggressive: 'AGGRESSIVE', balanced: 'BALANCED', passive: 'PASSIVE' }} />
+        <ScaleRow label="Coordination" options={['coordinated', 'average', 'chaotic'] as Coordination[]}
+          value={teamCoord} onChange={setTeamCoord}
+          labels={{ coordinated: 'COORDINATED', average: 'AVERAGE', chaotic: 'CHAOTIC' }} />
+        <div className="flex gap-2 pt-1">
+          <TogglePill label="LEAVER" on={teamLeaver} onToggle={() => setTeamLeaver(v => !v)} />
+          <TogglePill label="THROWER" on={teamThrower} onToggle={() => setTeamThrower(v => !v)} />
+        </div>
+      </StepShell>
+    )
+  }
+
+  // ======================== ENEMY (multi-input → keep NEXT) ========================
+  if (step === 'enemy') {
+    return (
+      <StepShell title="Enemy team" onBack={() => setStep('team')}
+        onNext={() => setStep('thoughts')} onSkip={() => setStep('thoughts')}>
+        <ScaleRow label="Tempo" options={['aggressive', 'balanced', 'passive'] as Tempo[]}
+          value={enemyTempo} onChange={setEnemyTempo}
+          labels={{ aggressive: 'AGGRESSIVE', balanced: 'BALANCED', passive: 'PASSIVE' }} />
+        <ScaleRow label="Coordination" options={['coordinated', 'average', 'chaotic'] as Coordination[]}
+          value={enemyCoord} onChange={setEnemyCoord}
+          labels={{ coordinated: 'COORDINATED', average: 'AVERAGE', chaotic: 'CHAOTIC' }} />
+        <div className="flex gap-2 pt-1">
+          <TogglePill label="LEAVER" on={enemyLeaver} onToggle={() => setEnemyLeaver(v => !v)} />
+          <TogglePill label="THROWER" on={enemyThrower} onToggle={() => setEnemyThrower(v => !v)} />
+        </div>
+      </StepShell>
+    )
+  }
+
+  // ======================== THOUGHTS (free text → keep NEXT) ========================
+  if (step === 'thoughts') {
+    return (
+      <StepShell title="Anything to note?" hint="Optional — the one bit you'll want to remember"
+        onBack={() => setStep('enemy')} onNext={() => setStep('photos')} nextLabel="NEXT → PHOTOS"
+        onSkip={() => setStep('photos')}>
+        <textarea value={thoughts} onChange={e => setThoughts(e.target.value)}
+          placeholder="What happened? What could you improve?" rows={4}
+          className="w-full rounded-xl bg-ow-panel border border-white/10 px-4 py-3 text-white
+            placeholder-slate-600 focus:border-ow-orange/50 focus:outline-none transition-colors resize-none" />
+      </StepShell>
     )
   }
 
@@ -291,23 +461,18 @@ export default function UploadPage() {
   if (step === 'uploading') {
     const uploaded = files.filter(f => f.status === 'success').length
     return (
-      <div className="max-w-lg mx-auto">
-        <div className="bg-ow-panel rounded-lg p-8 text-center border border-white/5">
-          <div className="w-10 h-10 border-3 border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-white font-display text-lg">UPLOADING</p>
+      <div className="min-h-[100dvh] flex items-center justify-center px-6 bg-ow-dark">
+        <div className="w-full max-w-sm text-center">
+          <div className="w-10 h-10 border-[3px] border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-white font-display text-lg tracking-wider">UPLOADING</p>
           <p className="text-slate-400 text-sm mt-1">{uploaded} / {files.length} photos</p>
           <div className="grid grid-cols-4 gap-2 mt-6">
             {files.map((f, i) => (
-              <div key={i} className="aspect-square rounded overflow-hidden relative">
+              <div key={i} className="aspect-square rounded-lg overflow-hidden relative">
                 <img src={f.preview} alt="" className="w-full h-full object-cover" />
-                {f.status === 'success' && (
-                  <div className="absolute inset-0 bg-ow-victory/30 flex items-center justify-center text-lg">✓</div>
-                )}
-                {f.status === 'uploading' && (
-                  <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
-                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  </div>
-                )}
+                {f.status === 'success' && <div className="absolute inset-0 bg-ow-victory/30 flex items-center justify-center text-lg">✓</div>}
+                {f.status === 'uploading' && <div className="absolute inset-0 bg-black/50 flex items-center justify-center">
+                  <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /></div>}
               </div>
             ))}
           </div>
@@ -316,55 +481,100 @@ export default function UploadPage() {
     )
   }
 
-  // ======================== PHOTOS STEP ========================
-  if (step === 'photos') {
+  // ======================== DONE ========================
+  if (step === 'done') {
     return (
-      <div className="max-w-lg mx-auto space-y-6">
-        <div>
-          <h1 className="text-3xl text-ow-orange">Upload Photos</h1>
-          <p className="text-sm text-slate-400 mt-1">Select your Summary, Scoreboard, and Breakdown screenshots (up to 8)</p>
-          <button onClick={() => setStep('questions')}
-            className="text-xs text-slate-500 hover:text-ow-orange transition-colors mt-1">
-            ← Back to questions
+      <div className="min-h-[100dvh] flex items-center justify-center px-6 bg-ow-dark">
+        <div className="w-full max-w-sm">
+          <div className="bg-ow-victory/10 border border-ow-victory/30 rounded-xl p-8 text-center">
+            <span className="text-4xl block mb-3">✓</span>
+            <p className="text-ow-victory font-display text-xl font-bold tracking-wider">MATCH UPLOADED</p>
+            <p className="text-slate-400 text-sm mt-2">Open the tracker on your laptop to process and review</p>
+            <button onClick={resetForm}
+              className="mt-6 rounded-xl bg-ow-panel border border-white/10 text-white font-display
+                px-6 py-3 tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
+              UPLOAD ANOTHER
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ======================== CHECKING (after UPLOAD ALL, before question) ========================
+  if (step === 'checking') {
+    return (
+      <div className="min-h-[100dvh] flex items-center justify-center px-6 bg-ow-dark">
+        <div className="w-full max-w-sm text-center">
+          <div className="w-10 h-10 border-[3px] border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-white font-display text-lg tracking-wider">CHECKING MAP…</p>
+          <p className="text-slate-500 text-sm mt-1">One moment</p>
+        </div>
+      </div>
+    )
+  }
+
+  // ======================== CONFIRM SIDE (blocking — hybrid/escort only) ========================
+  // Reached only when the map needs a starting side. Answering (or UNSURE)
+  // proceeds to the actual upload. There is intentionally NO back / upload-more
+  // here — it must be answered before the upload commits.
+  if (step === 'confirm_side') {
+    const answer = (side: StartingSide | null) => {
+      setStartingSide(side)
+      window.setTimeout(() => { commitUpload() }, ADVANCE_DELAY)
+    }
+    return (
+      <div className="min-h-[100dvh] flex flex-col justify-center px-5 bg-ow-dark relative overflow-hidden">
+        <div aria-hidden className="absolute inset-0 opacity-50 pointer-events-none"
+          style={{ background: 'radial-gradient(60% 45% at 50% 0%, rgba(249,158,26,0.10), transparent 70%)' }} />
+        <div className="relative max-w-md mx-auto w-full">
+          <div className="h-1 w-12 bg-ow-orange mb-5 rounded-full" />
+          <h1 className="font-display text-2xl tracking-[0.15em] text-slate-100 uppercase leading-tight">Starting Side</h1>
+          <p className="text-sm text-slate-500 mt-2 mb-6">
+            <span className="text-ow-orange">{detectedMap}</span> — did you attack or defend first?
+          </p>
+          <div className="space-y-3">
+            <OptionButton label="ATTACK FIRST" selected={startingSide === 'attack'}
+              onClick={() => answer('attack')} />
+            <OptionButton label="DEFEND FIRST" selected={startingSide === 'defense'}
+              onClick={() => answer('defense')} />
+          </div>
+          {/* Unsure is present but understated — attack/defend are the obvious choice */}
+          <button type="button" onClick={() => answer(null)}
+            className="mt-6 w-full text-center text-xs text-slate-600 hover:text-slate-400 font-display tracking-wider uppercase transition-colors">
+            Not sure
           </button>
         </div>
+      </div>
+    )
+  }
 
-        <div className="bg-ow-panel rounded-lg p-3 border border-white/5 flex flex-wrap gap-2 text-xs">
-          <span className={`px-2 py-1 rounded font-display ${
-            matchFormat === '6v6' ? 'bg-purple-900/60 text-purple-300' : 'bg-ow-dark text-slate-300'
-          }`}>{matchFormat.toUpperCase()}</span>
-          {matchFormat === '5v5' && role && (
-            <span className="bg-ow-dark px-2 py-1 rounded text-slate-300 font-display">{role.toUpperCase()}</span>
-          )}
-          {matchFormat === '6v6' && rolesPlayed.length > 0 && (
-            <span className="bg-ow-dark px-2 py-1 rounded text-slate-300 font-display">
-              {rolesPlayed.map(r => r.toUpperCase()).join(' + ')}
-            </span>
-          )}
-          {matchFeel && <span className="bg-ow-dark px-2 py-1 rounded text-slate-300 font-display">
-            {matchFeel === 'stomped_them' ? 'STOMPED' : matchFeel === 'close_game' ? 'CLOSE' : 'GOT STOMPED'}
-          </span>}
-          {perfFeel && <span className="bg-ow-dark px-2 py-1 rounded text-slate-300 font-display">
-            {perfFeel === 'did_my_job' ? 'DID MY JOB' : perfFeel.toUpperCase()}
-          </span>}
-          {funRating && <span className="bg-ow-dark px-2 py-1 rounded text-slate-300">{'★'.repeat(funRating)}</span>}
-        </div>
+  // ======================== PHOTOS ========================
+  return (
+    <div className="min-h-[100dvh] flex flex-col px-5 pt-[max(env(safe-area-inset-top),20px)] pb-[max(env(safe-area-inset-bottom),20px)] bg-ow-dark relative overflow-hidden">
+      <div aria-hidden className="absolute inset-0 opacity-50 pointer-events-none"
+        style={{ background: 'radial-gradient(60% 40% at 50% 0%, rgba(249,158,26,0.08), transparent 70%)' }} />
+
+      <div className="relative flex items-center h-10 shrink-0">
+        <button onClick={() => setStep('thoughts')} className="text-slate-500 hover:text-ow-orange text-sm font-display tracking-wider transition-colors">← BACK</button>
+      </div>
+
+      <div className="relative flex-1 max-w-md mx-auto w-full overflow-y-auto">
+        <div className="h-1 w-12 bg-ow-orange mb-5 rounded-full" />
+        <h1 className="font-display text-2xl tracking-[0.15em] text-slate-100 uppercase">Upload Photos</h1>
+        <p className="text-sm text-slate-500 mt-2 mb-6">Summary, Scoreboard &amp; Breakdown screenshots (up to 8)</p>
 
         <input ref={inputRef} type="file" accept="image/*" multiple onChange={handleFileSelect} className="hidden" />
 
         <button onClick={() => inputRef.current?.click()}
-          className="w-full border-2 border-dashed border-white/10 rounded-lg p-8
-                     text-center hover:border-ow-orange/40 transition-colors group">
+          className="w-full rounded-xl border-2 border-dashed border-white/10 p-8 text-center hover:border-ow-orange/40 transition-colors group">
           <span className="text-4xl block mb-2">📷</span>
-          <span className="text-slate-400 group-hover:text-slate-300 font-display tracking-wider">
-            TAP TO SELECT PHOTOS
-          </span>
-          <span className="block text-xs text-slate-600 mt-1">Summary + Scoreboard + Breakdown page(s)</span>
+          <span className="text-slate-400 group-hover:text-slate-300 font-display tracking-wider">TAP TO SELECT PHOTOS</span>
         </button>
 
         {files.length > 0 && (
-          <div className="space-y-3">
-            <p className="text-sm text-slate-400 font-display">
+          <div className="space-y-3 mt-4">
+            <p className="text-sm text-slate-400 font-display tracking-wider">
               {files.length} PHOTO{files.length !== 1 ? 'S' : ''} SELECTED
             </p>
             <div className="grid grid-cols-3 gap-2">
@@ -372,157 +582,22 @@ export default function UploadPage() {
                 <div key={i} className="relative aspect-[4/3] rounded-lg overflow-hidden bg-ow-panel">
                   <img src={f.preview} alt={`Photo ${i + 1}`} className="w-full h-full object-cover" />
                   <button onClick={() => removeFile(i)}
-                    className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/70
-                               text-white text-xs flex items-center justify-center hover:bg-ow-defeat transition-colors">
-                    ✕
-                  </button>
+                    className="absolute top-1 right-1 w-6 h-6 rounded-full bg-black/70 text-white text-xs flex items-center justify-center hover:bg-ow-defeat transition-colors">✕</button>
                 </div>
               ))}
             </div>
-            {/* Map detection status + attack/defend question.
-                Only hybrid & escort maps need a starting side. Detection is
-                best-effort; if it fails we simply don't ask. "Unsure" stores
-                null. None of this blocks the upload. */}
-            {detectState === 'detecting' && (
-              <div className="flex items-center gap-2 text-xs text-slate-500 font-display">
-                <div className="w-3 h-3 border-2 border-ow-orange border-t-transparent rounded-full animate-spin" />
-                DETECTING MAP…
-              </div>
-            )}
-
-            {/* Subtle confirmation of what the phone detected. */}
-            {detectState === 'done' && detectedMap && (
-              <p className="text-[11px] text-slate-500 font-display tracking-wider">
-                MAP DETECTED: <span className="text-slate-300">{detectedMap}</span>
-              </p>
-            )}
-
-            {detectState === 'done' && askStartingSide && (
-              <div className="bg-ow-panel rounded-lg p-4 border border-ow-orange/30 space-y-3">
-                <div>
-                  <p className="text-sm text-white font-display tracking-wider">
-                    STARTING SIDE
-                  </p>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    <span className="text-ow-orange">{detectedMap}</span> needs a starting side — did you attack or defend first?
-                  </p>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {([
-                    ['attack', 'ATTACK FIRST'],
-                    ['defense', 'DEFEND FIRST'],
-                  ] as [StartingSide, string][]).map(([val, label]) => (
-                    <button key={val} type="button"
-                      onClick={() => { setStartingSide(val); setStartingSideAnswered(true) }}
-                      className={`px-4 py-2 rounded-lg text-sm font-display tracking-wider transition-all
-                        ${startingSide === val
-                          ? 'bg-ow-orange text-ow-dark font-bold'
-                          : 'bg-ow-dark text-slate-400 border border-white/10 hover:text-white hover:border-white/20'
-                        }`}
-                    >{label}</button>
-                  ))}
-                  <button type="button"
-                    onClick={() => { setStartingSide(null); setStartingSideAnswered(true) }}
-                    className={`px-4 py-2 rounded-lg text-sm font-display tracking-wider transition-all
-                      ${startingSideAnswered && startingSide === null
-                        ? 'bg-slate-600 text-white font-bold'
-                        : 'bg-ow-dark text-slate-400 border border-white/10 hover:text-white hover:border-white/20'
-                      }`}
-                  >UNSURE</button>
-                </div>
-              </div>
-            )}
-
-            <button onClick={uploadAll}
-              className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
-                         py-3 rounded-lg tracking-wider transition-colors text-sm">
-              UPLOAD ALL
-            </button>
           </div>
         )}
       </div>
-    )
-  }
 
-  // ======================== QUESTIONS STEP ========================
-  return (
-    <div className="max-w-lg mx-auto space-y-6">
-      <div>
-        <h1 className="text-3xl text-ow-orange">Log Match</h1>
-        <p className="text-sm text-slate-400 mt-1">Quick questions, then upload your photos</p>
-      </div>
-
-      <div>
-        <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">
-          MATCH FORMAT <span className="text-ow-defeat">*</span>
-        </label>
-        <ChipSelect options={['5v5', '6v6'] as ('5v5' | '6v6')[]} value={matchFormat} onChange={(v) => {
-          if (v) {
-            setMatchFormat(v)
-            // Reset role selection when switching formats
-            if (v === '5v5') { setRolesPlayed([]); }
-            else { setRole(null); }
-          }
-        }}
-          labels={{ '5v5': '5V5', '6v6': '6V6' }}
-          colors={{ '5v5': 'bg-ow-orange text-ow-dark', '6v6': 'bg-purple-600 text-white' }} />
-      </div>
-
-      <div>
-        <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">
-          {matchFormat === '6v6' ? 'ROLES PLAYED' : 'ROLE PLAYED'} <span className="text-ow-defeat">*</span>
-        </label>
-        {matchFormat === '5v5' ? (
-          <ChipSelect options={['tank', 'dps', 'support'] as RoleType[]} value={role} onChange={setRole}
-            labels={{ tank: 'TANK', dps: 'DPS', support: 'SUPPORT' }} />
-        ) : (
-          <>
-            <MultiChipSelect options={['tank', 'dps', 'support'] as RoleType[]} value={rolesPlayed} onChange={setRolesPlayed}
-              labels={{ tank: 'TANK', dps: 'DPS', support: 'SUPPORT' }} />
-            <p className="text-xs text-slate-500 mt-1.5">Select all roles you played this match (1-3)</p>
-          </>
-        )}
-      </div>
-
-      <div>
-        <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">HOW WAS THE MATCH?</label>
-        <ChipSelect options={['stomped_them', 'close_game', 'got_stomped'] as MatchFeel[]} value={matchFeel} onChange={setMatchFeel}
-          labels={{ stomped_them: 'STOMPED THEM', close_game: 'CLOSE GAME', got_stomped: 'GOT STOMPED' }} />
-      </div>
-
-      <div>
-        <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">YOUR PERFORMANCE</label>
-        <ChipSelect options={['carried', 'did_my_job', 'struggled'] as PerformanceFeel[]} value={perfFeel} onChange={setPerfFeel}
-          labels={{ carried: 'CARRIED', did_my_job: 'DID MY JOB', struggled: 'STRUGGLED' }} />
-      </div>
-
-      <div>
-        <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">ANYTHING NOTABLE?</label>
-        <MultiChipSelect options={['leaver', 'smurf', 'thrower', 'great_teamwork'] as NotableEvent[]} value={notableEvents} onChange={setNotableEvents}
-          labels={{ leaver: 'LEAVER', smurf: 'SMURF', thrower: 'THROWER', great_teamwork: 'GREAT TEAMWORK' }} />
-      </div>
-
-      <div>
-        <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">FUN RATING</label>
-        <StarRating value={funRating} onChange={setFunRating} />
-      </div>
-
-      <div>
-        <label className="block text-sm font-display tracking-wider text-slate-300 mb-2">PERSONAL THOUGHTS</label>
-        <textarea value={thoughts} onChange={e => setThoughts(e.target.value)}
-          placeholder="What happened? What could you improve?" rows={3}
-          className="w-full bg-ow-dark border border-white/10 rounded-lg px-4 py-2.5
-                     text-white placeholder-slate-600 focus:border-ow-orange/50
-                     focus:outline-none transition-colors resize-none" />
-      </div>
-
-      <button onClick={() => setStep('photos')}
-        disabled={matchFormat === '5v5' ? !role : rolesPlayed.length === 0}
-        className="w-full bg-ow-orange hover:bg-ow-accent disabled:bg-slate-700
-                   disabled:text-slate-500 text-ow-dark font-display font-bold
-                   py-3 rounded-lg tracking-wider transition-colors text-sm">
-        NEXT → SELECT PHOTOS
-      </button>
+      {files.length > 0 && (
+        <div className="relative shrink-0 max-w-md mx-auto w-full pt-4">
+          <button onClick={beginUpload}
+            className="w-full rounded-xl bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold py-4 tracking-[0.2em] uppercase text-sm transition-colors">
+            UPLOAD ALL
+          </button>
+        </div>
+      )}
     </div>
   )
 }

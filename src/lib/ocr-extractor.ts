@@ -39,6 +39,7 @@ const REGIONS: Record<string, Region> = {
   mapName:    { x: 2580, y: 379,  w: 470, h: 51 },   // map name header
   result:     { x: 2580, y: 1225, w: 470, h: 95 },   // VICTORY / DEFEAT / DRAW
   scoreLine:  { x: 2580, y: 1345, w: 470, h: 36 },   // "· FINAL SCORE: X VS Y"
+  dateLine:   { x: 2580, y: 1405, w: 470, h: 38 },   // "· DATE: MM/DD/YY - HH:MM" (measured: text band y1408-1434)
   modeLine:   { x: 2580, y: 1461, w: 470, h: 36 },   // "· GAME MODE: HYBRID"
   lengthLine: { x: 2580, y: 1519, w: 470, h: 36 },   // "· GAME LENGTH: MM:SS"
 
@@ -122,6 +123,11 @@ export interface SummaryOcrResult {
   score: string | null
   gameLengthText: string | null
   gameLengthSeconds: number | null
+  // Real match time, parsed from the summary screenshot's "DATE: MM/DD/YY - HH:MM"
+  // line. The game displays American MM/DD/YY; we parse that and build a proper
+  // Date. null if the date couldn't be read (caller falls back to process time).
+  matchTimestamp: Date | null
+  matchDateText: string | null   // raw OCR'd date text, for debug/verification
   eliminations: number | null
   assists: number | null
   deaths: number | null
@@ -137,6 +143,7 @@ export async function ocrSummaryPage(img: HTMLImageElement): Promise<SummaryOcrR
   const result: SummaryOcrResult = {
     mapName: null, result: null, score: null,
     gameLengthText: null, gameLengthSeconds: null,
+    matchTimestamp: null, matchDateText: null,
     eliminations: null, assists: null, deaths: null,
     heroNames: [], raw: {},
   }
@@ -242,6 +249,51 @@ export async function ocrSummaryPage(img: HTMLImageElement): Promise<SummaryOcrR
       result.gameLengthSeconds = min * 60 + sec
     }
     console.log(`[ocr-extractor] Length: "${lengthText}" → ${result.gameLengthText}`)
+
+    // =========================================================
+    // MATCH DATE/TIME — Tesseract + regex ("DATE: MM/DD/YY - HH:MM")
+    // ---------------------------------------------------------
+    // The game shows AMERICAN MM/DD/YY. We parse those parts and build a
+    // proper Date (stored as a real timestamp; British DD-MM-YYYY is a
+    // DISPLAY concern handled in the UI, not here).
+    // Verified against Test_1/2/7 summary screenshots: reads cleanly.
+    // Best-effort: if it can't parse, matchTimestamp stays null and the
+    // caller falls back to process time. A bad read NEVER blocks anything.
+    // =========================================================
+    const dateText = await ocrRegion(img, REGIONS.dateLine)
+    result.raw.dateText = dateText
+    result.matchDateText = dateText
+    // Match "MM/DD/YY - HH:MM" anywhere in the string (ignores the "· DATE:" label).
+    const dateMatch = dateText.match(/(\d{2})\/(\d{2})\/(\d{2})\s*-\s*(\d{1,2}):(\d{2})/)
+    if (dateMatch) {
+      const mm = parseInt(dateMatch[1], 10)   // American: month first
+      const dd = parseInt(dateMatch[2], 10)   // then day
+      const yy = parseInt(dateMatch[3], 10)   // 2-digit year
+      const hh = parseInt(dateMatch[4], 10)
+      const min = parseInt(dateMatch[5], 10)
+      // Sanity-bound every part before trusting it (guards against OCR noise).
+      const valid =
+        mm >= 1 && mm <= 12 &&
+        dd >= 1 && dd <= 31 &&
+        hh >= 0 && hh <= 23 &&
+        min >= 0 && min <= 59
+      if (valid) {
+        const fullYear = 2000 + yy
+        // Construct in local time (matches how the player reads the clock).
+        // Month is 0-indexed in JS Date.
+        const d = new Date(fullYear, mm - 1, dd, hh, min, 0, 0)
+        if (!isNaN(d.getTime())) {
+          result.matchTimestamp = d
+          result.raw.matchTimestampISO = d.toISOString()
+        }
+      }
+      if (!result.matchTimestamp) {
+        console.warn(`[ocr-extractor] Date parsed but failed validation: "${dateText}"`)
+      }
+    } else {
+      console.warn(`[ocr-extractor] Date not matched in: "${dateText}" (will fall back to process time)`)
+    }
+    console.log(`[ocr-extractor] Date: "${dateText}" → ${result.matchTimestamp?.toISOString() ?? 'null (fallback)'}`)
 
     // =========================================================
     // HERO NAMES
