@@ -140,6 +140,24 @@ export async function fetchIssueLog(): Promise<IssueLogRow[]> {
   return (data ?? []) as IssueLogRow[]
 }
 
+// ── Destructive: clear the log (Start New Season) ────────────
+//
+// Deletes EVERY row in beta_issue_log and NOTHING else — match data lives in
+// other tables and is never touched here. PostgREST rejects an unfiltered
+// delete as a safety measure, so we use an always-true filter (id >= 0) that
+// matches all rows. The caller MUST archive first; this is irreversible.
+export async function clearIssueLog(): Promise<{ error: unknown; deleted: boolean }> {
+  const { error } = await supabase
+    .from('beta_issue_log')
+    .delete()
+    .gte('id', 0)   // matches all rows; satisfies PostgREST's "must filter" rule
+  if (error) {
+    console.warn('[beta-log] failed to clear log', error)
+    return { error, deleted: false }
+  }
+  return { error: null, deleted: true }
+}
+
 // ── Aggregation (pure — unit-testable without a DB) ──────────
 
 export interface SeasonStats {
@@ -340,5 +358,29 @@ export function generateIssueReportMarkdown(rows: IssueLogRow[]): string {
   }
   lines.push('')
 
+  return lines.join('\n')
+}
+
+// ── Season archive (report + lossless raw rows) ──────────────
+//
+// Used by the "Start New Season" reset: the readable report on top, then every
+// raw row as JSON so the season is preserved losslessly and can be re-imported
+// or re-analysed later. Generated and downloaded BEFORE any rows are cleared.
+export function generateSeasonArchiveMarkdown(rows: IssueLogRow[]): string {
+  const report = generateIssueReportMarkdown(rows)
+  const lines: string[] = []
+  lines.push(report.trimEnd())
+  lines.push('')
+  lines.push('---')
+  lines.push('')
+  lines.push('## Raw data (lossless archive)')
+  lines.push('')
+  lines.push(`> All ${rows.length} \`beta_issue_log\` rows at archive time, as JSON. ` +
+    'Re-importable; this is the complete record for the season being cleared.')
+  lines.push('')
+  lines.push('```json')
+  lines.push(JSON.stringify(rows, null, 2))
+  lines.push('```')
+  lines.push('')
   return lines.join('\n')
 }
