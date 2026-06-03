@@ -1,14 +1,36 @@
 'use client'
 
+// ============================================================
+// PROCESS MATCHES — two-phase rework
+// ------------------------------------------------------------
+// Phase 1 (PROCESSING, unattended): loops every selected/all pending batch,
+//   runs processMatchPhotos() with NO stops, builds each match's 6f
+//   confirmation questions, and holds the result in memory as a ReviewItem.
+//   A batch that throws is SKIPPED (files left in pending for retry), logged
+//   to the issue log as a processing_error, and collected into failures[].
+//
+// Phase 2 (REVIEW, grouped by match): steps through the held ReviewItems one
+//   match at a time — username confirmation (if unresolved) then the 6f Quick
+//   check — and SAVES each match the instant its review clears. Saving removes
+//   that match's pending files (inside saveMatch, after all inserts succeed),
+//   exactly as before. Nothing is deleted before save.
+//
+// Safety notes:
+//   - Signed image URLs are re-minted at review time (per match), so a long
+//     session never shows expired/broken source crops in the confirmation
+//     cards. Scan-time URLs are only used for the batch-list thumbnails.
+//   - File cleanup remains the final step of saveMatch — never earlier.
+// ============================================================
+
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
-import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus, type ScoreboardResult } from '@/lib/image-processor'
+import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus } from '@/lib/image-processor'
 import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
-import { getGameModeForMap, needsStartingSide } from '@/data/reference'
+import { getGameModeForMap, needsStartingSide, MAPS } from '@/data/reference'
 import type { RoleType, MatchFeel, PerformanceFeel, StartingSide } from '@/lib/types'
 import { buildConfirmationQuestions, type ConfirmInputs, type ConfirmationCandidate } from '@/lib/beta-confirmation'
-import { logConfirmationOutcome, logMatchSummary } from '@/lib/beta-issue-log'
+import { logConfirmationOutcome, logMatchSummary, logProcessingError } from '@/lib/beta-issue-log'
 import { ConfirmationPanel, type ConfirmationResult } from '@/app/review/ConfirmationCard'
 
 interface PendingBatch {
@@ -39,17 +61,45 @@ interface PendingBatch {
   photoPaths: string[]
 }
 
-type PageState = 'scanning' | 'idle' | 'processing' | 'confirming' | 'beta_confirm' | 'saving' | 'done' | 'error'
+// A processed-but-not-yet-saved match held in memory through Phase 2.
+interface ReviewItem {
+  batch: PendingBatch
+  result: ProcessedMatch
+  questions: ConfirmationCandidate[]
+  matchSeq: number
+  // username confirmation state for THIS match
+  userResolved: boolean
+  saved: boolean
+}
+
+interface ProcessFailure {
+  batchId: string
+  message: string
+  uploadedAt: string
+}
+
+type PageState =
+  | 'scanning'
+  | 'idle'
+  | 'processing'    // Phase 1 — unattended loop
+  | 'review'        // Phase 2 — grouped-by-match review
+  | 'done'
+
+// Per-match review sub-step within Phase 2.
+type ReviewStep = 'user_confirm' | 'user_select' | 'beta' | 'saving' | 'saved'
+
+const MAP_NAMES = MAPS.map(m => m.name)
+const MODE_NAMES = ['escort', 'control', 'hybrid', 'push', 'flashpoint']
 
 const STATUS_MESSAGES: Record<string, string> = {
-  loading_opencv: 'Loading image recognition engine...',
-  loading_heroes: 'Loading hero bank (51 heroes)...',
-  processing_photo: 'Loading photos...',
-  classifying_pages: 'Detecting page types...',
-  running_ocr: 'Reading text from screenshots...',
-  matching_heroes: 'Identifying heroes...',
-  reading_breakdowns: 'Extracting hero stats...',
-  reading_scoreboard: 'Reading scoreboard data...',
+  loading_opencv: 'Loading image recognition engine…',
+  loading_heroes: 'Loading hero bank (51 heroes)…',
+  processing_photo: 'Loading photos…',
+  classifying_pages: 'Detecting page types…',
+  running_ocr: 'Reading text from screenshots…',
+  matching_heroes: 'Identifying heroes…',
+  reading_breakdowns: 'Extracting hero stats…',
+  reading_scoreboard: 'Reading scoreboard data…',
   complete: 'Processing complete!',
 }
 
@@ -57,25 +107,34 @@ export default function ProcessPage() {
   const router = useRouter()
   const [batches, setBatches] = useState<PendingBatch[]>([])
   const [pageState, setPageState] = useState<PageState>('scanning')
-  const [processingStatus, setProcessingStatus] = useState<ProcessingStatus | null>(null)
-  const [processedResult, setProcessedResult] = useState<ProcessedMatch | null>(null)
-  const [currentBatch, setCurrentBatch] = useState<PendingBatch | null>(null)
-  const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [gamertag, setGamertag] = useState<string>('')
-  const [confirmStep, setConfirmStep] = useState<'confirm' | 'select'>('confirm')
 
-  // 6f beta confirmation
-  const [betaQuestions, setBetaQuestions] = useState<ConfirmationCandidate[]>([])
-  const [betaPending, setBetaPending] = useState<{ batch: PendingBatch; result: ProcessedMatch } | null>(null)
-  const [matchSeq, setMatchSeq] = useState(0)
-
-  // Multi-process queue
+  // selection
   const [selectedBatchIds, setSelectedBatchIds] = useState<Set<string>>(new Set())
-  const [queueRemaining, setQueueRemaining] = useState<PendingBatch[]>([])
-  const [queueTotal, setQueueTotal] = useState(0)
-  const [queueProcessed, setQueueProcessed] = useState(0)
 
-  // Fetch gamertag from user_settings on mount
+  // Phase 1 — processing
+  const [processingStatus, setProcessingStatus] = useState<ProcessingStatus | null>(null)
+  const [procTotal, setProcTotal] = useState(0)
+  const [procDone, setProcDone] = useState(0)
+  const [procCurrentLabel, setProcCurrentLabel] = useState<string>('')
+  const [failures, setFailures] = useState<ProcessFailure[]>([])
+
+  // Phase 2 — review queue (held in memory until each is saved)
+  const [reviewItems, setReviewItems] = useState<ReviewItem[]>([])
+  const [reviewIndex, setReviewIndex] = useState(0)
+  const [reviewStep, setReviewStep] = useState<ReviewStep>('beta')
+  const [reviewError, setReviewError] = useState<string | null>(null)
+  // freshly re-minted signed URLs for the match currently under review
+  const [liveImages, setLiveImages] = useState<{
+    scoreboard?: string
+    summary?: string
+    byHero: Record<string, string>
+  }>({ byHero: {} })
+
+  const [savedCount, setSavedCount] = useState(0)
+  const [matchSeqCounter, setMatchSeqCounter] = useState(0)
+
+  // ── Mount: gamertag + initial scan ──
   useEffect(() => {
     async function loadGamertag() {
       const { data } = await supabase
@@ -83,9 +142,7 @@ export default function ProcessPage() {
         .select('gamertag')
         .limit(1)
         .single()
-      if (data?.gamertag) {
-        setGamertag(data.gamertag)
-      }
+      if (data?.gamertag) setGamertag(data.gamertag)
     }
     loadGamertag()
   }, [])
@@ -97,7 +154,7 @@ export default function ProcessPage() {
     try {
       const { data: folders } = await supabase.storage
         .from('match-images')
-        .list('pending', { limit: 20 })
+        .list('pending', { limit: 50 })
 
       if (!folders || folders.length === 0) {
         setBatches([])
@@ -142,6 +199,11 @@ export default function ProcessPage() {
         pendingBatches.push({ batchId: folder.name, metadata, photoUrls, photoPaths })
       }
 
+      // Stable order: oldest upload first, so an overnight run processes in
+      // the order matches were played/uploaded.
+      pendingBatches.sort((a, b) =>
+        (a.metadata.uploaded_at || '').localeCompare(b.metadata.uploaded_at || ''))
+
       setBatches(pendingBatches)
       setPageState('idle')
     } catch (err) {
@@ -150,8 +212,7 @@ export default function ProcessPage() {
     }
   }
 
-  // ── Selection & multi-process ──
-
+  // ── Selection ──
   function toggleBatchSelection(batchId: string) {
     setSelectedBatchIds(prev => {
       const next = new Set(prev)
@@ -160,99 +221,41 @@ export default function ProcessPage() {
       return next
     })
   }
+  function selectAllBatches() { setSelectedBatchIds(new Set(batches.map(b => b.batchId))) }
+  function deselectAllBatches() { setSelectedBatchIds(new Set()) }
 
-  function selectAllBatches() {
-    setSelectedBatchIds(new Set(batches.map(b => b.batchId)))
-  }
+  // ════════════════════════════════════════════════════════════
+  // PHASE 1 — unattended processing
+  // ════════════════════════════════════════════════════════════
 
-  function deselectAllBatches() {
+  function startProcessing(which: PendingBatch[]) {
+    if (which.length === 0) return
+    setFailures([])
+    setReviewItems([])
+    setReviewIndex(0)
+    setSavedCount(0)
+    setProcTotal(which.length)
+    setProcDone(0)
     setSelectedBatchIds(new Set())
+    setPageState('processing')
+    // Run the loop. It owns its own seq counter so memory state stays correct.
+    void runProcessingLoop(which)
   }
 
   function processSelected() {
     const selected = batches.filter(b => selectedBatchIds.has(b.batchId))
-    if (selected.length === 0) return
-
-    const [first, ...rest] = selected
-    setQueueRemaining(rest)
-    setQueueTotal(selected.length)
-    setQueueProcessed(0)
-    setSelectedBatchIds(new Set())
-    processBatch(first)
+    startProcessing(selected)
   }
+  function processAllBatches() { startProcessing(batches) }
 
-  function processAllBatches() {
-    if (batches.length === 0) return
-    const [first, ...rest] = batches
-    setQueueRemaining(rest)
-    setQueueTotal(batches.length)
-    setQueueProcessed(0)
-    setSelectedBatchIds(new Set())
-    processBatch(first)
-  }
-
-  function processNextInQueue() {
-    if (queueRemaining.length === 0) {
-      // Queue finished — reset
-      setQueueTotal(0)
-      setQueueProcessed(0)
-      handleDone()
-      return
-    }
-    const [next, ...rest] = queueRemaining
-    setQueueRemaining(rest)
-    setQueueProcessed(prev => prev + 1)
-    processBatch(next)
-  }
-
-  async function processBatch(batch: PendingBatch) {
-    setCurrentBatch(batch)
-    setPageState('processing')
-    setErrorMsg(null)
-
-    try {
-      const result = await processMatchPhotos(
-        batch.photoUrls,
-        (status) => setProcessingStatus(status),
-        batch.metadata.role_played || undefined,
-        gamertag || undefined,
-      )
-
-      setProcessedResult(result)
-      console.log('Processing result:', result)
-
-      // Check if scoreboard needs user confirmation
-      if (result.scoreboard?.ocrAnalysis && !result.scoreboard.ocrAnalysis.resolved) {
-        setConfirmStep('confirm')
-        setPageState('confirming')
-        return
-      }
-
-      // No username confirmation needed — go to beta confirmation before saving
-      startBetaConfirm(batch, result)
-
-    } catch (err: any) {
-      console.error('Processing error:', err)
-      setErrorMsg(err.message || 'Processing failed')
-      setPageState('error')
-    }
-  }
-
-  // ── 6f Beta confirmation ──────────────────────────────────
-  // Build the (ranked, capped) confirmation questions from the finished result
-  // and switch to the beta_confirm screen. Every match shows this step.
-  function startBetaConfirm(batch: PendingBatch, result: ProcessedMatch) {
+  // Build the 6f confirmation questions for a finished result (pure-ish; no save).
+  function buildQuestions(batch: PendingBatch, result: ProcessedMatch, seq: number): ConfirmationCandidate[] {
     const sb = result.scoreboard
-    const seq = matchSeq + 1
-    setMatchSeq(seq)
 
-    // Derive low-confidence hero slots from the per-slot confidence the
-    // identifier already produced (no extra signal needed).
     const lowConfHeroSlots = (sb?.heroes ?? [])
       .filter(h => h.heroName && h.confidence < 0.6)
       .map(h => h.slot)
 
-    // Map breakdowns to the BreakdownOcrResult shape the builder expects.
     const breakdowns = result.heroBreakdowns.map(b => ({
       heroName: b.heroName,
       percentPlayed: b.percentPlayed,
@@ -287,32 +290,187 @@ export default function ProcessPage() {
         raw: result.ocrRaw,
       },
       lowConfHeroSlots,
-      // knownMaps / knownModes omitted for now (reference export names unverified);
-      // the unrecognized-content producer no-ops safely without them.
+      knownMaps: MAP_NAMES,
+      knownModes: MODE_NAMES,
       scoreboardImageUrl: sb?.imageUrl,
       summaryImageUrl: result.summaryImageUrl,
       breakdownImageUrlByHero: Object.fromEntries(
         result.heroBreakdowns.map(b => [b.heroName, b.imageUrl])
       ),
       grid: sb?.detection?.grid ?? undefined,
-      // Scoreboard images are always 3840×2160 (the extractor rejects anything
-      // else), so grid coords map to fractions against these fixed dimensions.
       imageNaturalWidth: 3840,
       imageNaturalHeight: 2160,
       matchSequence: seq,
     }
 
-    const questions = buildConfirmationQuestions(inputs)
-    setBetaQuestions(questions)
-    setBetaPending({ batch, result })
-    setPageState('beta_confirm')
+    return buildConfirmationQuestions(inputs)
   }
 
+  async function runProcessingLoop(which: PendingBatch[]) {
+    const collected: ReviewItem[] = []
+    const failed: ProcessFailure[] = []
+    let seq = matchSeqCounter
+
+    for (let i = 0; i < which.length; i++) {
+      const batch = which[i]
+      setProcDone(i)
+      const roles = batch.metadata.roles_played?.length
+        ? batch.metadata.roles_played.join(', ')
+        : batch.metadata.role_played || 'all roles'
+      setProcCurrentLabel(`${batch.metadata.match_format?.toUpperCase() || ''} · ${roles}`.trim())
+      setProcessingStatus(null)
+
+      try {
+        const result = await processMatchPhotos(
+          batch.photoUrls,
+          (status) => setProcessingStatus(status),
+          batch.metadata.role_played || undefined,
+          gamertag || undefined,
+        )
+
+        seq += 1
+        const questions = buildQuestions(batch, result, seq)
+        const userResolved = !(result.scoreboard?.ocrAnalysis && !result.scoreboard.ocrAnalysis.resolved)
+
+        collected.push({
+          batch,
+          result,
+          questions,
+          matchSeq: seq,
+          userResolved,
+          saved: false,
+        })
+      } catch (err: any) {
+        const message = err?.message || 'Processing failed'
+        console.error(`[process] batch ${batch.batchId} failed:`, err)
+        failed.push({ batchId: batch.batchId, message, uploadedAt: batch.metadata.uploaded_at })
+        // Log to issue log (best-effort; never blocks the run). Files are NOT
+        // removed — they stay in pending/ for a later retry.
+        try {
+          await logProcessingError({
+            matchId: batch.batchId,
+            message,
+            format: batch.metadata.match_format ?? null,
+          })
+        } catch (logErr) {
+          console.warn('[process] failed to log processing_error (continuing):', logErr)
+        }
+      }
+    }
+
+    setProcDone(which.length)
+    setMatchSeqCounter(seq)
+    setFailures(failed)
+    setReviewItems(collected)
+
+    if (collected.length === 0) {
+      // Nothing processed successfully — go straight to the done screen, which
+      // will surface the failures.
+      setPageState('done')
+      return
+    }
+
+    // Enter Phase 2 at the first match.
+    setReviewIndex(0)
+    void enterReviewForIndex(0, collected)
+  }
+
+  // ════════════════════════════════════════════════════════════
+  // PHASE 2 — review, grouped by match
+  // ════════════════════════════════════════════════════════════
+
+  // Re-mint fresh signed URLs for a match's source screenshots so the
+  // confirmation crops never show an expired link, then pick the first sub-step.
+  async function enterReviewForIndex(index: number, items: ReviewItem[]) {
+    const item = items[index]
+    if (!item) { finishReview(); return }
+
+    setReviewError(null)
+    setPageState('review')
+
+    // Re-sign the batch's photo paths and remap to the result's image roles by
+    // matching the path suffix the original signed URLs used. We can't know
+    // which path was scoreboard vs summary without the result's own URLs, so we
+    // refresh ALL batch paths and substitute by filename where the result URL
+    // contained that filename. Simpler + robust: refresh each path, then for
+    // each result image URL find the path whose filename it ends with.
+    const fresh: Record<string, string> = {}
+    for (const path of item.batch.photoPaths) {
+      const { data } = await supabase.storage
+        .from('match-images')
+        .createSignedUrl(path, 3600)
+      if (data?.signedUrl) fresh[path] = data.signedUrl
+    }
+    const reSign = (oldUrl: string | undefined): string | undefined => {
+      if (!oldUrl) return undefined
+      // The signed URL path segment contains the storage path; match by the
+      // batch path whose filename appears in the old URL.
+      const hit = item.batch.photoPaths.find(p => {
+        const file = p.split('/').pop() || p
+        return oldUrl.includes(encodeURIComponent(file)) || oldUrl.includes(file)
+      })
+      return hit ? fresh[hit] ?? oldUrl : oldUrl
+    }
+
+    const sb = item.result.scoreboard
+    const byHero: Record<string, string> = {}
+    for (const b of item.result.heroBreakdowns) {
+      const u = reSign(b.imageUrl)
+      if (u) byHero[b.heroName] = u
+    }
+    setLiveImages({
+      scoreboard: reSign(sb?.imageUrl),
+      summary: reSign(item.result.summaryImageUrl),
+      byHero,
+    })
+
+    // First sub-step: username confirmation if unresolved, else straight to 6f.
+    if (!item.userResolved) setReviewStep('user_confirm')
+    else setReviewStep('beta')
+  }
+
+  const current = reviewItems[reviewIndex]
+
+  // Username confirmation handlers (operate on the current review item) ──
+  function applyUserSlot(slot: number, method: 'ocr_confirmed' | 'manual_select') {
+    setReviewItems(prev => {
+      const next = [...prev]
+      const item = next[reviewIndex]
+      if (!item?.result.scoreboard) return prev
+      const sb = item.result.scoreboard
+      const updatedPlayers = buildPlayerLabels(sb.heroes, sb.roles, gamertag, slot, method)
+      next[reviewIndex] = {
+        ...item,
+        userResolved: true,
+        result: {
+          ...item.result,
+          scoreboard: {
+            ...sb,
+            players: updatedPlayers,
+            ocrAnalysis: { ...sb.ocrAnalysis, resolved: true, userSlot: slot },
+          },
+        },
+      }
+      return next
+    })
+    setReviewStep('beta')
+  }
+
+  const handleConfirmUser = useCallback((slot: number) => applyUserSlot(slot, 'ocr_confirmed'), [reviewIndex, gamertag])
+  const handleSelectUser  = useCallback((slot: number) => applyUserSlot(slot, 'manual_select'), [reviewIndex, gamertag])
+  const handleDeclineConfirm = useCallback(() => setReviewStep('user_select'), [])
+  const handleSkipConfirm = useCallback(() => setReviewStep('beta'), [])
+
+  // 6f completion → log outcomes, then SAVE this match immediately.
   async function onBetaComplete(results: ConfirmationResult[]) {
-    if (!betaPending) return
-    const { batch, result } = betaPending
+    const item = reviewItems[reviewIndex]
+    if (!item) return
+    const { batch, result } = item
     const format = (result.matchFormat || batch.metadata.match_format || '5v5') as '5v5' | '6v6'
-    let autoPassFields = result.scoreboard?.cellConfidence?.length ?? 0
+    const autoPassFields = result.scoreboard?.cellConfidence?.length ?? 0
+
+    setReviewStep('saving')
+    setReviewError(null)
 
     try {
       for (const r of results) {
@@ -338,98 +496,47 @@ export default function ProcessPage() {
       console.warn('[beta] logging failed (continuing to save):', err)
     }
 
-    // Proceed to save the match exactly as before.
-    setPageState('saving')
     try {
       await saveMatch(batch, result)
-      setPageState('done')
+      setReviewItems(prev => {
+        const next = [...prev]
+        if (next[reviewIndex]) next[reviewIndex] = { ...next[reviewIndex], saved: true }
+        return next
+      })
+      setSavedCount(c => c + 1)
+      setReviewStep('saved')
     } catch (err: any) {
-      setErrorMsg(err.message || 'Save failed')
-      setPageState('error')
+      setReviewError(err?.message || 'Save failed')
+      setReviewStep('beta')
     }
   }
 
-  // Handle user confirming the OCR suggestion
-  const handleConfirmUser = useCallback((slot: number) => {
-    if (!processedResult?.scoreboard || !currentBatch) return
+  function advanceReview() {
+    const nextIndex = reviewIndex + 1
+    if (nextIndex >= reviewItems.length) { finishReview(); return }
+    setReviewIndex(nextIndex)
+    void enterReviewForIndex(nextIndex, reviewItems)
+  }
 
-    const sb = processedResult.scoreboard
-    const updatedPlayers = buildPlayerLabels(
-      sb.heroes, sb.roles, gamertag, slot, 'ocr_confirmed',
-    )
+  function finishReview() {
+    setPageState('done')
+  }
 
-    const updatedResult: ProcessedMatch = {
-      ...processedResult,
-      scoreboard: {
-        ...sb,
-        players: updatedPlayers,
-        ocrAnalysis: { ...sb.ocrAnalysis, resolved: true, userSlot: slot },
-      },
-    }
-
-    setProcessedResult(updatedResult)
-    startBetaConfirm(currentBatch, updatedResult)
-  }, [processedResult, currentBatch, gamertag])
-
-  // Handle user selecting from all 5 options
-  const handleSelectUser = useCallback((slot: number) => {
-    if (!processedResult?.scoreboard || !currentBatch) return
-
-    const sb = processedResult.scoreboard
-    const updatedPlayers = buildPlayerLabels(
-      sb.heroes, sb.roles, gamertag, slot, 'manual_select',
-    )
-
-    const updatedResult: ProcessedMatch = {
-      ...processedResult,
-      scoreboard: {
-        ...sb,
-        players: updatedPlayers,
-        ocrAnalysis: { ...sb.ocrAnalysis, resolved: true, userSlot: slot },
-      },
-    }
-
-    setProcessedResult(updatedResult)
-    startBetaConfirm(currentBatch, updatedResult)
-  }, [processedResult, currentBatch, gamertag])
-
-  // Decline → show all 5 options
-  const handleDeclineConfirm = useCallback(() => {
-    setConfirmStep('select')
-  }, [])
-
-  // Skip user identification entirely — save without marking any player as user
-  const handleSkipConfirm = useCallback(() => {
-    if (!processedResult || !currentBatch) return
-    startBetaConfirm(currentBatch, processedResult)
-  }, [processedResult, currentBatch])
-
+  // ── Save (unchanged logic; cleanup remains the LAST step) ──
   async function saveMatch(batch: PendingBatch, processed: ProcessedMatch) {
     const meta = batch.metadata
     const gameMode = processed.mapName ? getGameModeForMap(processed.mapName) : null
     const finalRole = processed.correctedRole || meta.role_played || 'dps'
-
-    // match_format: prefer auto-detected from scoreboard, fall back to upload metadata, default '5v5'
     const matchFormat = processed.matchFormat || meta.match_format || '5v5'
-
-    // roles_played: prefer upload metadata (user-declared), fall back to single role
     const rolesPlayed = meta.roles_played && meta.roles_played.length > 0
       ? meta.roles_played
       : [finalRole]
 
-    // starting_side: the phone asks attack/defend only on hybrid/escort maps
-    // and sends the answer in metadata. We only TRUST it if the laptop's own
-    // (authoritative) map detection agrees the map needs a starting side —
-    // this prevents a phone OCR mis-read from writing a bogus value. If the
-    // map is symmetric (control/push/flashpoint) or unknown, store null.
     const startingSide: StartingSide | null =
       processed.mapName && needsStartingSide(processed.mapName)
         ? (meta.starting_side ?? null)
         : null
 
-    // Real match time, OCR'd from the summary screenshot. If the date couldn't
-    // be read (null), fall back to NOW so processing never breaks — but log it,
-    // since a fallback means session/season for this match are approximate.
     const playedAtDate: Date = processed.matchTimestamp ?? new Date()
     if (!processed.matchTimestamp) {
       console.warn('[process] No match timestamp from OCR — falling back to process time for played_at/season')
@@ -477,7 +584,6 @@ export default function ProcessPage() {
 
     if (matchError) throw matchError
 
-    // Save hero performances + stats (existing logic)
     if (match && processed.heroes.length > 0) {
       const heroInserts = processed.heroes.map((hero, i) => {
         const breakdown = processed.heroBreakdowns.find(b => b.heroName === hero.name)
@@ -508,7 +614,6 @@ export default function ProcessPage() {
         for (const perf of heroPerfs) {
           const breakdown = processed.heroBreakdowns.find(b => b.heroName === perf.hero_name)
           if (!breakdown) continue
-
           for (const stat of breakdown.stats) {
             allStatInserts.push({
               hero_performance_id: perf.id,
@@ -523,17 +628,12 @@ export default function ProcessPage() {
           const { error: statsError } = await supabase
             .from('hero_stats')
             .insert(allStatInserts)
-
-          if (statsError) {
-            console.warn('Failed to save hero stats:', statsError)
-          } else {
-            console.log(`Saved ${allStatInserts.length} hero stats to database`)
-          }
+          if (statsError) console.warn('Failed to save hero stats:', statsError)
+          else console.log(`Saved ${allStatInserts.length} hero stats to database`)
         }
       }
     }
 
-    // Save scoreboard players (10 or 12 rows depending on format)
     if (match && processed.scoreboard) {
       const sb = processed.scoreboard
       const scoreboardInserts = sb.stats.map(s => {
@@ -558,15 +658,11 @@ export default function ProcessPage() {
       const { error: sbError } = await supabase
         .from('scoreboard_players')
         .insert(scoreboardInserts)
-
-      if (sbError) {
-        console.warn('Failed to save scoreboard players:', sbError)
-      } else {
-        console.log(`Saved ${scoreboardInserts.length} scoreboard players to database`)
-      }
+      if (sbError) console.warn('Failed to save scoreboard players:', sbError)
+      else console.log(`Saved ${scoreboardInserts.length} scoreboard players to database`)
     }
 
-    // Clean up pending files
+    // Clean up pending files — LAST, only after every insert above succeeded.
     const allPaths = [
       `pending/${batch.batchId}/metadata.json`,
       ...batch.photoPaths,
@@ -574,585 +670,357 @@ export default function ProcessPage() {
     await supabase.storage.from('match-images').remove(allPaths)
   }
 
-  function handleDone() {
-    setCurrentBatch(null)
-    setProcessedResult(null)
+  function resetToIdle() {
+    setReviewItems([])
+    setReviewIndex(0)
+    setFailures([])
+    setProcTotal(0)
+    setProcDone(0)
+    setSavedCount(0)
     setProcessingStatus(null)
-    setPageState('scanning')
-    setQueueRemaining([])
-    setQueueTotal(0)
-    setQueueProcessed(0)
     scanForBatches()
   }
 
-  // ======================== CONFIRMING (Scoreboard User ID) ========================
-  if (pageState === 'confirming' && processedResult?.scoreboard) {
-    const sb = processedResult.scoreboard
-    const analysis = sb.ocrAnalysis
-    const bestCandidate = analysis.candidates.find(
-      c => c.slot === analysis.bestCandidate.slot
-    )
+  // ════════════════════════════════════════════════════════════
+  // RENDER
+  // ════════════════════════════════════════════════════════════
 
-    if (confirmStep === 'confirm' && bestCandidate) {
-      return (
-        <div className="max-w-3xl mx-auto space-y-4">
-          <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg p-8">
-            <p className="text-ow-orange font-display font-bold text-lg mb-1">
-              IS THIS YOU?
-            </p>
-            <p className="text-slate-400 text-xs mb-5">
-              OCR wasn&apos;t confident enough to auto-identify your player
-              ({(analysis.bestCandidate.similarity * 100).toFixed(0)}% similarity,
-              {(analysis.bestCandidate.margin * 100).toFixed(0)}% margin).
-            </p>
-
-            <div className="flex items-center gap-4 bg-ow-dark rounded-lg p-4 mb-5 border border-white/5">
-              {bestCandidate.heroPortraitUrl && (
-                <img
-                  src={bestCandidate.heroPortraitUrl}
-                  alt=""
-                  className="w-14 h-14 rounded border border-white/10"
-                />
-              )}
-              <div className="flex-1 min-w-0">
-                {bestCandidate.gamertagCropUrl && (
-                  <img
-                    src={bestCandidate.gamertagCropUrl}
-                    alt=""
-                    className="h-8 rounded mb-1"
-                    style={{ imageRendering: 'auto' }}
-                  />
-                )}
-                <p className="text-xs text-slate-500">
-                  Slot {bestCandidate.slot} · {bestCandidate.heroName || 'Unknown hero'}
-                </p>
-              </div>
-            </div>
-
-            <div className="flex gap-3">
-              <button
-                onClick={() => handleConfirmUser(bestCandidate.slot)}
-                className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
-                           px-5 py-2.5 rounded-lg tracking-wider text-sm transition-colors"
-              >
-                YES, THAT&apos;S ME
-              </button>
-              <button
-                onClick={handleDeclineConfirm}
-                className="bg-ow-panel border border-white/10 text-white font-display
-                           px-5 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors"
-              >
-                NO, SHOW ALL
-              </button>
-              <button
-                onClick={handleSkipConfirm}
-                className="text-slate-500 hover:text-slate-300 font-display
-                           px-4 py-2.5 text-sm tracking-wider transition-colors"
-              >
-                SKIP
-              </button>
-            </div>
-          </div>
-        </div>
-      )
-    }
-
-    // confirmStep === 'select' — show all 5 ally candidates
-    return (
-      <div className="max-w-3xl mx-auto space-y-4">
-        <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg p-8">
-          <p className="text-ow-orange font-display font-bold text-lg mb-1">
-            WHICH ONE IS YOU?
-          </p>
-          <p className="text-slate-400 text-xs mb-5">
-            Select your player from the ally team.
-          </p>
-
-          <div className="space-y-2">
-            {analysis.candidates.map(candidate => (
-              <button
-                key={candidate.slot}
-                onClick={() => handleSelectUser(candidate.slot)}
-                className="w-full flex items-center gap-4 bg-ow-dark hover:bg-ow-dark/80 rounded-lg p-3
-                           transition-colors text-left border border-white/5 hover:border-ow-orange/30"
-              >
-                {candidate.heroPortraitUrl && (
-                  <img
-                    src={candidate.heroPortraitUrl}
-                    alt=""
-                    className="w-12 h-12 rounded border border-white/10 flex-shrink-0"
-                  />
-                )}
-                <div className="flex-1 min-w-0">
-                  {candidate.gamertagCropUrl && (
-                    <img
-                      src={candidate.gamertagCropUrl}
-                      alt=""
-                      className="h-7 rounded mb-1"
-                      style={{ imageRendering: 'auto' }}
-                    />
-                  )}
-                  <p className="text-xs text-slate-500">
-                    Slot {candidate.slot} · {candidate.heroName || 'Unknown hero'}
-                  </p>
-                </div>
-                <span className="text-xs font-mono text-slate-600">
-                  {(candidate.ocrSimilarity * 100).toFixed(0)}%
-                </span>
-              </button>
-            ))}
-          </div>
-
-          <button
-            onClick={handleSkipConfirm}
-            className="mt-4 text-slate-500 hover:text-slate-300 font-display
-                       text-sm tracking-wider transition-colors"
-          >
-            SKIP — SAVE WITHOUT USER ID
-          </button>
-        </div>
-      </div>
-    )
-  }
-
-  // ======================== 6f BETA CONFIRM ========================
-  if (pageState === 'beta_confirm') {
-    return (
-      <div className="max-w-lg mx-auto space-y-4">
-        <div>
-          <h1 className="text-2xl text-ow-orange">Quick check</h1>
-          <p className="text-sm text-slate-400 mt-1">
-            Confirm what was read before saving.
-          </p>
-        </div>
-        <ConfirmationPanel candidates={betaQuestions} onComplete={onBetaComplete} />
-        {betaQuestions.length === 0 && (
-          <button
-            onClick={() => onBetaComplete([])}
-            className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
-                       py-3 rounded-lg tracking-wider transition-colors text-sm"
-          >
-            SAVE MATCH
-          </button>
-        )}
-      </div>
-    )
-  }
-
-  // ======================== DONE ========================
-  if (pageState === 'done' && processedResult) {
-    const totalStats = processedResult.heroBreakdowns.reduce((sum, b) => sum + b.stats.length, 0)
-    const sb = processedResult.scoreboard
-    const hasQueue = queueTotal > 1
-    const queueDoneCount = queueProcessed + 1
-    const queueHasMore = queueRemaining.length > 0
-
-    return (
-      <div className="max-w-3xl mx-auto space-y-4">
-        <div className="bg-ow-victory/10 border border-ow-victory/30 rounded-lg p-8 text-center">
-          <span className="text-4xl block mb-3">✓</span>
-          <p className="text-ow-victory font-display text-xl font-bold">MATCH SAVED</p>
-          {hasQueue && (
-            <p className="text-ow-orange font-display text-sm font-bold mt-1">
-              {queueDoneCount} / {queueTotal}
-            </p>
-          )}
-          <p className="text-slate-400 text-sm mt-1">
-            Processed in {(processedResult.processingTimeMs / 1000).toFixed(1)}s
-            {processedResult.matchFormat && ` · ${processedResult.matchFormat}`}
-            {totalStats > 0 && ` · ${totalStats} hero stats extracted`}
-            {sb && ` · scoreboard saved`}
-          </p>
-        </div>
-
-        {processedResult.correctedRole && currentBatch && (
-          <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg px-5 py-4">
-            <p className="text-ow-orange font-display font-bold text-sm">ROLE AUTO-CORRECTED</p>
-            <p className="text-slate-400 text-xs mt-1">
-              You selected <span className="text-white font-display">{(currentBatch.metadata.role_played || 'unknown').toUpperCase()}</span> but
-              the matched hero is <span className="text-white font-display">{processedResult.correctedRole.toUpperCase()}</span>.
-              The role has been updated automatically.
-            </p>
-          </div>
-        )}
-
-        {/* Summary extraction */}
-        <div className="bg-ow-panel rounded-lg p-5 border border-white/5 space-y-3">
-          <p className="text-xs text-slate-400 font-display tracking-wider">MATCH SUMMARY</p>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center">
-            <div>
-              <p className="text-xs text-slate-500">MAP</p>
-              <p className="text-white font-display">{processedResult.mapName || '—'}</p>
-            </div>
-            <div>
-              <p className="text-xs text-slate-500">RESULT</p>
-              <p className={`font-display font-bold ${
-                processedResult.result === 'victory' ? 'text-ow-victory' :
-                processedResult.result === 'defeat' ? 'text-ow-defeat' : 'text-ow-draw'
-              }`}>
-                {processedResult.result?.toUpperCase() || '—'}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-slate-500">SCORE</p>
-              <p className="text-white font-display">{processedResult.score || '—'}</p>
-            </div>
-            <div>
-              <p className="text-xs text-slate-500">E / A / D</p>
-              <p className="text-white font-display">
-                {processedResult.eliminations ?? '—'} / {processedResult.assists ?? '—'} / {processedResult.deaths ?? '—'}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        {/* Hero breakdowns */}
-        {processedResult.heroBreakdowns.map((breakdown, i) => (
-          <div key={i} className="bg-ow-panel rounded-lg p-5 border border-white/5 space-y-3">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <p className="text-white font-display font-bold text-lg">{breakdown.heroName}</p>
-                {breakdown.percentPlayed !== null && (
-                  <span className="bg-ow-dark px-2 py-1 rounded text-xs text-slate-300 font-display">
-                    {breakdown.percentPlayed}%
-                  </span>
-                )}
-                {breakdown.playTimeSeconds !== null && (
-                  <span className="bg-ow-dark px-2 py-1 rounded text-xs text-slate-400">
-                    {Math.floor(breakdown.playTimeSeconds / 60)}:{String(breakdown.playTimeSeconds % 60).padStart(2, '0')}
-                  </span>
-                )}
-              </div>
-              {!breakdown.matchedToSummary && (
-                <span className="text-xs text-ow-orange bg-ow-orange/10 px-2 py-1 rounded font-display">
-                  NOT IN SUMMARY
-                </span>
-              )}
-              <span className={`text-xs px-2 py-1 rounded font-display ${
-                breakdown.foundStatCount === breakdown.expectedStatCount
-                  ? 'text-ow-victory bg-ow-victory/10'
-                  : 'text-ow-orange bg-ow-orange/10'
-              }`}>
-                {breakdown.foundStatCount}/{breakdown.expectedStatCount} STATS
-              </span>
-            </div>
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
-              {breakdown.stats.map((stat, j) => (
-                <div key={j} className="bg-ow-dark rounded-lg px-3 py-2.5 border border-white/5">
-                  <p className="text-white text-lg font-display font-bold">{stat.statValue}</p>
-                  <p className="text-xs text-slate-400 leading-tight">{stat.statName}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-
-        {/* Heroes without breakdowns */}
-        {processedResult.heroes.length > 0 && processedResult.heroBreakdowns.length === 0 && (
-          <div className="bg-ow-panel rounded-lg p-5 border border-white/5">
-            <p className="text-xs text-slate-400 font-display tracking-wider mb-2">HEROES DETECTED</p>
-            <div className="flex gap-2">
-              {processedResult.heroes.map((h, i) => (
-                <span key={i} className="bg-ow-dark px-3 py-1.5 rounded text-sm text-white font-display">
-                  {h.name}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Scoreboard data */}
-        {sb && (() => {
-          const totalSlots = sb.stats.length
-          return (
-          <div className="bg-ow-panel rounded-lg p-5 border border-white/5 space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <p className="text-xs text-slate-400 font-display tracking-wider">SCOREBOARD</p>
-                {processedResult.matchFormat && (
-                  <span className="text-[10px] font-display font-bold px-1.5 py-0.5 rounded bg-ow-orange/10 text-ow-orange">
-                    {processedResult.matchFormat.toUpperCase()}
-                  </span>
-                )}
-              </div>
-              <span className="text-xs text-slate-500 font-display">
-                {sb.heroes.filter(h => h.heroName).length}/{totalSlots} heroes
-                {' · '}
-                {sb.stats.filter(s => s.eliminations !== null).length}/{totalSlots} stats
-              </span>
-            </div>
-
-            {/* Team compositions */}
-            {(processedResult.allyComp || processedResult.enemyComp) && (
-              <div className="flex gap-4 text-xs font-display">
-                {processedResult.allyComp && (
-                  <span className="text-blue-400">
-                    Ally <span className="text-white font-bold">{processedResult.allyComp}</span>
-                  </span>
-                )}
-                {processedResult.enemyComp && (
-                  <span className="text-red-400">
-                    Enemy <span className="text-white font-bold">{processedResult.enemyComp}</span>
-                  </span>
-                )}
-              </div>
-            )}
-
-            {/* Ally team */}
-            <div>
-              <p className="text-[10px] text-blue-400 font-display tracking-wider uppercase mb-2">Ally Team</p>
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/5">
-                      <th className="text-left py-1.5 px-2 font-medium">Player</th>
-                      <th className="text-left py-1.5 px-2 font-medium">Hero</th>
-                      <th className="text-left py-1.5 px-2 font-medium">Role</th>
-                      <th className="text-right py-1.5 px-2 font-medium">E</th>
-                      <th className="text-right py-1.5 px-2 font-medium">A</th>
-                      <th className="text-right py-1.5 px-2 font-medium">D</th>
-                      <th className="text-right py-1.5 px-2 font-medium">DMG</th>
-                      <th className="text-right py-1.5 px-2 font-medium">H</th>
-                      <th className="text-right py-1.5 px-2 font-medium">MIT</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {sb.stats.filter(s => s.team === 'ally').map(s => {
-                      const player = sb.players.find(p => p.slot === s.slot)
-                      return (
-                        <tr
-                          key={s.slot}
-                          className={`border-b border-white/5 ${player?.isUser ? 'bg-ow-orange/5' : ''}`}
-                        >
-                          <td className={`py-1.5 px-2 font-display ${player?.isUser ? 'text-ow-orange font-bold' : 'text-slate-300'}`}>
-                            {player?.displayName || `Ally ${s.slot}`}
-                          </td>
-                          <td className="py-1.5 px-2 text-slate-300">{s.heroName || '—'}</td>
-                          <td className={`py-1.5 px-2 uppercase font-display text-[10px] font-bold ${
-                            s.role === 'tank' ? 'text-blue-300' :
-                            s.role === 'dps' ? 'text-red-300' :
-                            s.role === 'support' ? 'text-green-300' : 'text-slate-600'
-                          }`}>
-                            {s.role || '—'}
-                          </td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.eliminations ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.assists ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.deaths ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.damage?.toLocaleString() ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.healing?.toLocaleString() ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.mitigation?.toLocaleString() ?? '—'}</td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* Enemy team */}
-            <div>
-              <p className="text-[10px] text-red-400 font-display tracking-wider uppercase mb-2">Enemy Team</p>
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/5">
-                      <th className="text-left py-1.5 px-2 font-medium">Player</th>
-                      <th className="text-left py-1.5 px-2 font-medium">Hero</th>
-                      <th className="text-left py-1.5 px-2 font-medium">Role</th>
-                      <th className="text-right py-1.5 px-2 font-medium">E</th>
-                      <th className="text-right py-1.5 px-2 font-medium">A</th>
-                      <th className="text-right py-1.5 px-2 font-medium">D</th>
-                      <th className="text-right py-1.5 px-2 font-medium">DMG</th>
-                      <th className="text-right py-1.5 px-2 font-medium">H</th>
-                      <th className="text-right py-1.5 px-2 font-medium">MIT</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {sb.stats.filter(s => s.team === 'enemy').map(s => {
-                      const player = sb.players.find(p => p.slot === s.slot)
-                      return (
-                        <tr key={s.slot} className="border-b border-white/5">
-                          <td className="py-1.5 px-2 text-slate-300 font-display">
-                            {player?.displayName || `Enemy ${s.slot - (sb.detection.grid?.rowsPerTeam ?? 5)}`}
-                          </td>
-                          <td className="py-1.5 px-2 text-slate-300">{s.heroName || '—'}</td>
-                          <td className={`py-1.5 px-2 uppercase font-display text-[10px] font-bold ${
-                            s.role === 'tank' ? 'text-blue-300' :
-                            s.role === 'dps' ? 'text-red-300' :
-                            s.role === 'support' ? 'text-green-300' : 'text-slate-600'
-                          }`}>
-                            {s.role || '—'}
-                          </td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.eliminations ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.assists ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.deaths ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.damage?.toLocaleString() ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.healing?.toLocaleString() ?? '—'}</td>
-                          <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.mitigation?.toLocaleString() ?? '—'}</td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-          ) })()}
-
-        <div className="flex justify-center gap-3">
-          {queueHasMore ? (
-            <>
-              <button onClick={processNextInQueue}
-                className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
-                           px-6 py-2.5 rounded-lg tracking-wider text-sm transition-colors">
-                NEXT MATCH ({queueRemaining.length} remaining)
-              </button>
-              <button onClick={handleDone}
-                className="bg-ow-panel border border-white/10 text-white font-display
-                           px-6 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
-                STOP
-              </button>
-            </>
-          ) : (
-            <>
-              <button onClick={handleDone}
-                className="bg-ow-panel border border-white/10 text-white font-display
-                           px-6 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
-                PROCESS MORE
-              </button>
-              <button onClick={() => router.push('/matches')}
-                className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
-                           px-6 py-2.5 rounded-lg tracking-wider text-sm transition-colors">
-                VIEW MATCHES
-              </button>
-            </>
-          )}
-        </div>
-      </div>
-    )
-  }
-
-  // ======================== ERROR ========================
-  if (pageState === 'error') {
-    return (
-      <div className="max-w-3xl mx-auto space-y-4">
-        <div className="bg-ow-defeat/10 border border-ow-defeat/30 rounded-lg p-8 text-center">
-          <span className="text-4xl block mb-3">✗</span>
-          <p className="text-ow-defeat font-display text-xl font-bold">PROCESSING FAILED</p>
-          <p className="text-slate-400 text-sm mt-2">{errorMsg}</p>
-        </div>
-        <div className="flex justify-center gap-3">
-          <button onClick={() => currentBatch && processBatch(currentBatch)}
-            className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
-                       px-6 py-2.5 rounded-lg tracking-wider text-sm transition-colors">
-            RETRY
-          </button>
-          {queueRemaining.length > 0 && (
-            <button onClick={processNextInQueue}
-              className="bg-ow-panel border border-white/10 text-white font-display
-                         px-6 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
-              SKIP
-            </button>
-          )}
-          <button onClick={handleDone}
-            className="bg-ow-panel border border-white/10 text-white font-display
-                       px-6 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
-            {queueRemaining.length > 0 ? 'STOP' : 'BACK'}
-          </button>
-        </div>
-      </div>
-    )
-  }
-
-  // ======================== PROCESSING / SAVING ========================
-  if (pageState === 'processing' || pageState === 'saving') {
-    const progress = pageState === 'saving' ? 97 : (processingStatus?.progress || 0)
-    const stage = processingStatus?.stage || 'loading_opencv'
-
-    let message = pageState === 'saving'
-      ? 'Saving to database...'
-      : STATUS_MESSAGES[stage] || 'Processing...'
-
-    if (stage === 'matching_heroes' && currentBatch) {
-      message = `Identifying heroes (${currentBatch.metadata.role_played || 'all roles'} first)...`
-    }
-
-    return (
-      <div className="max-w-3xl mx-auto">
-        <div className="bg-ow-panel rounded-lg p-12 text-center border border-white/5">
-          {queueTotal > 1 && (
-            <p className="text-ow-orange font-display font-bold text-sm mb-4">
-              MATCH {queueProcessed + 1} / {queueTotal}
-            </p>
-          )}
-          <div className="w-12 h-12 border-3 border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-6" />
-          <p className="text-white font-display text-lg">{message}</p>
-          <div className="mt-6 bg-ow-dark rounded-full h-2 overflow-hidden max-w-sm mx-auto">
-            <div
-              className="h-full bg-ow-orange transition-all duration-500 rounded-full"
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-          <p className="text-xs text-slate-500 mt-2 font-display">{Math.round(progress)}%</p>
-        </div>
-      </div>
-    )
-  }
-
-  // ======================== SCANNING ========================
+  // ---------- SCANNING ----------
   if (pageState === 'scanning') {
     return (
       <div className="max-w-3xl mx-auto">
-        <div className="bg-ow-panel rounded-lg p-12 text-center border border-white/5">
+        <div className="bg-ow-panel rounded-lg p-12 text-center border border-white/10">
           <div className="w-8 h-8 border-2 border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-slate-400 font-display">Checking for uploads...</p>
+          <p className="text-slate-400 font-display tracking-wider">CHECKING FOR UPLOADS…</p>
         </div>
       </div>
     )
   }
 
-  // ======================== IDLE — BATCH LIST ========================
+  // ---------- PHASE 1: PROCESSING ----------
+  if (pageState === 'processing') {
+    const stage = processingStatus?.stage || 'loading_opencv'
+    const stageProgress = processingStatus?.progress || 0
+    const message = STATUS_MESSAGES[stage] || 'Processing…'
+    // Overall progress across the whole run (each match contributes 1/total).
+    const overall = procTotal > 0
+      ? Math.min(100, ((procDone + stageProgress / 100) / procTotal) * 100)
+      : 0
+
+    return (
+      <div className="max-w-3xl mx-auto space-y-6">
+        <div>
+          <h1 className="font-display text-3xl tracking-[0.12em] text-slate-100 uppercase">Processing</h1>
+          <p className="text-sm text-slate-400 mt-1">
+            Working through {procTotal} match{procTotal !== 1 ? 'es' : ''} — no input needed until review.
+          </p>
+        </div>
+
+        <div className="bg-ow-panel rounded-lg p-10 text-center border border-white/10">
+          <p className="text-ow-orange font-display font-bold text-sm tracking-wider mb-4">
+            MATCH {Math.min(procDone + 1, procTotal)} / {procTotal}
+            {procCurrentLabel && <span className="text-slate-400 font-normal"> · {procCurrentLabel}</span>}
+          </p>
+          <div className="w-12 h-12 border-[3px] border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-6" />
+          <p className="text-white font-display text-lg">{message}</p>
+
+          {/* per-match stage bar */}
+          <div className="mt-6 bg-ow-dark rounded-full h-1.5 overflow-hidden max-w-sm mx-auto">
+            <div className="h-full bg-ow-orange/60 transition-all duration-500 rounded-full"
+              style={{ width: `${stageProgress}%` }} />
+          </div>
+
+          {/* overall run bar */}
+          <div className="mt-3 bg-ow-dark rounded-full h-2 overflow-hidden max-w-sm mx-auto">
+            <div className="h-full bg-ow-orange transition-all duration-500 rounded-full"
+              style={{ width: `${overall}%` }} />
+          </div>
+          <p className="text-xs text-slate-500 mt-2 font-display tracking-wider">
+            {Math.round(overall)}% overall
+          </p>
+
+          {failures.length > 0 && (
+            <p className="text-xs text-ow-defeat/80 mt-4 font-display">
+              {failures.length} skipped so far — you can retry these later.
+            </p>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  // ---------- PHASE 2: REVIEW ----------
+  if (pageState === 'review' && current) {
+    const item = current
+    const sb = item.result.scoreboard
+    const analysis = sb?.ocrAnalysis
+    const positionInQueue = `Match ${reviewIndex + 1} of ${reviewItems.length}`
+
+    // inject the freshly-signed image URLs into the questions for THIS match so
+    // the confirmation cards never reference an expired link.
+    const liveQuestions: ConfirmationCandidate[] = item.questions.map(q => {
+      if (!q.region) return q
+      // pick the right re-signed URL by field type
+      let url = q.region.imageUrl
+      if (q.field === 'summary') url = liveImages.summary ?? url
+      else if (q.field === 'breakdown_stat' || q.field === 'hero_id') {
+        // breakdown questions name the hero in fieldDetail; fall back to summary
+        const heroHit = Object.keys(liveImages.byHero).find(h => q.fieldDetail.includes(h))
+        url = (heroHit && liveImages.byHero[heroHit]) ?? liveImages.scoreboard ?? url
+      } else {
+        url = liveImages.scoreboard ?? url
+      }
+      return { ...q, region: { ...q.region, imageUrl: url } }
+    })
+
+    return (
+      <div className="max-w-2xl mx-auto space-y-6">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="font-display text-3xl tracking-[0.12em] text-slate-100 uppercase">Review</h1>
+            <p className="text-sm text-slate-400 mt-1">
+              {positionInQueue} · {savedCount} saved{failures.length > 0 ? ` · ${failures.length} skipped` : ''}
+            </p>
+          </div>
+        </div>
+
+        {/* queue progress bar */}
+        <div className="bg-ow-dark rounded-full h-2 overflow-hidden">
+          <div className="h-full bg-ow-orange transition-all duration-300 rounded-full"
+            style={{ width: `${(reviewIndex / reviewItems.length) * 100}%` }} />
+        </div>
+
+        {/* match identity header */}
+        <div className="bg-ow-panel rounded-lg border border-white/10 px-5 py-4 flex items-center gap-3 flex-wrap">
+          {item.result.matchFormat && (
+            <span className="text-[10px] font-display font-bold px-2 py-0.5 rounded bg-ow-orange/10 text-ow-orange tracking-wider">
+              {item.result.matchFormat.toUpperCase()}
+            </span>
+          )}
+          <span className="text-white font-display">{item.result.mapName || 'Unknown map'}</span>
+          {item.result.result && (
+            <span className={`font-display font-bold text-sm ${
+              item.result.result === 'victory' ? 'text-ow-victory'
+              : item.result.result === 'defeat' ? 'text-ow-defeat' : 'text-ow-draw'
+            }`}>{item.result.result.toUpperCase()}</span>
+          )}
+          {item.result.score && <span className="text-slate-400 text-sm font-display">{item.result.score}</span>}
+        </div>
+
+        {reviewError && (
+          <div className="bg-ow-defeat/10 border border-ow-defeat/30 rounded-lg px-4 py-3 text-sm text-ow-defeat">
+            {reviewError}
+          </div>
+        )}
+
+        {/* sub-step: username confirm */}
+        {reviewStep === 'user_confirm' && analysis && (() => {
+          const bestCandidate = analysis.candidates.find(c => c.slot === analysis.bestCandidate.slot)
+          if (!bestCandidate) { setReviewStep('beta'); return null }
+          return (
+            <div className="bg-ow-panel rounded-lg border border-ow-orange/30 p-6">
+              <p className="text-ow-orange font-display font-bold text-lg mb-1">IS THIS YOU?</p>
+              <p className="text-slate-400 text-xs mb-5">
+                OCR wasn&apos;t confident enough to auto-identify your player
+                ({(analysis.bestCandidate.similarity * 100).toFixed(0)}% similarity,
+                {' '}{(analysis.bestCandidate.margin * 100).toFixed(0)}% margin).
+              </p>
+              <div className="flex items-center gap-4 bg-ow-dark rounded-lg p-4 mb-5 border border-white/10">
+                {bestCandidate.heroPortraitUrl && (
+                  /* eslint-disable-next-line @next/next/no-img-element */
+                  <img src={bestCandidate.heroPortraitUrl} alt="" className="w-14 h-14 rounded border border-white/10" />
+                )}
+                <div className="flex-1 min-w-0">
+                  {bestCandidate.gamertagCropUrl && (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img src={bestCandidate.gamertagCropUrl} alt="" className="h-8 rounded mb-1" style={{ imageRendering: 'auto' }} />
+                  )}
+                  <p className="text-xs text-slate-500">
+                    Slot {bestCandidate.slot} · {bestCandidate.heroName || 'Unknown hero'}
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-3 flex-wrap">
+                <button onClick={() => handleConfirmUser(bestCandidate.slot)}
+                  className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold px-5 py-2.5 rounded-lg tracking-wider text-sm transition-colors">
+                  YES, THAT&apos;S ME
+                </button>
+                <button onClick={handleDeclineConfirm}
+                  className="bg-ow-panel border border-white/10 text-white font-display px-5 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
+                  NO, SHOW ALL
+                </button>
+                <button onClick={handleSkipConfirm}
+                  className="text-slate-500 hover:text-slate-300 font-display px-4 py-2.5 text-sm tracking-wider transition-colors">
+                  SKIP
+                </button>
+              </div>
+            </div>
+          )
+        })()}
+
+        {/* sub-step: username select-all */}
+        {reviewStep === 'user_select' && analysis && (
+          <div className="bg-ow-panel rounded-lg border border-ow-orange/30 p-6">
+            <p className="text-ow-orange font-display font-bold text-lg mb-1">WHICH ONE IS YOU?</p>
+            <p className="text-slate-400 text-xs mb-5">Select your player from the ally team.</p>
+            <div className="space-y-2">
+              {analysis.candidates.map(candidate => (
+                <button key={candidate.slot} onClick={() => handleSelectUser(candidate.slot)}
+                  className="w-full flex items-center gap-4 bg-ow-dark hover:bg-ow-dark/80 rounded-lg p-3 transition-colors text-left border border-white/10 hover:border-ow-orange/30">
+                  {candidate.heroPortraitUrl && (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img src={candidate.heroPortraitUrl} alt="" className="w-12 h-12 rounded border border-white/10 flex-shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    {candidate.gamertagCropUrl && (
+                      /* eslint-disable-next-line @next/next/no-img-element */
+                      <img src={candidate.gamertagCropUrl} alt="" className="h-7 rounded mb-1" style={{ imageRendering: 'auto' }} />
+                    )}
+                    <p className="text-xs text-slate-500">Slot {candidate.slot} · {candidate.heroName || 'Unknown hero'}</p>
+                  </div>
+                  <span className="text-xs font-mono text-slate-600">{(candidate.ocrSimilarity * 100).toFixed(0)}%</span>
+                </button>
+              ))}
+            </div>
+            <button onClick={handleSkipConfirm}
+              className="mt-4 text-slate-500 hover:text-slate-300 font-display text-sm tracking-wider transition-colors">
+              SKIP — SAVE WITHOUT USER ID
+            </button>
+          </div>
+        )}
+
+        {/* sub-step: 6f beta quick check */}
+        {reviewStep === 'beta' && (
+          <div className="space-y-4">
+            <div>
+              <h2 className="font-display text-xl text-ow-orange tracking-wider">Quick check</h2>
+              <p className="text-sm text-slate-400 mt-1">Confirm what was read before saving this match.</p>
+            </div>
+            <ConfirmationPanel candidates={liveQuestions} onComplete={onBetaComplete} />
+            {liveQuestions.length === 0 && (
+              <button onClick={() => onBetaComplete([])}
+                className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold py-3 rounded-lg tracking-wider transition-colors text-sm">
+                SAVE MATCH
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* sub-step: saving */}
+        {reviewStep === 'saving' && (
+          <div className="bg-ow-panel rounded-lg p-10 text-center border border-white/10">
+            <div className="w-10 h-10 border-[3px] border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+            <p className="text-white font-display tracking-wider">SAVING…</p>
+          </div>
+        )}
+
+        {/* sub-step: saved → advance */}
+        {reviewStep === 'saved' && (
+          <div className="space-y-4">
+            <div className="bg-ow-victory/10 border border-ow-victory/30 rounded-lg p-6 text-center">
+              <span className="text-3xl block mb-2">✓</span>
+              <p className="text-ow-victory font-display tracking-wider font-bold">MATCH SAVED</p>
+            </div>
+            <button onClick={advanceReview}
+              className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold py-3 rounded-lg tracking-wider transition-colors text-sm">
+              {reviewIndex + 1 >= reviewItems.length ? 'FINISH' : `NEXT MATCH (${reviewItems.length - reviewIndex - 1} left)`}
+            </button>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  // ---------- DONE ----------
+  if (pageState === 'done') {
+    return (
+      <div className="max-w-2xl mx-auto space-y-6">
+        <div className="bg-ow-victory/10 border border-ow-victory/30 rounded-lg p-8 text-center">
+          <span className="text-4xl block mb-3">✓</span>
+          <p className="text-ow-victory font-display text-xl font-bold tracking-wider">
+            {savedCount} MATCH{savedCount !== 1 ? 'ES' : ''} SAVED
+          </p>
+        </div>
+
+        {failures.length > 0 && (
+          <div className="bg-ow-panel rounded-lg border border-ow-defeat/30 p-5 space-y-3">
+            <p className="text-ow-defeat font-display font-bold text-sm tracking-wider">
+              {failures.length} SKIPPED — KEPT FOR RETRY
+            </p>
+            <p className="text-xs text-slate-400">
+              These batches couldn&apos;t be processed and their screenshots are still
+              in storage. They&apos;ve been noted in the issue log. Try them again from here.
+            </p>
+            <div className="space-y-2">
+              {failures.map(f => (
+                <div key={f.batchId} className="bg-ow-dark rounded-lg px-4 py-3 border border-white/10">
+                  <p className="text-xs text-slate-300 font-display">
+                    {new Date(f.uploadedAt).toLocaleString()}
+                  </p>
+                  <p className="text-xs text-ow-defeat/80 mt-1">{f.message}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="flex justify-center gap-3 flex-wrap">
+          <button onClick={resetToIdle}
+            className="bg-ow-panel border border-white/10 text-white font-display px-6 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
+            PROCESS MORE
+          </button>
+          <button onClick={() => router.push('/matches')}
+            className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold px-6 py-2.5 rounded-lg tracking-wider text-sm transition-colors">
+            VIEW MATCHES
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  // ---------- IDLE: BATCH LIST ----------
   return (
     <div className="max-w-3xl mx-auto space-y-6">
       <div>
-        <h1 className="text-3xl text-ow-orange">Process Matches</h1>
+        <h1 className="font-display text-3xl tracking-[0.12em] text-slate-100 uppercase">Process Matches</h1>
         <p className="text-sm text-slate-400 mt-1">
           Automatically extract data from uploaded match photos
         </p>
       </div>
 
       {batches.length === 0 ? (
-        <div className="bg-ow-panel rounded-lg p-12 text-center border border-white/5">
+        <div className="bg-ow-panel rounded-lg p-12 text-center border border-white/10">
           <span className="text-4xl block mb-3">📷</span>
-          <p className="text-slate-400 font-display text-lg">NO PENDING UPLOADS</p>
+          <p className="text-slate-300 font-display text-lg tracking-wider">NO PENDING UPLOADS</p>
           <p className="text-slate-500 text-sm mt-2">
             Upload match photos from your phone to see them here
           </p>
+          <button onClick={scanForBatches}
+            className="mt-5 text-sm text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors">
+            ↻ REFRESH
+          </button>
         </div>
       ) : (
         <div className="space-y-3">
           {/* Header with actions */}
-          <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg px-5 py-4
-                          flex items-center justify-between">
+          <div className="bg-ow-panel rounded-lg border border-ow-orange/30 px-5 py-4 flex items-center justify-between gap-3 flex-wrap">
             <div>
-              <p className="text-ow-orange font-display font-bold">
+              <p className="text-ow-orange font-display font-bold tracking-wider">
                 {batches.length} MATCH{batches.length !== 1 ? 'ES' : ''} WAITING
               </p>
               <p className="text-slate-400 text-xs mt-0.5">
-                Select matches to process, or process all at once
+                Process all unattended, then review them together — or pick a few.
               </p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 flex-wrap">
               {selectedBatchIds.size > 0 && (
                 <button onClick={processSelected}
-                  className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
-                             px-4 py-2 rounded-lg tracking-wider text-xs transition-colors whitespace-nowrap">
+                  className="bg-ow-panel border border-white/10 text-white font-display px-4 py-2 rounded-lg tracking-wider text-xs hover:border-ow-orange/30 transition-colors whitespace-nowrap">
                   PROCESS {selectedBatchIds.size} SELECTED
                 </button>
               )}
               <button onClick={processAllBatches}
-                className="bg-ow-panel border border-white/10 text-white font-display
-                           px-4 py-2 rounded-lg tracking-wider text-xs hover:border-ow-orange/30 transition-colors whitespace-nowrap">
+                className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold px-4 py-2 rounded-lg tracking-wider text-xs transition-colors whitespace-nowrap">
                 PROCESS ALL
               </button>
             </div>
@@ -1162,14 +1030,11 @@ export default function ProcessPage() {
           <div className="flex items-center gap-3 px-1">
             <button
               onClick={selectedBatchIds.size === batches.length ? deselectAllBatches : selectAllBatches}
-              className="text-xs text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors"
-            >
+              className="text-xs text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors">
               {selectedBatchIds.size === batches.length ? '✓ DESELECT ALL' : '☐ SELECT ALL'}
             </button>
             {selectedBatchIds.size > 0 && selectedBatchIds.size < batches.length && (
-              <span className="text-xs text-slate-600 font-display">
-                {selectedBatchIds.size} selected
-              </span>
+              <span className="text-xs text-slate-600 font-display">{selectedBatchIds.size} selected</span>
             )}
           </div>
 
@@ -1185,74 +1050,56 @@ export default function ProcessPage() {
               <div key={batch.batchId}
                 onClick={() => toggleBatchSelection(batch.batchId)}
                 className={`bg-ow-panel rounded-lg p-5 border transition-colors cursor-pointer ${
-                  isSelected
-                    ? 'border-ow-orange/40 bg-ow-orange/5'
-                    : 'border-white/5 hover:border-ow-orange/20'
+                  isSelected ? 'border-ow-orange/40 bg-ow-orange/5' : 'border-white/10 hover:border-ow-orange/20'
                 }`}>
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-4">
-                    {/* Checkbox */}
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-4 min-w-0">
                     <div className={`w-5 h-5 rounded border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
-                      isSelected
-                        ? 'border-ow-orange bg-ow-orange text-ow-dark'
-                        : 'border-slate-600'
+                      isSelected ? 'border-ow-orange bg-ow-orange text-ow-dark' : 'border-slate-600'
                     }`}>
                       {isSelected && <span className="text-xs font-bold">✓</span>}
                     </div>
-
-                    <div>
-                      <div className="flex items-center gap-2 text-sm">
-                        {format && (
-                          <span className="text-ow-orange font-display font-bold text-xs">{format}</span>
-                        )}
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-sm flex-wrap">
+                        {format && <span className="text-ow-orange font-display font-bold text-xs">{format}</span>}
                         {roles && (
                           <>
                             {format && <span className="text-slate-500">•</span>}
                             <span className="text-white font-display">{roles}</span>
                           </>
                         )}
-                        {!format && !roles && (
-                          <span className="text-slate-500 font-display">NO METADATA</span>
-                        )}
+                        {!format && !roles && <span className="text-slate-500 font-display">NO METADATA</span>}
                         <span className="text-slate-500">•</span>
                         <span className="text-slate-400">
                           {batch.metadata.photo_count} photo{batch.metadata.photo_count !== 1 ? 's' : ''}
                         </span>
                         <span className="text-slate-500">•</span>
-                        <span className="text-slate-500 text-xs">
-                          {new Date(batch.metadata.uploaded_at).toLocaleString()}
-                        </span>
+                        <span className="text-slate-500 text-xs">{new Date(batch.metadata.uploaded_at).toLocaleString()}</span>
                       </div>
                       <div className="flex gap-2 mt-2">
                         {batch.photoUrls.slice(0, 4).map((url, i) => (
+                          /* eslint-disable-next-line @next/next/no-img-element */
                           <img key={i} src={url} alt="" className="w-16 h-12 object-cover rounded" />
                         ))}
                       </div>
                     </div>
                   </div>
 
-                  <button onClick={(e) => {
-                      e.stopPropagation()
-                      setQueueRemaining([])
-                      setQueueTotal(0)
-                      setQueueProcessed(0)
-                      processBatch(batch)
-                    }}
-                    className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
-                               px-5 py-2.5 rounded-lg tracking-wider text-sm transition-colors whitespace-nowrap">
+                  <button onClick={(e) => { e.stopPropagation(); startProcessing([batch]) }}
+                    className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold px-5 py-2.5 rounded-lg tracking-wider text-sm transition-colors whitespace-nowrap">
                     PROCESS
                   </button>
                 </div>
               </div>
             )
           })}
+
+          <button onClick={scanForBatches}
+            className="text-sm text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors">
+            ↻ REFRESH
+          </button>
         </div>
       )}
-
-      <button onClick={scanForBatches}
-        className="text-sm text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors">
-        ↻ REFRESH
-      </button>
     </div>
   )
 }

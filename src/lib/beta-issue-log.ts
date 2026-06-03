@@ -27,6 +27,7 @@ export type IssueEvent =
   | 'region_mismatch'
   | 'unrecognized'
   | 'match_summary'
+  | 'processing_error'   // a batch failed to process (extraction threw); files kept in pending for retry
 
 // Mirrors the `beta_issue_log` table. `id` / `created_at` are DB-assigned.
 export interface IssueLogRow {
@@ -106,6 +107,25 @@ export async function logMatchSummary(args: {
   })
 }
 
+/** Log a batch that failed to process. The error message is stored in
+ *  `read_value` (no new column needed); `field_detail` carries a short reason.
+ *  Files for this batch are intentionally LEFT in pending/ for retry, so the
+ *  same matchId may appear again later as a success — that's expected. */
+export async function logProcessingError(args: {
+  matchId: string
+  message: string
+  format?: '5v5' | '6v6' | null
+}): Promise<{ error: unknown }> {
+  return logIssueEvent({
+    match_id: args.matchId,
+    event: 'processing_error',
+    field: null,
+    field_detail: 'processing',
+    read_value: args.message.slice(0, 500),  // guard against giant stack traces
+    format: args.format ?? null,
+  })
+}
+
 // ── Reader ───────────────────────────────────────────────────
 
 export async function fetchIssueLog(): Promise<IssueLogRow[]> {
@@ -130,12 +150,16 @@ export interface SeasonStats {
   totalCorrected: number
   totalRegionMismatch: number
   totalUnrecognized: number
+  /** count of batches that failed to process (kept in pending for retry). */
+  totalProcessingErrors: number
   /** error rate per FIELD type: corrected / (corrected + confirmed_correct). */
   errorRateByField: Record<string, { corrected: number; confirmed: number; rate: number }>
   /** precision per SIGNAL: how often a flag was a real error. */
   precisionBySignal: Record<string, { corrected: number; confirmed: number; precision: number }>
   /** every distinct unrecognized value seen (new-content ledger). */
   unrecognizedLedger: Array<{ fieldDetail: string; value: string; matchId: string }>
+  /** processing failures, with the captured reason. */
+  processingErrors: Array<{ matchId: string; message: string }>
 }
 
 export function aggregate(rows: IssueLogRow[]): SeasonStats {
@@ -147,9 +171,11 @@ export function aggregate(rows: IssueLogRow[]): SeasonStats {
     totalCorrected: 0,
     totalRegionMismatch: 0,
     totalUnrecognized: 0,
+    totalProcessingErrors: 0,
     errorRateByField: {},
     precisionBySignal: {},
     unrecognizedLedger: [],
+    processingErrors: [],
   }
 
   for (const r of rows) {
@@ -166,6 +192,15 @@ export function aggregate(rows: IssueLogRow[]): SeasonStats {
         fieldDetail: r.field_detail ?? r.field ?? 'unknown',
         value: r.read_value ?? '',
         matchId: r.match_id,
+      })
+      continue
+    }
+
+    if (r.event === 'processing_error') {
+      stats.totalProcessingErrors += 1
+      stats.processingErrors.push({
+        matchId: r.match_id,
+        message: r.read_value ?? '(no detail)',
       })
       continue
     }
@@ -222,7 +257,24 @@ export function generateIssueReportMarkdown(rows: IssueLogRow[]): string {
   lines.push(`- Corrected (real errors): **${s.totalCorrected}**`)
   lines.push(`- Wrong-area flags (misplaced highlight): **${s.totalRegionMismatch}**`)
   lines.push(`- Unrecognized events: **${s.totalUnrecognized}**`)
+  lines.push(`- Processing failures (kept for retry): **${s.totalProcessingErrors}**`)
   lines.push(`- **Overall error rate: ${pct(overallErrorRate)}** (corrected / fields processed)`)
+  lines.push('')
+
+  lines.push('## Processing failures (batches kept in pending for retry)')
+  lines.push('')
+  if (s.processingErrors.length === 0) {
+    lines.push('_None — every batch processed._')
+  } else {
+    lines.push('| Match | Reason |')
+    lines.push('|---|---|')
+    for (const e of s.processingErrors) {
+      lines.push(`| ${e.matchId} | ${e.message.replace(/\n/g, ' ')} |`)
+    }
+    lines.push('')
+    lines.push('> These batches were skipped during an unattended run and their ' +
+      'screenshots remain in storage. Reprocess them from the Process page.')
+  }
   lines.push('')
 
   lines.push('## Error rate by field type')
