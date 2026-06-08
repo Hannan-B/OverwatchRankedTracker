@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
 import { formatBritishDate } from '@/lib/date-format'
+import AlphaToggle from '@/components/AlphaToggle'
 
 // ============================================================
 // SETTINGS + SEASON MANAGEMENT (Phase 2)
@@ -273,6 +274,9 @@ export default function SettingsPage() {
           </div>
         </div>
       </section>
+
+      {/* ---------- DEV: ALPHA DATA VISIBILITY (localhost only) ---------- */}
+      <AlphaToggle />
     </div>
   )
 }

@@ -134,6 +134,22 @@ export default function ProcessPage() {
   const [savedCount, setSavedCount] = useState(0)
   const [matchSeqCounter, setMatchSeqCounter] = useState(0)
 
+  // ── Alpha / test-data flagging ──
+  // When the /process page runs on localhost we treat the matches we save as
+  // TEST data (is_alpha = true) so they stay out of analytics. On the live
+  // deployed site, saved matches are real (is_alpha = false). `alphaOverride`
+  // lets you flip that decision by hand for the occasional exception.
+  // null = "use the automatic localhost decision"; true/false = manual override.
+  const [alphaOverride, setAlphaOverride] = useState<boolean | null>(null)
+  const [isLocalhost, setIsLocalhost] = useState(false)
+  useEffect(() => {
+    const h = window.location.hostname
+    setIsLocalhost(h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0')
+  }, [])
+  // The value actually written to the DB: manual override wins if set,
+  // otherwise fall back to the automatic localhost decision.
+  const isAlpha = alphaOverride ?? isLocalhost
+
   // ── Mount: gamertag + initial scan ──
   useEffect(() => {
     async function loadGamertag() {
@@ -578,6 +594,7 @@ export default function ProcessPage() {
         enemy_thrower: meta.enemy_thrower ?? false,
         fun_rating: meta.fun_rating,
         personal_thoughts: meta.personal_thoughts,
+        is_alpha: isAlpha,
       })
       .select('id')
       .single()
@@ -1026,7 +1043,41 @@ export default function ProcessPage() {
             </div>
           </div>
 
-          {/* Select all / deselect */}
+          {/* Alpha / test-data status + manual override.
+              Shows what is_alpha will be for matches saved right now, and why. */}
+          <div className={`rounded-lg border px-5 py-3 flex items-center justify-between gap-3 flex-wrap ${
+            isAlpha ? 'border-amber-500/40 bg-amber-500/5' : 'border-emerald-500/30 bg-emerald-500/5'
+          }`}>
+            <div className="min-w-0">
+              <p className={`font-display font-bold tracking-wider text-sm ${
+                isAlpha ? 'text-amber-400' : 'text-emerald-400'
+              }`}>
+                {isAlpha ? '⚠ SAVING AS TEST DATA' : '● SAVING AS REAL DATA'}
+              </p>
+              <p className="text-slate-400 text-xs mt-0.5">
+                {alphaOverride !== null
+                  ? 'Manual override active.'
+                  : isLocalhost
+                    ? 'Running on localhost — matches won’t count in analytics.'
+                    : 'Running on the live site — matches count in analytics.'}
+              </p>
+            </div>
+            <div className="flex gap-2 flex-wrap shrink-0">
+              <button
+                onClick={() => setAlphaOverride(isAlpha ? false : true)}
+                className="bg-ow-panel border border-white/15 text-slate-200 font-display px-3 py-1.5 rounded-lg tracking-wider text-xs hover:border-ow-orange/40 transition-colors whitespace-nowrap">
+                {isAlpha ? 'MARK AS REAL' : 'MARK AS TEST'}
+              </button>
+              {alphaOverride !== null && (
+                <button
+                  onClick={() => setAlphaOverride(null)}
+                  className="text-xs text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors whitespace-nowrap">
+                  RESET TO AUTO
+                </button>
+              )}
+            </div>
+          </div>
+
           <div className="flex items-center gap-3 px-1">
             <button
               onClick={selectedBatchIds.size === batches.length ? deselectAllBatches : selectAllBatches}

@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
 import { formatBritishDate } from '@/lib/date-format'
 import Link from 'next/link'
+import { AnalyticsMenu } from '@/components/AnalyticsNav'
 
 // ============================================================
 // HOME — career-profile landing (Phase 2)
@@ -256,6 +257,18 @@ export default function HomePage() {
           )}
         </>
       )}
+
+      {/* Analytics — surfaced here as well as at /analytics. The grouped menu is
+          rendered from the shared source, so it matches the Analytics overview. */}
+      <div className="pt-2">
+        <div className="flex items-center gap-2 mb-4">
+          <h2 className="font-display text-xl tracking-[0.12em] text-slate-100 uppercase">Analytics</h2>
+          <Link href="/analytics" className="text-xs text-slate-500 hover:text-ow-orange font-display tracking-wider uppercase">
+            open full area →
+          </Link>
+        </div>
+        <AnalyticsMenu compact />
+      </div>
     </div>
   )
 }

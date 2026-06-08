@@ -67,8 +67,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/matches" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
                 MATCH HISTORY
               </Link>
-              <Link href="/heroes" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
-                HERO ANALYTICS
+              <Link href="/analytics" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+                ANALYTICS
               </Link>
               <Link href="/issue-log" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
                 ISSUE LOG

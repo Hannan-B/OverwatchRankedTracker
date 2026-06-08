@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
 import { useRouter } from 'next/navigation'
 import { HEROES } from '@/data/reference'
+import { matchQuery } from '@/lib/alpha'
 
 // ============================================================
 // MATCH HISTORY (Phase 2 — v3)
@@ -94,15 +95,14 @@ export default function MatchHistoryPage() {
     setCurrentSeasonId(current?.id ?? null)
 
     const [{ data: matchData }, { data: overviewData }] = await Promise.all([
-      supabase.from('matches')
-        .select('id, played_at, map, game_mode, result, score, role_played, match_format, season_id')
+      matchQuery('id, played_at, map, game_mode, result, score, role_played, match_format, season_id')
         .order('played_at', { ascending: false }),
       supabase.from('match_overview').select('id, heroes_played'),
     ])
     const heroesById = new Map<number, string[]>()
     ;(overviewData as { id: number; heroes_played: string[] | null }[] | null)
       ?.forEach(o => heroesById.set(o.id, o.heroes_played || []))
-    const merged: Row[] = ((matchData as Omit<Row, 'heroes_played'>[]) || [])
+    const merged: Row[] = ((matchData as unknown as Omit<Row, 'heroes_played'>[]) || [])
       .map(m => ({ ...m, heroes_played: heroesById.get(m.id) || [] }))
     setRows(merged)
     setLoading(false)
