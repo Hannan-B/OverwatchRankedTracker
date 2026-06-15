@@ -11,7 +11,7 @@
 //
 // Conventions (shared with the rest of the app):
 //   • Win rate = wins / (wins + losses); DRAWS EXCLUDED from the %, counted in N.
-//   • Nothing dropped for sparsity; callers dim < MIN_GAMES as a confidence cue.
+//   • Nothing dropped for sparsity; callers dim < minGames (default MIN_GAMES) as a confidence cue.
 //   • Time is read from played_at in the viewer's LOCAL timezone (same as the
 //     day-of-week chart on Outcomes), via the JS Date object.
 //
@@ -232,7 +232,7 @@ export const TIME_BLOCKS: TimeBlock[] = [
   { label: 'Night (9pm–12am)', startHour: 21, endHour: 24 },
 ]
 
-export function winRateByTimeBlock(rows: TimeMatch[]): CatRow[] {
+export function winRateByTimeBlock(rows: TimeMatch[], minGames: number = MIN_GAMES): CatRow[] {
   const tallies = TIME_BLOCKS.map(() => emptyTally())
   for (const r of rows) {
     const ms = parseTime(r.played_at)
@@ -245,7 +245,7 @@ export function winRateByTimeBlock(rows: TimeMatch[]): CatRow[] {
     key: b.label,
     winRate: winRate(tallies[i]),
     games: games(tallies[i]),
-    lowConfidence: games(tallies[i]) < MIN_GAMES,
+    lowConfidence: games(tallies[i]) < minGames,
   }))
 }
 
@@ -262,7 +262,7 @@ export const LENGTH_BUCKETS: LengthBucket[] = [
   { label: '16+ min', minSec: 16 * 60, maxSec: Infinity },
 ]
 
-export function winRateByGameLength(rows: TimeMatch[]): CatRow[] {
+export function winRateByGameLength(rows: TimeMatch[], minGames: number = MIN_GAMES): CatRow[] {
   const tallies = LENGTH_BUCKETS.map(() => emptyTally())
   for (const r of rows) {
     const s = r.game_length_seconds
@@ -274,7 +274,7 @@ export function winRateByGameLength(rows: TimeMatch[]): CatRow[] {
     key: b.label,
     winRate: winRate(tallies[i]),
     games: games(tallies[i]),
-    lowConfidence: games(tallies[i]) < MIN_GAMES,
+    lowConfidence: games(tallies[i]) < minGames,
   }))
 }
 
@@ -313,7 +313,7 @@ export function flagDecayPoint(rows: CatRow[], overall: number | null): CatRow[]
 // (A) Position-in-session. Buckets the tail so a few very long sessions don't
 // create lots of n=1 columns. Positions 1..6 explicit, then "7+".
 export const POSITION_BUCKETS = ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th+']
-export function winRateByPositionInSession(rows: TimeMatch[]): CatRow[] {
+export function winRateByPositionInSession(rows: TimeMatch[], minGames: number = MIN_GAMES): CatRow[] {
   const sessions = buildSessions(rows)
   const tallies = POSITION_BUCKETS.map(() => emptyTally())
   for (const s of sessions) {
@@ -326,7 +326,7 @@ export function winRateByPositionInSession(rows: TimeMatch[]): CatRow[] {
     key: label,
     winRate: winRate(tallies[i]),
     games: games(tallies[i]),
-    lowConfidence: games(tallies[i]) < MIN_GAMES,
+    lowConfidence: games(tallies[i]) < minGames,
   }))
 }
 
@@ -338,7 +338,7 @@ export const ELAPSED_BUCKETS: { label: string; minMin: number; maxMin: number }[
   { label: '2–3 hr', minMin: 120, maxMin: 180 },
   { label: '3 hr+', minMin: 180, maxMin: Infinity },
 ]
-export function winRateByTimeIntoSession(rows: TimeMatch[]): CatRow[] {
+export function winRateByTimeIntoSession(rows: TimeMatch[], minGames: number = MIN_GAMES): CatRow[] {
   const sessions = buildSessions(rows)
   const tallies = ELAPSED_BUCKETS.map(() => emptyTally())
   for (const s of sessions) {
@@ -352,7 +352,7 @@ export function winRateByTimeIntoSession(rows: TimeMatch[]): CatRow[] {
     key: b.label,
     winRate: winRate(tallies[i]),
     games: games(tallies[i]),
-    lowConfidence: games(tallies[i]) < MIN_GAMES,
+    lowConfidence: games(tallies[i]) < minGames,
   }))
 }
 
@@ -377,7 +377,7 @@ export const DEPTH_BUCKETS: { label: string; min: number; max: number }[] = [
   { label: 'Games 7–9', min: 7, max: 9 },
   { label: 'Games 10+', min: 10, max: Infinity },
 ]
-export function decayByGamesDeep(rows: TimeMatch[]): CatRow[] {
+export function decayByGamesDeep(rows: TimeMatch[], minGames: number = MIN_GAMES): CatRow[] {
   const sessions = buildSessions(rows)
   const tallies = DEPTH_BUCKETS.map(() => emptyTally())
   for (const s of sessions) {
@@ -391,7 +391,7 @@ export function decayByGamesDeep(rows: TimeMatch[]): CatRow[] {
     key: b.label,
     winRate: winRate(tallies[i]),
     games: games(tallies[i]),
-    lowConfidence: games(tallies[i]) < MIN_GAMES,
+    lowConfidence: games(tallies[i]) < minGames,
   }))
   return flagDecayPoint(base, overallWinRate(rows))
 }
@@ -490,6 +490,7 @@ export interface SeasonWeekGroup {
 export function winRateByWeekPerSeason(
   rows: TimeMatch[],
   seasonName: (id: number | null) => string,
+  minGames: number = MIN_GAMES,
 ): SeasonWeekGroup[] {
   // bucket matches by season_id
   const bySeason = new Map<number | null, TimeMatch[]>()
@@ -520,7 +521,7 @@ export function winRateByWeekPerSeason(
       .map(([key, v]) => ({
         key, label: v.label,
         winRate: winRate(v.t), games: games(v.t),
-        lowConfidence: games(v.t) < MIN_GAMES,
+        lowConfidence: games(v.t) < minGames,
       }))
     groups.push({
       seasonId: sid,
@@ -545,10 +546,10 @@ export interface MonthSessionRow {
   avgMinutes: number | null
   avgGames: number | null
   sessions: number
-  lowConfidence: boolean // < MIN_GAMES sessions in the month
+  lowConfidence: boolean // < minGames (default MIN_GAMES) sessions in the month
 }
 
-export function avgSessionPerMonth(rows: TimeMatch[]): MonthSessionRow[] {
+export function avgSessionPerMonth(rows: TimeMatch[], minGames: number = MIN_GAMES): MonthSessionRow[] {
   const sessions = buildSessions(rows)
   // group sessions by the month of their start
   const byMonth = new Map<string, { label: string; minutes: number[]; games: number[] }>()
@@ -568,7 +569,7 @@ export function avgSessionPerMonth(rows: TimeMatch[]): MonthSessionRow[] {
       avgMinutes: avg(v.minutes),
       avgGames: avg(v.games),
       sessions: v.minutes.length,
-      lowConfidence: v.minutes.length < MIN_GAMES,
+      lowConfidence: v.minutes.length < minGames,
     }))
 }
 
@@ -596,6 +597,7 @@ function buildHeatmap(
   colOf: (m: TimeMatch, ms: number) => string | null,
   rowLabels: string[],
   colLabels: string[],
+  minGames: number = MIN_GAMES,
 ): Heatmap {
   const grid = new Map<string, Tally>()
   const cellKey = (r: string, c: string) => `${r}\u0000${c}`
@@ -616,7 +618,7 @@ function buildHeatmap(
       cells.push({
         rowKey: rk, colKey: ck,
         winRate: winRate(t), games: games(t),
-        lowConfidence: games(t) < MIN_GAMES,
+        lowConfidence: games(t) < minGames,
       })
     }
   }
@@ -625,7 +627,7 @@ function buildHeatmap(
 
 // (1) Day of week (Mon→Sun) × time-of-day block.
 const DOW_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-export function heatmapDayByTimeOfDay(rows: TimeMatch[]): Heatmap {
+export function heatmapDayByTimeOfDay(rows: TimeMatch[], minGames: number = MIN_GAMES): Heatmap {
   const blockLabels = TIME_BLOCKS.map(b => b.label)
   return buildHeatmap(
     rows,
@@ -637,6 +639,7 @@ export function heatmapDayByTimeOfDay(rows: TimeMatch[]): Heatmap {
     },
     DOW_LABELS,
     blockLabels,
+    minGames,
   )
 }
 
@@ -644,7 +647,7 @@ export function heatmapDayByTimeOfDay(rows: TimeMatch[]): Heatmap {
 // data (chronological), cols are Mon→Sun. Only weeks with games are emitted.
 // Rows DISPLAY the friendly "W20 · 11/05" label (week number + that week's
 // Monday date) rather than the opaque sortable key.
-export function heatmapWeekByDay(rows: TimeMatch[]): Heatmap {
+export function heatmapWeekByDay(rows: TimeMatch[], minGames: number = MIN_GAMES): Heatmap {
   // discover the weeks present, in chronological order, mapping key → label.
   const keyToLabel = new Map<string, string>()
   const orderedKeys: string[] = []
@@ -662,6 +665,7 @@ export function heatmapWeekByDay(rows: TimeMatch[]): Heatmap {
     (_m, ms) => DOW_LABELS[(new Date(ms).getDay() + 6) % 7],
     weekLabels,
     DOW_LABELS,
+    minGames,
   )
 }
 
@@ -681,7 +685,7 @@ export const SESSION_GAMES_BUCKETS: { label: string; min: number; max: number }[
   { label: '6–9 games', min: 6, max: 9 },
   { label: '10+ games', min: 10, max: Infinity },
 ]
-export function heatmapSessionShape(rows: TimeMatch[]): Heatmap {
+export function heatmapSessionShape(rows: TimeMatch[], minGames: number = MIN_GAMES): Heatmap {
   const sessions = buildSessions(rows)
   // map each match id → its session's (lengthLabel, gamesLabel)
   const lenOf = (mins: number) =>
@@ -702,5 +706,6 @@ export function heatmapSessionShape(rows: TimeMatch[]): Heatmap {
     m => matchShape.get(m.id)?.gms ?? null,    // col = games in session
     lengthLabels,
     gamesLabels,
+    minGames,
   )
 }

@@ -12,7 +12,7 @@ export default function SignOutButton() {
   return (
     <button
       onClick={signOut}
-      className="text-sm text-slate-500 hover:text-ow-defeat transition-colors
+      className="text-sm text-ow-faint hover:text-ow-defeat transition-colors
                  font-display tracking-wider uppercase"
       title="Sign out"
     >

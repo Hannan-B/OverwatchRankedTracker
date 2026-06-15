@@ -37,24 +37,25 @@ export const ANALYTICS_GROUPS: AnalyticsGroup[] = [
   {
     label: 'Match analysis',
     tabs: [
-      { href: '/analytics/outcomes', label: 'Outcomes', kind: 'curated', blurb: 'Win rate by mode, map, role; 5v5 vs 6v6; result mix.' },
-      { href: '/analytics/feel', label: 'Feel', kind: 'curated', blurb: 'Fun, match feel, tilt and tempo against your results.' },
-      { href: '/analytics/time', label: 'Time', kind: 'curated', blurb: 'Streaks, sessions, time-of-day and game-length patterns.' },
-      { href: '/analytics/combat', label: 'Combat', kind: 'curated', blurb: 'Damage share, E/A/D trends, stats in wins vs losses.' },
+      { href: '/analytics/outcomes', label: 'Outcomes', kind: 'curated', blurb: 'Win rate by mode, map, and role, with 5v5 vs 6v6 and your result mix.' },
+      { href: '/analytics/feel', label: 'Feel', kind: 'curated', blurb: 'How fun, match feel, tilt, and tempo line up against your results.' },
+      { href: '/analytics/time', label: 'Time', kind: 'curated', blurb: 'Streaks, sessions, time-of-day, and game-length patterns.' },
+      { href: '/analytics/combat', label: 'Combat', kind: 'curated', blurb: 'Damage/healing share, E/A/D trends, and how stats differ in wins vs losses.' },
     ],
   },
   {
     label: 'Hero analysis',
     tabs: [
-      { href: '/analytics/heroes', label: 'Heroes', kind: 'curated', blurb: 'Per-hero win rate, record and detailed stats, by mode and map.' },
-      { href: '/analytics/heroes-overview', label: 'Hero Pairings', kind: 'curated', blurb: 'The hero combinations you play, and how they perform.' },
-      { href: '/analytics/matchups', label: 'Hero Matchups', kind: 'curated', blurb: 'Pick a hero → best/worst enemy matchups and ally pairings.' },
+      { href: '/analytics/heroes', label: 'Heroes', kind: 'curated', blurb: 'Each hero\u2019s win rate, record, and per-game stats \u2014 filterable by mode, map, and season.' },
+      { href: '/analytics/hero_compare', label: 'Hero Compare', kind: 'curated', blurb: 'Put up to four heroes (or one hero across different conditions) side by side.' },
+      { href: '/analytics/heroes-overview', label: 'Hero Pairings', kind: 'curated', blurb: 'Which heroes you pair together, and how those combinations perform.' },
+      { href: '/analytics/matchups', label: 'Hero Matchups', kind: 'curated', blurb: 'Pick a hero to see its strongest and weakest enemy matchups and ally pairings.' },
     ],
   },
   {
     label: 'Build your own',
     tabs: [
-      { href: '/analytics/builder', label: 'Builder', kind: 'builder', blurb: 'The laboratory — any variable × measure × chart type.' },
+      { href: '/analytics/builder', label: 'Builder', kind: 'builder', blurb: 'Build any chart yourself \u2014 pick a variable, a measure, and a chart type.' },
     ],
   },
 ]
@@ -67,13 +68,13 @@ export const ANALYTICS_TABS: AnalyticsTab[] = ANALYTICS_GROUPS.flatMap(g => g.ta
 export function AnalyticsNav() {
   const pathname = usePathname()
   return (
-    <nav className="flex flex-wrap gap-1 border-b border-white/10 pb-px">
+    <nav className="flex flex-wrap gap-1 border-b border-ow-line pb-px">
       <Link
         href="/analytics"
         className={`px-3 py-2 text-xs font-display tracking-wider uppercase rounded-t-md transition-colors ${
           pathname === '/analytics'
             ? 'text-ow-orange border-b-2 border-ow-orange'
-            : 'text-slate-400 hover:text-slate-100'
+            : 'text-ow-muted hover:text-ow-fg'
         }`}>
         Overview
       </Link>
@@ -86,7 +87,7 @@ export function AnalyticsNav() {
             className={`px-3 py-2 text-xs font-display tracking-wider uppercase rounded-t-md transition-colors ${
               active
                 ? 'text-ow-orange border-b-2 border-ow-orange'
-                : 'text-slate-400 hover:text-slate-100'
+                : 'text-ow-muted hover:text-ow-fg'
             }`}>
             {t.label}
           </Link>
@@ -105,10 +106,10 @@ export function AnalyticsHeader({
 }) {
   return (
     <div>
-      <h1 className="font-display text-3xl tracking-[0.12em] text-slate-100 uppercase">
+      <h1 className="font-display text-3xl tracking-[0.12em] text-ow-fg uppercase">
         {title}
       </h1>
-      {subtitle && <p className="text-sm text-slate-400 mt-1">{subtitle}</p>}
+      {subtitle && <p className="text-sm text-ow-muted mt-1">{subtitle}</p>}
     </div>
   )
 }
@@ -125,7 +126,7 @@ export function AnalyticsMenu({ compact = false }: { compact?: boolean }) {
         <div key={group.label} className="space-y-2">
           <div className="flex items-center gap-2">
             <div className="h-1 w-8 bg-ow-orange rounded-full" />
-            <h3 className="font-display tracking-[0.15em] text-slate-300 uppercase text-xs">
+            <h3 className="font-display tracking-[0.15em] text-ow-muted uppercase text-xs">
               {group.label}
             </h3>
           </div>
@@ -134,22 +135,14 @@ export function AnalyticsMenu({ compact = false }: { compact?: boolean }) {
               <Link
                 key={item.href}
                 href={item.href}
-                className="block bg-ow-panel rounded-lg p-4 border border-white/10
+                className="block bg-ow-panel rounded-lg p-4 border border-ow-line
                            hover:border-ow-orange/40 transition-colors">
                 <div className="flex items-center justify-between gap-2">
-                  <span className={`font-display font-bold text-white tracking-wider uppercase ${compact ? 'text-base' : 'text-lg'}`}>
+                  <span className={`font-display font-bold text-ow-fg tracking-wider uppercase ${compact ? 'text-base' : 'text-lg'}`}>
                     {item.label}
                   </span>
-                  <span
-                    className={`text-[10px] font-display tracking-wider uppercase px-2 py-0.5 rounded ${
-                      item.kind === 'builder'
-                        ? 'text-ow-orange bg-ow-orange/10'
-                        : 'text-slate-300 bg-white/10'
-                    }`}>
-                    {item.kind === 'builder' ? 'Generic' : 'Curated'}
-                  </span>
                 </div>
-                {item.blurb && <p className="text-sm text-slate-400 mt-1.5">{item.blurb}</p>}
+                {item.blurb && <p className="text-sm text-ow-muted mt-1.5">{item.blurb}</p>}
               </Link>
             ))}
           </div>

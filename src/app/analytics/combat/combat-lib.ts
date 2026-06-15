@@ -28,7 +28,7 @@
 // CONVENTIONS (shared with the rest of the app):
 //   • Win rate = wins / (wins + losses); draws excluded from %, counted in N.
 //   • Shares are stored 0–100 already (e.g. "25.58") — parsed, NOT re-scaled.
-//   • Sparse buckets are flagged lowConfidence (< MIN_GAMES); callers dim them.
+//   • Sparse buckets are flagged lowConfidence (< minGames, default MIN_GAMES); callers dim them.
 // ============================================================
 
 export type Result = 'victory' | 'defeat' | 'draw'
@@ -62,6 +62,10 @@ export interface CombatFactRow {
   user_mitigation: string | number | null
   ally_total_damage: string | number | null
   enemy_total_damage: string | number | null
+  // Total deaths across the ally team's scoreboard rows (#8). Added to the
+  // match_team_damage → hero_match_facts → combat_facts view chain. Optional so
+  // the type stays tolerant if a stale combat_facts (pre-migration) is read.
+  ally_total_deaths?: string | number | null
   damage_pct: string | number | null
   healing_pct: string | number | null
   mitigation_pct: string | number | null
@@ -72,6 +76,10 @@ export interface CombatFactRow {
   // role_played is needed to map a match to its role for the share metric.
   role_played?: Role | null
   is_alpha?: boolean | null
+  // Match-grain leaver flags (from matches m, exposed by the combat_facts view).
+  // Optional so the type is tolerant if the view hasn't been updated yet.
+  team_leaver?: boolean | null
+  enemy_leaver?: boolean | null
 }
 
 // ---- numeric parsing ----
@@ -256,7 +264,7 @@ function isoWeekLabel(d: Date): { key: string; label: string } {
   const mm = String(monday.getMonth() + 1).padStart(2, '0')
   return { key: `${year}-W${String(week).padStart(2, '0')}`, label: `W${week} · ${dd}/${mm}` }
 }
-export function shareTrendByWeek(matches: MatchRow[]): WeekShare[] {
+export function shareTrendByWeek(matches: MatchRow[], minGames: number = MIN_GAMES): WeekShare[] {
   const byWeek = new Map<string, { label: string; vals: number[] }>()
   for (const m of matches) {
     const t = parseTime(m.played_at)
@@ -270,7 +278,7 @@ export function shareTrendByWeek(matches: MatchRow[]): WeekShare[] {
     .map(([key, v]) => ({
       key, label: v.label,
       avgShare: mean(v.vals), games: v.vals.length,
-      lowConfidence: v.vals.length < MIN_GAMES,
+      lowConfidence: v.vals.length < minGames,
     }))
 }
 
@@ -289,7 +297,7 @@ export interface RoleShareSummary {
   total: number
   lowConfidence: boolean
 }
-export function perRoleSummary(matches: MatchRow[]): RoleShareSummary[] {
+export function perRoleSummary(matches: MatchRow[], minGames: number = MIN_GAMES): RoleShareSummary[] {
   const roles: Role[] = ['tank', 'dps', 'support']
   return roles.map(role => {
     const ofRole = matches.filter(m => m.role === role)
@@ -300,7 +308,7 @@ export function perRoleSummary(matches: MatchRow[]): RoleShareSummary[] {
       role, label: SHARE_LABEL[role],
       avgShare: mean(vals),
       withData: vals.length, total: ofRole.length,
-      lowConfidence: vals.length < MIN_GAMES,
+      lowConfidence: vals.length < minGames,
     }
   })
 }
@@ -314,7 +322,7 @@ export function perRoleSummary(matches: MatchRow[]): RoleShareSummary[] {
 // whether or not role_played is populated for those games. Each stat reports its
 // own coverage (non-null share count).
 // ============================================================
-export function sixVsSixSummary(matches: MatchRow[]): RoleShareSummary[] {
+export function sixVsSixSummary(matches: MatchRow[], minGames: number = MIN_GAMES): RoleShareSummary[] {
   const specs: { role: Role; pick: (m: MatchRow) => number | null }[] = [
     { role: 'tank', pick: m => m.mitigationPct },
     { role: 'dps', pick: m => m.damagePct },
@@ -326,7 +334,7 @@ export function sixVsSixSummary(matches: MatchRow[]): RoleShareSummary[] {
       role, label: SHARE_LABEL[role],
       avgShare: mean(vals),
       withData: vals.length, total: matches.length,
-      lowConfidence: vals.length < MIN_GAMES,
+      lowConfidence: vals.length < minGames,
     }
   })
 }
@@ -380,6 +388,113 @@ export function finalBlowRate(rows: CombatFactRow[]): FinalBlowStat {
   }
 }
 
+// ============================================================
+// #7 — TEAM TOTAL DAMAGE: my team vs the enemy team, per match. Reads the
+// pre-summed ally_total_damage / enemy_total_damage off the user hero row (one
+// row per match). A match contributes only when BOTH totals are present (so the
+// 5v5/6v6 difference doesn't matter — these are whole-team sums either way).
+// Returns per-match points (chronological) plus the two overall averages, so the
+// page can show a grouped bar chart and a headline "you out-damage the enemy in
+// X% of games" figure.
+// ============================================================
+export interface TeamDamagePoint {
+  match_id: number
+  ally: number
+  enemy: number
+  result: Result | null
+  t: number
+}
+export interface TeamDamageComparison {
+  perMatch: TeamDamagePoint[]
+  avgAlly: number | null
+  avgEnemy: number | null
+  gamesAllyHigher: number   // games where my team out-damaged the enemy
+  withData: number
+  total: number
+}
+export function teamDamageComparison(rows: CombatFactRow[]): TeamDamageComparison {
+  const userRows = userHeroRows(rows)
+  const perMatch: TeamDamagePoint[] = []
+  for (const r of userRows) {
+    const ally = num(r.ally_total_damage)
+    const enemy = num(r.enemy_total_damage)
+    const t = parseTime(r.played_at)
+    if (ally == null || enemy == null || t == null) continue
+    perMatch.push({ match_id: r.match_id, ally, enemy, result: r.result, t })
+  }
+  perMatch.sort((a, b) => a.t - b.t)
+  return {
+    perMatch,
+    avgAlly: mean(perMatch.map(p => p.ally)),
+    avgEnemy: mean(perMatch.map(p => p.enemy)),
+    gamesAllyHigher: perMatch.filter(p => p.ally > p.enemy).length,
+    withData: perMatch.length,
+    total: userRows.length,
+  }
+}
+
+// ============================================================
+// #8 — MY SHARE OF TEAM DEATHS, per match. Two framings from the same two
+// numbers (my deaths + the ally team's total deaths, incl. mine):
+//   (1) SHARE: my deaths / team total deaths → "how much of the dying is me?"
+//   (2) VS TEAMMATE AVG: my deaths vs the average of my (teamSize-1) teammates
+//       → "am I dying more or less than the others?"
+// Only non-leaver games have a scoreboard, so leaver games never reach here
+// (the page excludes them before calling). A match contributes only when the
+// team total is present and > 0. Team size is inferred from the match format
+// (5 ally players in 5v5, 6 in 6v6) so the teammate average excludes me.
+// ============================================================
+export interface DeathSharePoint {
+  match_id: number
+  myDeaths: number
+  teamDeaths: number
+  sharePct: number          // my deaths as a % of team total (0..100)
+  teammateAvg: number | null // avg deaths of my teammates (null if size unknown)
+  result: Result | null
+  t: number
+}
+export interface DeathShareSummary {
+  perMatch: DeathSharePoint[]
+  avgSharePct: number | null      // average of the per-game shares
+  myAvgDeaths: number | null      // my mean deaths per game
+  teammateAvgDeaths: number | null // mean teammate deaths per game (pooled)
+  withData: number
+  total: number
+}
+export function deathShare(rows: CombatFactRow[]): DeathShareSummary {
+  const userRows = userHeroRows(rows)
+  const perMatch: DeathSharePoint[] = []
+  for (const r of userRows) {
+    const mine = num(r.user_deaths)
+    const team = num(r.ally_total_deaths)
+    const t = parseTime(r.played_at)
+    if (mine == null || team == null || team <= 0 || t == null) continue
+    // ally team size: 5 in 5v5, 6 in 6v6 (the user is one of them).
+    const allySize = r.match_format === '6v6' ? 6 : 5
+    const teammates = allySize - 1
+    const teammateAvg = teammates > 0 ? Math.round(((team - mine) / teammates) * 100) / 100 : null
+    perMatch.push({
+      match_id: r.match_id,
+      myDeaths: mine,
+      teamDeaths: team,
+      sharePct: Math.round((mine / team) * 1000) / 10,
+      teammateAvg,
+      result: r.result,
+      t,
+    })
+  }
+  perMatch.sort((a, b) => a.t - b.t)
+  const teammateVals = perMatch.map(p => p.teammateAvg).filter((v): v is number => v != null)
+  return {
+    perMatch,
+    avgSharePct: mean(perMatch.map(p => p.sharePct)),
+    myAvgDeaths: mean(perMatch.map(p => p.myDeaths)),
+    teammateAvgDeaths: mean(teammateVals),
+    withData: perMatch.length,
+    total: userRows.length,
+  }
+}
+
 // Final-blow % broken down per hero the user played (across all their rows, not
 // just the scoreboard hero — a hero appears if it has final_blows + a usable
 // elim figure on its own row). NOTE: user_elims is the user's MATCH total, so a
@@ -393,7 +508,7 @@ export interface HeroFinalBlows {
   games: number
   lowConfidence: boolean
 }
-export function finalBlowsByHero(rows: CombatFactRow[]): HeroFinalBlows[] {
+export function finalBlowsByHero(rows: CombatFactRow[], minGames: number = MIN_GAMES, playtimePct = 95): HeroFinalBlows[] {
   const byHero = new Map<string, { fb: number; elimsForPct: number; fbForPct: number; pctGames: number; games: number }>()
   for (const r of rows) {
     const hero = r.hero_name
@@ -405,7 +520,11 @@ export function finalBlowsByHero(rows: CombatFactRow[]): HeroFinalBlows[] {
     b.games++
     // only use single-hero matches for the FB% (elims attributable to this hero)
     const elims = num(r.user_elims)
-    if (r.is_single_hero === true && elims != null && elims > 0) {
+    // Live single-hero cut: percent_played >= playtimePct (default 95 == the
+    // frozen is_single_hero flag). Fall back to the flag if percent is null.
+    const pp = num(r.percent_played)
+    const singleHero = pp != null ? pp >= playtimePct : r.is_single_hero === true
+    if (singleHero && elims != null && elims > 0) {
       b.fbForPct += fb
       b.elimsForPct += elims
       b.pctGames++
@@ -417,7 +536,7 @@ export function finalBlowsByHero(rows: CombatFactRow[]): HeroFinalBlows[] {
       fbPct: b.elimsForPct > 0 ? Math.round((b.fbForPct / b.elimsForPct) * 1000) / 10 : null,
       totalFinalBlows: b.fb,
       games: b.games,
-      lowConfidence: b.games < MIN_GAMES,
+      lowConfidence: b.games < minGames,
     }))
     .sort((a, b) => b.totalFinalBlows - a.totalFinalBlows)
 }
@@ -503,7 +622,7 @@ export interface DrillRow {
 // share; `dim` picks the bucketing key. Dedupes to one row per match first
 // (shares are whole-match), then groups by the dimension. For 'hero' we use the
 // user's actual hero (scoreboard_hero) so it's "share in games I played hero X".
-export function shareDrill(rows: CombatFactRow[], role: Role, dim: DrillDimension): DrillRow[] {
+export function shareDrill(rows: CombatFactRow[], role: Role, dim: DrillDimension, minGames: number = MIN_GAMES): DrillRow[] {
   if (dim === 'none') return []
   const shareCol = (r: CombatFactRow): number | null =>
     role === 'tank' ? num(r.mitigation_pct) : role === 'dps' ? num(r.damage_pct) : num(r.healing_pct)
@@ -529,7 +648,7 @@ export function shareDrill(rows: CombatFactRow[], role: Role, dim: DrillDimensio
   return Array.from(buckets.entries())
     .map(([key, vals]) => ({
       key, avgShare: mean(vals), games: vals.length,
-      lowConfidence: vals.length < MIN_GAMES,
+      lowConfidence: vals.length < minGames,
     }))
     .sort((a, b) => (b.avgShare ?? -1) - (a.avgShare ?? -1))
 }
@@ -640,6 +759,7 @@ export function ratesByHero(
   rows: CombatFactRow[],
   value: (r: CombatFactRow) => string | number | null,
   isDuration = false,
+  minGames: number = MIN_GAMES,
 ): HeroRateRow[] {
   const byHero = new Map<string, { counts: number[]; perMin: number[]; per30: number[]; timeGames: number }>()
   for (const r of rows) {
@@ -665,7 +785,7 @@ export function ratesByHero(
       per30Sec: round2(mean(b.per30)),
       games: b.counts.length,
       timeGames: b.timeGames,
-      lowConfidence: b.counts.length < MIN_GAMES,
+      lowConfidence: b.counts.length < minGames,
     }))
     .sort((a, b) => (b.avgPerGame ?? -1) - (a.avgPerGame ?? -1))
 }
@@ -684,7 +804,7 @@ export interface HeroFinalBlowRates {
   timeGames: number       // games with usable time (for the rate columns)
   lowConfidence: boolean
 }
-export function finalBlowRatesByHero(rows: CombatFactRow[]): HeroFinalBlowRates[] {
+export function finalBlowRatesByHero(rows: CombatFactRow[], minGames: number = MIN_GAMES): HeroFinalBlowRates[] {
   const byHero = new Map<string, { counts: number[]; perMin: number[]; per30: number[]; timeGames: number }>()
   for (const r of rows) {
     const hero = r.hero_name
@@ -709,7 +829,7 @@ export function finalBlowRatesByHero(rows: CombatFactRow[]): HeroFinalBlowRates[
       per30Sec: round2(mean(b.per30)),
       games: b.counts.length,
       timeGames: b.timeGames,
-      lowConfidence: b.counts.length < MIN_GAMES,
+      lowConfidence: b.counts.length < minGames,
     }))
     .sort((a, b) => (b.avgPerGame ?? -1) - (a.avgPerGame ?? -1))
 }

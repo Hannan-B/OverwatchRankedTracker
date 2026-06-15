@@ -25,12 +25,13 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
+import { matchQuery } from '@/lib/alpha'
 import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus } from '@/lib/image-processor'
 import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
 import { getGameModeForMap, needsStartingSide, MAPS } from '@/data/reference'
 import type { RoleType, MatchFeel, PerformanceFeel, StartingSide } from '@/lib/types'
 import { buildConfirmationQuestions, type ConfirmInputs, type ConfirmationCandidate } from '@/lib/beta-confirmation'
-import { logConfirmationOutcome, logMatchSummary, logProcessingError } from '@/lib/beta-issue-log'
+import { logConfirmationOutcome, logMatchSummary, logProcessingError, logDateOcrFailure, logMapDetectMiss } from '@/lib/beta-issue-log'
 import { ConfirmationPanel, type ConfirmationResult } from '@/app/review/ConfirmationCard'
 
 interface PendingBatch {
@@ -50,10 +51,14 @@ interface PendingBatch {
     enemy_coordination: string | null
     enemy_leaver: boolean
     enemy_thrower: boolean
+    has_leaver?: boolean
     fun_rating: number | null
     personal_thoughts: string | null
     starting_side?: StartingSide | null
     detected_map?: string | null
+    /** Step 10: phone map auto-detect produced nothing at upload (so no side
+     *  question was asked). Drives the map dropdown + side follow-up at review. */
+    map_detect_missed?: boolean
     uploaded_at: string
     photo_count: number
   }
@@ -112,6 +117,21 @@ export default function ProcessPage() {
   // selection
   const [selectedBatchIds, setSelectedBatchIds] = useState<Set<string>>(new Set())
 
+  // delete a pending (un-saved) upload: which batch is awaiting "are you sure?",
+  // and whether a delete is currently in flight (to disable the buttons).
+  const [batchPendingDelete, setBatchPendingDelete] = useState<PendingBatch | null>(null)
+  const [deletingBatch, setDeletingBatch] = useState(false)
+
+  // Escape closes the delete-confirm modal (unless a delete is mid-flight).
+  useEffect(() => {
+    if (!batchPendingDelete) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape' && !deletingBatch) setBatchPendingDelete(null)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [batchPendingDelete, deletingBatch])
+
   // Phase 1 — processing
   const [processingStatus, setProcessingStatus] = useState<ProcessingStatus | null>(null)
   const [procTotal, setProcTotal] = useState(0)
@@ -140,15 +160,22 @@ export default function ProcessPage() {
   // deployed site, saved matches are real (is_alpha = false). `alphaOverride`
   // lets you flip that decision by hand for the occasional exception.
   // null = "use the automatic localhost decision"; true/false = manual override.
+  //
+  // ⚠️ The manual override is LOCALHOST-ONLY. On the live site it is ignored, so
+  // a real match can never be hand-flagged as test and silently vanish from
+  // analytics. Live always follows the automatic decision (= real). The override
+  // is only honoured when running on localhost (where its useful direction is
+  // promoting a test match to real). See NEXT-STEPS #1 / alpha.ts write-side.
   const [alphaOverride, setAlphaOverride] = useState<boolean | null>(null)
   const [isLocalhost, setIsLocalhost] = useState(false)
   useEffect(() => {
     const h = window.location.hostname
     setIsLocalhost(h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0')
   }, [])
-  // The value actually written to the DB: manual override wins if set,
-  // otherwise fall back to the automatic localhost decision.
-  const isAlpha = alphaOverride ?? isLocalhost
+  // The value actually written to the DB: on localhost a manual override wins if
+  // set, otherwise the automatic localhost decision. OFF localhost (live) the
+  // override is ignored entirely — live matches are always real (is_alpha=false).
+  const isAlpha = isLocalhost ? (alphaOverride ?? isLocalhost) : false
 
   // ── Mount: gamertag + initial scan ──
   useEffect(() => {
@@ -197,6 +224,35 @@ export default function ProcessPage() {
         if (!metadataBlob) continue
 
         const metadata = JSON.parse(await metadataBlob.text())
+
+        // Auto-cleanup of abandoned uploads: a batch only remains in pending/ if
+        // it was never processed+saved (saving deletes its files). So anything
+        // here older than the retention window is an upload the user never acted
+        // on — safe to delete. Keyed on the batch's own uploaded_at timestamp.
+        // 21-day window: comfortably longer than any phone→laptop gap.
+        const PENDING_RETENTION_DAYS = 21
+        const uploadedAtMs = Date.parse(metadata?.uploaded_at ?? '')
+        if (!Number.isNaN(uploadedAtMs)) {
+          const ageDays = (Date.now() - uploadedAtMs) / (1000 * 60 * 60 * 24)
+          if (ageDays > PENDING_RETENTION_DAYS) {
+            const stalePaths = [
+              `pending/${folder.name}/metadata.json`,
+              ...files
+                .filter(f => f.name !== 'metadata.json')
+                .map(f => `pending/${folder.name}/${f.name}`),
+            ]
+            const { error: cleanupErr } = await supabase.storage
+              .from('match-images')
+              .remove(stalePaths)
+            if (cleanupErr) {
+              console.warn(`Auto-cleanup failed for batch ${folder.name}:`, cleanupErr)
+            } else {
+              console.log(`Auto-cleaned abandoned upload ${folder.name} (${Math.floor(ageDays)} days old)`)
+            }
+            continue // don't build preview URLs or list a batch we just removed
+          }
+        }
+
         const photoFiles = files.filter(f => f.name !== 'metadata.json')
         const photoUrls: string[] = []
         const photoPaths: string[] = []
@@ -240,6 +296,40 @@ export default function ProcessPage() {
   function selectAllBatches() { setSelectedBatchIds(new Set(batches.map(b => b.batchId))) }
   function deselectAllBatches() { setSelectedBatchIds(new Set()) }
 
+  // ── Delete a pending (un-saved) upload ──
+  // Removes the batch's files from Storage (metadata.json + every photo) WITHOUT
+  // writing anything to the database — a pure discard. Reuses the same storage
+  // path shape + `.remove()` that saveMatch uses for post-save cleanup.
+  async function deletePendingBatch(batch: PendingBatch) {
+    setDeletingBatch(true)
+    try {
+      const allPaths = [
+        `pending/${batch.batchId}/metadata.json`,
+        ...batch.photoPaths,
+      ]
+      const { error } = await supabase.storage.from('match-images').remove(allPaths)
+      if (error) {
+        console.error('Failed to delete pending batch:', error)
+        // Leave it in the list so the user can retry; surface nothing destructive.
+        setDeletingBatch(false)
+        setBatchPendingDelete(null)
+        return
+      }
+      // Drop it from the on-screen list and any selection it was part of.
+      setBatches(prev => prev.filter(b => b.batchId !== batch.batchId))
+      setSelectedBatchIds(prev => {
+        const next = new Set(prev)
+        next.delete(batch.batchId)
+        return next
+      })
+    } catch (err) {
+      console.error('Failed to delete pending batch:', err)
+    } finally {
+      setDeletingBatch(false)
+      setBatchPendingDelete(null)
+    }
+  }
+
   // ════════════════════════════════════════════════════════════
   // PHASE 1 — unattended processing
   // ════════════════════════════════════════════════════════════
@@ -265,7 +355,7 @@ export default function ProcessPage() {
   function processAllBatches() { startProcessing(batches) }
 
   // Build the 6f confirmation questions for a finished result (pure-ish; no save).
-  function buildQuestions(batch: PendingBatch, result: ProcessedMatch, seq: number): ConfirmationCandidate[] {
+  function buildQuestions(batch: PendingBatch, result: ProcessedMatch, seq: number, recentMatchDates: Date[] = []): ConfirmationCandidate[] {
     const sb = result.scoreboard
 
     const lowConfHeroSlots = (sb?.heroes ?? [])
@@ -298,7 +388,7 @@ export default function ProcessPage() {
           : null,
         gameLengthSeconds: result.gameLengthSeconds,
         matchTimestamp: result.matchTimestamp,
-        matchDateText: null,
+        matchDateText: result.matchDateText,
         eliminations: result.eliminations,
         assists: result.assists,
         deaths: result.deaths,
@@ -308,6 +398,12 @@ export default function ProcessPage() {
       lowConfHeroSlots,
       knownMaps: MAP_NAMES,
       knownModes: MODE_NAMES,
+      // Step 10: the phone reported its map auto-detect missed at upload. The
+      // laptop's own OCR map (summary.mapName above) is the first recovery
+      // attempt; mapDetectCandidate only raises the dropdown when that is also
+      // null/unrecognized, so this flag widens the trigger to "phone missed AND
+      // OCR didn't recover" without changing behaviour when OCR succeeded.
+      mapDetectMissed: batch.metadata.map_detect_missed === true,
       scoreboardImageUrl: sb?.imageUrl,
       summaryImageUrl: result.summaryImageUrl,
       breakdownImageUrlByHero: Object.fromEntries(
@@ -317,6 +413,7 @@ export default function ProcessPage() {
       imageNaturalWidth: 3840,
       imageNaturalHeight: 2160,
       matchSequence: seq,
+      recentMatchDates,
     }
 
     return buildConfirmationQuestions(inputs)
@@ -326,6 +423,27 @@ export default function ProcessPage() {
     const collected: ReviewItem[] = []
     const failed: ProcessFailure[] = []
     let seq = matchSeqCounter
+
+    // Step 3: fetch the most recent matches' played_at ONCE for the date
+    // neighbour-check (a parsed date >7 days from its nearest neighbour is
+    // surfaced for confirmation). Routed through matchQuery so the alpha rule is
+    // respected (localhost sees test data; live sees only real). Best-effort —
+    // if it fails we just skip the neighbour trigger (missing/implausible still fire).
+    let recentMatchDates: Date[] = []
+    try {
+      const { data: recentRows } = await matchQuery('played_at')
+        .order('played_at', { ascending: false })
+        .limit(10)
+      // Cast via `unknown`: the Supabase client types this result as
+      // GenericStringError[] | null, which doesn't overlap our row shape
+      // directly (strict build catches it), so go through unknown first.
+      const rows = (recentRows as unknown as { played_at: string | null }[] | null) ?? []
+      recentMatchDates = rows
+        .map(r => (r.played_at ? new Date(r.played_at) : null))
+        .filter((d): d is Date => d !== null && !isNaN(d.getTime()))
+    } catch {
+      recentMatchDates = []
+    }
 
     for (let i = 0; i < which.length; i++) {
       const batch = which[i]
@@ -337,15 +455,26 @@ export default function ProcessPage() {
       setProcessingStatus(null)
 
       try {
-        const result = await processMatchPhotos(
+        const rawResult = await processMatchPhotos(
           batch.photoUrls,
           (status) => setProcessingStatus(status),
           batch.metadata.role_played || undefined,
           gamertag || undefined,
         )
 
+        // Leaver games: a leaver collapses the scoreboard layout, so its stats
+        // can't be read reliably. Discard whatever was extracted from the
+        // scoreboard — the summary + hero breakdowns are still kept. Dropping it
+        // here means everything downstream (the confirmation cards, the username
+        // check, and the scoreboard insert in saveMatch) all correctly see "no
+        // scoreboard" without any further special-casing.
+        const isLeaverGame = !!(batch.metadata.has_leaver || batch.metadata.team_leaver || batch.metadata.enemy_leaver)
+        // Omit the scoreboard key (rather than set it undefined) so this is valid
+        // under exactOptionalPropertyTypes as well as the default config.
+        const result = isLeaverGame ? { ...rawResult, scoreboard: null } : rawResult
+
         seq += 1
-        const questions = buildQuestions(batch, result, seq)
+        const questions = buildQuestions(batch, result, seq, recentMatchDates)
         const userResolved = !(result.scoreboard?.ocrAnalysis && !result.scoreboard.ocrAnalysis.resolved)
 
         collected.push({
@@ -512,6 +641,35 @@ export default function ProcessPage() {
       console.warn('[beta] logging failed (continuing to save):', err)
     }
 
+    // Step 10 — apply a map-detect answer back into the data BEFORE saving.
+    // Unlike other confirmation fields (which are logged but not written back),
+    // the map drives starting_side + game_mode, so a corrected map MUST reach
+    // saveMatch. We mutate the in-memory result (map) and the batch metadata
+    // (side); both are consumed by this save and then discarded. saveMatch needs
+    // no change — it re-derives gameMode/startingSide from result.mapName.
+    const mapAnswer = results.find(r => r.candidate.field === 'map')
+    if (mapAnswer && mapAnswer.correctedValue) {
+      result.mapName = mapAnswer.correctedValue
+      // Side rides on the result only when the chosen map needs one; otherwise
+      // clear any stale phone value so a control/push map can't carry a side.
+      batch.metadata.starting_side =
+        needsStartingSide(mapAnswer.correctedValue)
+          ? (mapAnswer.sideValue ?? null)
+          : null
+      try {
+        await logMapDetectMiss({
+          matchId: batch.batchId,
+          phoneMissed: batch.metadata.map_detect_missed === true,
+          ocrValue: mapAnswer.candidate.extractedValue === '(none)' ? null : mapAnswer.candidate.extractedValue,
+          correctedValue: mapAnswer.correctedValue,
+          side: mapAnswer.sideValue ?? null,
+          format,
+        })
+      } catch (err) {
+        console.warn('[beta] map-detect-miss logging failed (continuing to save):', err)
+      }
+    }
+
     try {
       await saveMatch(batch, result)
       setReviewItems(prev => {
@@ -556,6 +714,17 @@ export default function ProcessPage() {
     const playedAtDate: Date = processed.matchTimestamp ?? new Date()
     if (!processed.matchTimestamp) {
       console.warn('[process] No match timestamp from OCR — falling back to process time for played_at/season')
+      // Step 3a: log the hard date failure as a background event so it's tracked
+      // rather than silently swallowed. 'unparseable' if some text was read but
+      // didn't parse; 'missing' if nothing was read at all. Best-effort (fire-
+      // and-forget): a logging failure must never block the save.
+      const fmt = (processed.matchFormat || meta.match_format || '5v5') as '5v5' | '6v6'
+      void logDateOcrFailure({
+        matchId: batch.batchId,
+        reason: processed.matchDateText && processed.matchDateText.trim() ? 'unparseable' : 'missing',
+        rawText: processed.matchDateText,
+        format: fmt,
+      })
     }
     const playedAtISO = playedAtDate.toISOString()
 
@@ -706,9 +875,9 @@ export default function ProcessPage() {
   if (pageState === 'scanning') {
     return (
       <div className="max-w-3xl mx-auto">
-        <div className="bg-ow-panel rounded-lg p-12 text-center border border-white/10">
+        <div className="bg-ow-panel rounded-lg p-12 text-center border border-ow-line">
           <div className="w-8 h-8 border-2 border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-slate-400 font-display tracking-wider">CHECKING FOR UPLOADS…</p>
+          <p className="text-ow-muted font-display tracking-wider">CHECKING FOR UPLOADS…</p>
         </div>
       </div>
     )
@@ -727,19 +896,19 @@ export default function ProcessPage() {
     return (
       <div className="max-w-3xl mx-auto space-y-6">
         <div>
-          <h1 className="font-display text-3xl tracking-[0.12em] text-slate-100 uppercase">Processing</h1>
-          <p className="text-sm text-slate-400 mt-1">
+          <h1 className="font-display text-3xl tracking-[0.12em] text-ow-fg uppercase">Processing</h1>
+          <p className="text-sm text-ow-muted mt-1">
             Working through {procTotal} match{procTotal !== 1 ? 'es' : ''} — no input needed until review.
           </p>
         </div>
 
-        <div className="bg-ow-panel rounded-lg p-10 text-center border border-white/10">
+        <div className="bg-ow-panel rounded-lg p-10 text-center border border-ow-line">
           <p className="text-ow-orange font-display font-bold text-sm tracking-wider mb-4">
             MATCH {Math.min(procDone + 1, procTotal)} / {procTotal}
-            {procCurrentLabel && <span className="text-slate-400 font-normal"> · {procCurrentLabel}</span>}
+            {procCurrentLabel && <span className="text-ow-muted font-normal"> · {procCurrentLabel}</span>}
           </p>
           <div className="w-12 h-12 border-[3px] border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-6" />
-          <p className="text-white font-display text-lg">{message}</p>
+          <p className="text-ow-fg font-display text-lg">{message}</p>
 
           {/* per-match stage bar */}
           <div className="mt-6 bg-ow-dark rounded-full h-1.5 overflow-hidden max-w-sm mx-auto">
@@ -752,7 +921,7 @@ export default function ProcessPage() {
             <div className="h-full bg-ow-orange transition-all duration-500 rounded-full"
               style={{ width: `${overall}%` }} />
           </div>
-          <p className="text-xs text-slate-500 mt-2 font-display tracking-wider">
+          <p className="text-xs text-ow-faint mt-2 font-display tracking-wider">
             {Math.round(overall)}% overall
           </p>
 
@@ -779,7 +948,7 @@ export default function ProcessPage() {
       if (!q.region) return q
       // pick the right re-signed URL by field type
       let url = q.region.imageUrl
-      if (q.field === 'summary') url = liveImages.summary ?? url
+      if (q.field === 'summary' || q.field === 'map') url = liveImages.summary ?? url
       else if (q.field === 'breakdown_stat' || q.field === 'hero_id') {
         // breakdown questions name the hero in fieldDetail; fall back to summary
         const heroHit = Object.keys(liveImages.byHero).find(h => q.fieldDetail.includes(h))
@@ -794,8 +963,8 @@ export default function ProcessPage() {
       <div className="max-w-2xl mx-auto space-y-6">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h1 className="font-display text-3xl tracking-[0.12em] text-slate-100 uppercase">Review</h1>
-            <p className="text-sm text-slate-400 mt-1">
+            <h1 className="font-display text-3xl tracking-[0.12em] text-ow-fg uppercase">Review</h1>
+            <p className="text-sm text-ow-muted mt-1">
               {positionInQueue} · {savedCount} saved{failures.length > 0 ? ` · ${failures.length} skipped` : ''}
             </p>
           </div>
@@ -808,20 +977,20 @@ export default function ProcessPage() {
         </div>
 
         {/* match identity header */}
-        <div className="bg-ow-panel rounded-lg border border-white/10 px-5 py-4 flex items-center gap-3 flex-wrap">
+        <div className="bg-ow-panel rounded-lg border border-ow-line px-5 py-4 flex items-center gap-3 flex-wrap">
           {item.result.matchFormat && (
             <span className="text-[10px] font-display font-bold px-2 py-0.5 rounded bg-ow-orange/10 text-ow-orange tracking-wider">
               {item.result.matchFormat.toUpperCase()}
             </span>
           )}
-          <span className="text-white font-display">{item.result.mapName || 'Unknown map'}</span>
+          <span className="text-ow-fg font-display">{item.result.mapName || 'Unknown map'}</span>
           {item.result.result && (
             <span className={`font-display font-bold text-sm ${
               item.result.result === 'victory' ? 'text-ow-victory'
               : item.result.result === 'defeat' ? 'text-ow-defeat' : 'text-ow-draw'
             }`}>{item.result.result.toUpperCase()}</span>
           )}
-          {item.result.score && <span className="text-slate-400 text-sm font-display">{item.result.score}</span>}
+          {item.result.score && <span className="text-ow-muted text-sm font-display">{item.result.score}</span>}
         </div>
 
         {reviewError && (
@@ -837,22 +1006,22 @@ export default function ProcessPage() {
           return (
             <div className="bg-ow-panel rounded-lg border border-ow-orange/30 p-6">
               <p className="text-ow-orange font-display font-bold text-lg mb-1">IS THIS YOU?</p>
-              <p className="text-slate-400 text-xs mb-5">
+              <p className="text-ow-muted text-xs mb-5">
                 OCR wasn&apos;t confident enough to auto-identify your player
                 ({(analysis.bestCandidate.similarity * 100).toFixed(0)}% similarity,
                 {' '}{(analysis.bestCandidate.margin * 100).toFixed(0)}% margin).
               </p>
-              <div className="flex items-center gap-4 bg-ow-dark rounded-lg p-4 mb-5 border border-white/10">
+              <div className="flex items-center gap-4 bg-ow-dark rounded-lg p-4 mb-5 border border-ow-line">
                 {bestCandidate.heroPortraitUrl && (
                   /* eslint-disable-next-line @next/next/no-img-element */
-                  <img src={bestCandidate.heroPortraitUrl} alt="" className="w-14 h-14 rounded border border-white/10" />
+                  <img src={bestCandidate.heroPortraitUrl} alt="" className="w-14 h-14 rounded border border-ow-line" />
                 )}
                 <div className="flex-1 min-w-0">
                   {bestCandidate.gamertagCropUrl && (
                     /* eslint-disable-next-line @next/next/no-img-element */
                     <img src={bestCandidate.gamertagCropUrl} alt="" className="h-8 rounded mb-1" style={{ imageRendering: 'auto' }} />
                   )}
-                  <p className="text-xs text-slate-500">
+                  <p className="text-xs text-ow-faint">
                     Slot {bestCandidate.slot} · {bestCandidate.heroName || 'Unknown hero'}
                   </p>
                 </div>
@@ -863,11 +1032,11 @@ export default function ProcessPage() {
                   YES, THAT&apos;S ME
                 </button>
                 <button onClick={handleDeclineConfirm}
-                  className="bg-ow-panel border border-white/10 text-white font-display px-5 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
+                  className="bg-ow-panel border border-ow-line text-ow-fg font-display px-5 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
                   NO, SHOW ALL
                 </button>
                 <button onClick={handleSkipConfirm}
-                  className="text-slate-500 hover:text-slate-300 font-display px-4 py-2.5 text-sm tracking-wider transition-colors">
+                  className="text-ow-faint hover:text-ow-muted font-display px-4 py-2.5 text-sm tracking-wider transition-colors">
                   SKIP
                 </button>
               </div>
@@ -879,28 +1048,28 @@ export default function ProcessPage() {
         {reviewStep === 'user_select' && analysis && (
           <div className="bg-ow-panel rounded-lg border border-ow-orange/30 p-6">
             <p className="text-ow-orange font-display font-bold text-lg mb-1">WHICH ONE IS YOU?</p>
-            <p className="text-slate-400 text-xs mb-5">Select your player from the ally team.</p>
+            <p className="text-ow-muted text-xs mb-5">Select your player from the ally team.</p>
             <div className="space-y-2">
               {analysis.candidates.map(candidate => (
                 <button key={candidate.slot} onClick={() => handleSelectUser(candidate.slot)}
-                  className="w-full flex items-center gap-4 bg-ow-dark hover:bg-ow-dark/80 rounded-lg p-3 transition-colors text-left border border-white/10 hover:border-ow-orange/30">
+                  className="w-full flex items-center gap-4 bg-ow-dark hover:bg-ow-dark/80 rounded-lg p-3 transition-colors text-left border border-ow-line hover:border-ow-orange/30">
                   {candidate.heroPortraitUrl && (
                     /* eslint-disable-next-line @next/next/no-img-element */
-                    <img src={candidate.heroPortraitUrl} alt="" className="w-12 h-12 rounded border border-white/10 flex-shrink-0" />
+                    <img src={candidate.heroPortraitUrl} alt="" className="w-12 h-12 rounded border border-ow-line flex-shrink-0" />
                   )}
                   <div className="flex-1 min-w-0">
                     {candidate.gamertagCropUrl && (
                       /* eslint-disable-next-line @next/next/no-img-element */
                       <img src={candidate.gamertagCropUrl} alt="" className="h-7 rounded mb-1" style={{ imageRendering: 'auto' }} />
                     )}
-                    <p className="text-xs text-slate-500">Slot {candidate.slot} · {candidate.heroName || 'Unknown hero'}</p>
+                    <p className="text-xs text-ow-faint">Slot {candidate.slot} · {candidate.heroName || 'Unknown hero'}</p>
                   </div>
-                  <span className="text-xs font-mono text-slate-600">{(candidate.ocrSimilarity * 100).toFixed(0)}%</span>
+                  <span className="text-xs font-mono text-ow-faint">{(candidate.ocrSimilarity * 100).toFixed(0)}%</span>
                 </button>
               ))}
             </div>
             <button onClick={handleSkipConfirm}
-              className="mt-4 text-slate-500 hover:text-slate-300 font-display text-sm tracking-wider transition-colors">
+              className="mt-4 text-ow-faint hover:text-ow-muted font-display text-sm tracking-wider transition-colors">
               SKIP — SAVE WITHOUT USER ID
             </button>
           </div>
@@ -911,9 +1080,9 @@ export default function ProcessPage() {
           <div className="space-y-4">
             <div>
               <h2 className="font-display text-xl text-ow-orange tracking-wider">Quick check</h2>
-              <p className="text-sm text-slate-400 mt-1">Confirm what was read before saving this match.</p>
+              <p className="text-sm text-ow-muted mt-1">Confirm what was read before saving this match.</p>
             </div>
-            <ConfirmationPanel candidates={liveQuestions} onComplete={onBetaComplete} />
+            <ConfirmationPanel candidates={liveQuestions} onComplete={onBetaComplete} sideNeededFor={needsStartingSide} />
             {liveQuestions.length === 0 && (
               <button onClick={() => onBetaComplete([])}
                 className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold py-3 rounded-lg tracking-wider transition-colors text-sm">
@@ -925,9 +1094,9 @@ export default function ProcessPage() {
 
         {/* sub-step: saving */}
         {reviewStep === 'saving' && (
-          <div className="bg-ow-panel rounded-lg p-10 text-center border border-white/10">
+          <div className="bg-ow-panel rounded-lg p-10 text-center border border-ow-line">
             <div className="w-10 h-10 border-[3px] border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-            <p className="text-white font-display tracking-wider">SAVING…</p>
+            <p className="text-ow-fg font-display tracking-wider">SAVING…</p>
           </div>
         )}
 
@@ -964,14 +1133,14 @@ export default function ProcessPage() {
             <p className="text-ow-defeat font-display font-bold text-sm tracking-wider">
               {failures.length} SKIPPED — KEPT FOR RETRY
             </p>
-            <p className="text-xs text-slate-400">
+            <p className="text-xs text-ow-muted">
               These batches couldn&apos;t be processed and their screenshots are still
               in storage. They&apos;ve been noted in the issue log. Try them again from here.
             </p>
             <div className="space-y-2">
               {failures.map(f => (
-                <div key={f.batchId} className="bg-ow-dark rounded-lg px-4 py-3 border border-white/10">
-                  <p className="text-xs text-slate-300 font-display">
+                <div key={f.batchId} className="bg-ow-dark rounded-lg px-4 py-3 border border-ow-line">
+                  <p className="text-xs text-ow-muted font-display">
                     {new Date(f.uploadedAt).toLocaleString()}
                   </p>
                   <p className="text-xs text-ow-defeat/80 mt-1">{f.message}</p>
@@ -983,7 +1152,7 @@ export default function ProcessPage() {
 
         <div className="flex justify-center gap-3 flex-wrap">
           <button onClick={resetToIdle}
-            className="bg-ow-panel border border-white/10 text-white font-display px-6 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
+            className="bg-ow-panel border border-ow-line text-ow-fg font-display px-6 py-2.5 rounded-lg tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
             PROCESS MORE
           </button>
           <button onClick={() => router.push('/matches')}
@@ -999,21 +1168,21 @@ export default function ProcessPage() {
   return (
     <div className="max-w-3xl mx-auto space-y-6">
       <div>
-        <h1 className="font-display text-3xl tracking-[0.12em] text-slate-100 uppercase">Process Matches</h1>
-        <p className="text-sm text-slate-400 mt-1">
+        <h1 className="font-display text-3xl tracking-[0.12em] text-ow-fg uppercase">Process Matches</h1>
+        <p className="text-sm text-ow-muted mt-1">
           Automatically extract data from uploaded match photos
         </p>
       </div>
 
       {batches.length === 0 ? (
-        <div className="bg-ow-panel rounded-lg p-12 text-center border border-white/10">
+        <div className="bg-ow-panel rounded-lg p-12 text-center border border-ow-line">
           <span className="text-4xl block mb-3">📷</span>
-          <p className="text-slate-300 font-display text-lg tracking-wider">NO PENDING UPLOADS</p>
-          <p className="text-slate-500 text-sm mt-2">
+          <p className="text-ow-muted font-display text-lg tracking-wider">NO PENDING UPLOADS</p>
+          <p className="text-ow-faint text-sm mt-2">
             Upload match photos from your phone to see them here
           </p>
           <button onClick={scanForBatches}
-            className="mt-5 text-sm text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors">
+            className="mt-5 text-sm text-ow-faint hover:text-ow-muted font-display tracking-wider transition-colors">
             ↻ REFRESH
           </button>
         </div>
@@ -1025,14 +1194,14 @@ export default function ProcessPage() {
               <p className="text-ow-orange font-display font-bold tracking-wider">
                 {batches.length} MATCH{batches.length !== 1 ? 'ES' : ''} WAITING
               </p>
-              <p className="text-slate-400 text-xs mt-0.5">
+              <p className="text-ow-muted text-xs mt-0.5">
                 Process all unattended, then review them together — or pick a few.
               </p>
             </div>
             <div className="flex gap-2 flex-wrap">
               {selectedBatchIds.size > 0 && (
                 <button onClick={processSelected}
-                  className="bg-ow-panel border border-white/10 text-white font-display px-4 py-2 rounded-lg tracking-wider text-xs hover:border-ow-orange/30 transition-colors whitespace-nowrap">
+                  className="bg-ow-panel border border-ow-line text-ow-fg font-display px-4 py-2 rounded-lg tracking-wider text-xs hover:border-ow-orange/30 transition-colors whitespace-nowrap">
                   PROCESS {selectedBatchIds.size} SELECTED
                 </button>
               )}
@@ -1054,7 +1223,7 @@ export default function ProcessPage() {
               }`}>
                 {isAlpha ? '⚠ SAVING AS TEST DATA' : '● SAVING AS REAL DATA'}
               </p>
-              <p className="text-slate-400 text-xs mt-0.5">
+              <p className="text-ow-muted text-xs mt-0.5">
                 {alphaOverride !== null
                   ? 'Manual override active.'
                   : isLocalhost
@@ -1062,30 +1231,35 @@ export default function ProcessPage() {
                     : 'Running on the live site — matches count in analytics.'}
               </p>
             </div>
-            <div className="flex gap-2 flex-wrap shrink-0">
-              <button
-                onClick={() => setAlphaOverride(isAlpha ? false : true)}
-                className="bg-ow-panel border border-white/15 text-slate-200 font-display px-3 py-1.5 rounded-lg tracking-wider text-xs hover:border-ow-orange/40 transition-colors whitespace-nowrap">
-                {isAlpha ? 'MARK AS REAL' : 'MARK AS TEST'}
-              </button>
-              {alphaOverride !== null && (
+            {/* Manual override is LOCALHOST-ONLY. On the live site these buttons
+                don't render at all — live always saves as real (is_alpha=false),
+                so a real match can't be hand-flagged as test and disappear. */}
+            {isLocalhost && (
+              <div className="flex gap-2 flex-wrap shrink-0">
                 <button
-                  onClick={() => setAlphaOverride(null)}
-                  className="text-xs text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors whitespace-nowrap">
-                  RESET TO AUTO
+                  onClick={() => setAlphaOverride(isAlpha ? false : true)}
+                  className="bg-ow-panel border border-ow-line text-ow-fg font-display px-3 py-1.5 rounded-lg tracking-wider text-xs hover:border-ow-orange/40 transition-colors whitespace-nowrap">
+                  {isAlpha ? 'MARK AS REAL' : 'MARK AS TEST'}
                 </button>
-              )}
-            </div>
+                {alphaOverride !== null && (
+                  <button
+                    onClick={() => setAlphaOverride(null)}
+                    className="text-xs text-ow-faint hover:text-ow-muted font-display tracking-wider transition-colors whitespace-nowrap">
+                    RESET TO AUTO
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-3 px-1">
             <button
               onClick={selectedBatchIds.size === batches.length ? deselectAllBatches : selectAllBatches}
-              className="text-xs text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors">
+              className="text-xs text-ow-faint hover:text-ow-muted font-display tracking-wider transition-colors">
               {selectedBatchIds.size === batches.length ? '✓ DESELECT ALL' : '☐ SELECT ALL'}
             </button>
             {selectedBatchIds.size > 0 && selectedBatchIds.size < batches.length && (
-              <span className="text-xs text-slate-600 font-display">{selectedBatchIds.size} selected</span>
+              <span className="text-xs text-ow-faint font-display">{selectedBatchIds.size} selected</span>
             )}
           </div>
 
@@ -1101,7 +1275,7 @@ export default function ProcessPage() {
               <div key={batch.batchId}
                 onClick={() => toggleBatchSelection(batch.batchId)}
                 className={`bg-ow-panel rounded-lg p-5 border transition-colors cursor-pointer ${
-                  isSelected ? 'border-ow-orange/40 bg-ow-orange/5' : 'border-white/10 hover:border-ow-orange/20'
+                  isSelected ? 'border-ow-orange/40 bg-ow-orange/5' : 'border-ow-line hover:border-ow-orange/20'
                 }`}>
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-4 min-w-0">
@@ -1115,17 +1289,17 @@ export default function ProcessPage() {
                         {format && <span className="text-ow-orange font-display font-bold text-xs">{format}</span>}
                         {roles && (
                           <>
-                            {format && <span className="text-slate-500">•</span>}
-                            <span className="text-white font-display">{roles}</span>
+                            {format && <span className="text-ow-faint">•</span>}
+                            <span className="text-ow-fg font-display">{roles}</span>
                           </>
                         )}
-                        {!format && !roles && <span className="text-slate-500 font-display">NO METADATA</span>}
-                        <span className="text-slate-500">•</span>
-                        <span className="text-slate-400">
+                        {!format && !roles && <span className="text-ow-faint font-display">NO METADATA</span>}
+                        <span className="text-ow-faint">•</span>
+                        <span className="text-ow-muted">
                           {batch.metadata.photo_count} photo{batch.metadata.photo_count !== 1 ? 's' : ''}
                         </span>
-                        <span className="text-slate-500">•</span>
-                        <span className="text-slate-500 text-xs">{new Date(batch.metadata.uploaded_at).toLocaleString()}</span>
+                        <span className="text-ow-faint">•</span>
+                        <span className="text-ow-faint text-xs">{new Date(batch.metadata.uploaded_at).toLocaleString()}</span>
                       </div>
                       <div className="flex gap-2 mt-2">
                         {batch.photoUrls.slice(0, 4).map((url, i) => (
@@ -1136,19 +1310,72 @@ export default function ProcessPage() {
                     </div>
                   </div>
 
-                  <button onClick={(e) => { e.stopPropagation(); startProcessing([batch]) }}
-                    className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold px-5 py-2.5 rounded-lg tracking-wider text-sm transition-colors whitespace-nowrap">
-                    PROCESS
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button onClick={(e) => { e.stopPropagation(); startProcessing([batch]) }}
+                      className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold px-5 py-2.5 rounded-lg tracking-wider text-sm transition-colors whitespace-nowrap">
+                      PROCESS
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); setBatchPendingDelete(batch) }}
+                      aria-label="Delete this upload"
+                      title="Delete this upload"
+                      className="w-9 h-9 flex items-center justify-center rounded-lg border border-ow-line text-ow-faint hover:text-ow-defeat hover:border-ow-defeat/40 transition-colors">
+                      {/* trash icon */}
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                        <line x1="10" y1="11" x2="10" y2="17" />
+                        <line x1="14" y1="11" x2="14" y2="17" />
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               </div>
             )
           })}
 
           <button onClick={scanForBatches}
-            className="text-sm text-slate-500 hover:text-slate-300 font-display tracking-wider transition-colors">
+            className="text-sm text-ow-faint hover:text-ow-muted font-display tracking-wider transition-colors">
             ↻ REFRESH
           </button>
+        </div>
+      )}
+
+      {/* Delete-confirmation modal (dimmed backdrop, centered card). Discards a
+          pending upload from Storage — does NOT touch the database. */}
+      {batchPendingDelete && (
+        <div
+          onClick={() => { if (!deletingBatch) setBatchPendingDelete(null) }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-ow-panel border border-ow-line rounded-xl p-6 max-w-sm w-full space-y-4 shadow-xl"
+          >
+            <div className="space-y-1">
+              <h2 className="text-ow-fg font-display font-bold tracking-wider">Delete this upload?</h2>
+              <p className="text-sm text-ow-muted">
+                This permanently removes the {batchPendingDelete.metadata.photo_count} photo
+                {batchPendingDelete.metadata.photo_count !== 1 ? 's' : ''} in this upload from
+                storage. It hasn’t been saved to your match history, and this can’t be undone.
+              </p>
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setBatchPendingDelete(null)}
+                disabled={deletingBatch}
+                className="bg-ow-dark border border-ow-line text-ow-muted font-display tracking-wider text-xs px-4 py-2 rounded-lg hover:border-ow-orange/30 transition-colors disabled:opacity-50">
+                CANCEL
+              </button>
+              <button
+                onClick={() => deletePendingBatch(batchPendingDelete)}
+                disabled={deletingBatch}
+                className="bg-ow-defeat/90 hover:bg-ow-defeat text-white font-display font-bold tracking-wider text-xs px-4 py-2 rounded-lg transition-colors disabled:opacity-50">
+                {deletingBatch ? 'DELETING…' : 'DELETE'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -12,7 +12,7 @@
 //   • Win rate = wins / (wins + losses); DRAWS EXCLUDED from the %, counted in N.
 //   • Ordered enums keep their natural order (not sorted by win rate) so the
 //     scale reads left→right; unordered cuts can sort by win rate.
-//   • Nothing dropped for sparsity; callers dim < MIN_GAMES as a confidence cue.
+//   • Nothing dropped for sparsity; callers dim < minGames (default MIN_GAMES) as a confidence cue.
 // The role-aware "feel vs reality" stat cross is hero-grain and lives separately
 // (see feelVsStats) because it joins match feel ↔ hero stats by match_id.
 // ============================================================
@@ -112,6 +112,7 @@ export function distByEnum<T extends string>(
   rows: FeelMatch[],
   field: (m: FeelMatch) => T | null,
   order: T[],
+  minGames: number = MIN_GAMES,
 ): DistRow[] {
   const counts = new Map<T, number>()
   for (const o of order) counts.set(o, 0)
@@ -127,7 +128,7 @@ export function distByEnum<T extends string>(
     return {
       key: o, label: LABELS[o] ?? o,
       pct: total > 0 ? Math.round((count / total) * 1000) / 10 : null,
-      count, total, lowConfidence: count < MIN_GAMES,
+      count, total, lowConfidence: count < minGames,
     }
   })
 }
@@ -147,20 +148,22 @@ export function teamVsEnemyDist<T extends string>(
   teamField: (m: FeelMatch) => T | null,
   enemyField: (m: FeelMatch) => T | null,
   order: T[],
+  minGames: number = MIN_GAMES,
 ): TeamEnemyDistRow[] {
-  const team = distByEnum(rows, teamField, order)
-  const enemy = distByEnum(rows, enemyField, order)
+  const team = distByEnum(rows, teamField, order, minGames)
+  const enemy = distByEnum(rows, enemyField, order, minGames)
   return order.map((o, i) => ({
     key: o, label: LABELS[o] ?? o,
     teamPct: team[i].pct, enemyPct: enemy[i].pct,
     teamCount: team[i].count, enemyCount: enemy[i].count,
-    lowConfidence: team[i].count < MIN_GAMES || enemy[i].count < MIN_GAMES,
+    lowConfidence: team[i].count < minGames || enemy[i].count < minGames,
   }))
 }
 export function winRateByEnum<T extends string>(
   rows: FeelMatch[],
   field: (m: FeelMatch) => T | null,
   order: T[],
+  minGames: number = MIN_GAMES,
 ): CatRow[] {
   const t = new Map<T, Tally>()
   for (const o of order) t.set(o, emptyTally())
@@ -173,7 +176,7 @@ export function winRateByEnum<T extends string>(
     const tt = t.get(o)!
     return {
       key: o, label: LABELS[o] ?? o, winRate: winRate(tt), games: games(tt),
-      wins: tt.wins, losses: tt.losses, draws: tt.draws, lowConfidence: games(tt) < MIN_GAMES,
+      wins: tt.wins, losses: tt.losses, draws: tt.draws, lowConfidence: games(tt) < minGames,
     }
   })
 }
@@ -181,18 +184,18 @@ export function winRateByEnum<T extends string>(
 // ---- Fun rating ----
 // Distribution: count of games at each star 1..5 (always all five buckets).
 export interface FunBucket { star: number; count: number; lowConfidence: boolean }
-export function funDistribution(rows: FeelMatch[]): FunBucket[] {
+export function funDistribution(rows: FeelMatch[], minGames: number = MIN_GAMES): FunBucket[] {
   const counts = [0, 0, 0, 0, 0]
   for (const r of rows) {
     const f = r.fun_rating
     if (f != null && f >= 1 && f <= 5) counts[f - 1]++
   }
-  return counts.map((count, i) => ({ star: i + 1, count, lowConfidence: count < MIN_GAMES }))
+  return counts.map((count, i) => ({ star: i + 1, count, lowConfidence: count < minGames }))
 }
 
 // Average fun by result (win / loss / draw).
 export interface AvgFunRow { result: Result; avgFun: number | null; games: number; lowConfidence: boolean }
-export function avgFunByResult(rows: FeelMatch[]): AvgFunRow[] {
+export function avgFunByResult(rows: FeelMatch[], minGames: number = MIN_GAMES): AvgFunRow[] {
   const order: Result[] = ['victory', 'defeat', 'draw']
   return order.map(res => {
     const subset = rows.filter(r => r.result === res && r.fun_rating != null)
@@ -200,7 +203,7 @@ export function avgFunByResult(rows: FeelMatch[]): AvgFunRow[] {
       result: res,
       avgFun: mean(subset.map(r => r.fun_rating)),
       games: subset.length,
-      lowConfidence: subset.length < MIN_GAMES,
+      lowConfidence: subset.length < minGames,
     }
   })
 }
@@ -235,24 +238,24 @@ export interface FlagOutcome {
   winRate: number | null
   lowConfidence: boolean
 }
-export function flagOutcome(rows: FeelMatch[], field: (m: FeelMatch) => boolean | null, key: string, label: string): FlagOutcome {
+export function flagOutcome(rows: FeelMatch[], field: (m: FeelMatch) => boolean | null, key: string, label: string, minGames: number = MIN_GAMES): FlagOutcome {
   const t = emptyTally()
   for (const r of rows) {
     if (field(r) === true) add(t, r.result)
   }
   return {
     key, label, games: games(t), wins: t.wins, losses: t.losses, draws: t.draws,
-    winRate: winRate(t), lowConfidence: games(t) < MIN_GAMES,
+    winRate: winRate(t), lowConfidence: games(t) < minGames,
   }
 }
 
 // All four flags as count+outcome rows (for the combined leaver/thrower view).
-export function allFlagOutcomes(rows: FeelMatch[]): FlagOutcome[] {
+export function allFlagOutcomes(rows: FeelMatch[], minGames: number = MIN_GAMES): FlagOutcome[] {
   return [
-    flagOutcome(rows, m => m.team_leaver, 'team_leaver', 'Team leaver'),
-    flagOutcome(rows, m => m.team_thrower, 'team_thrower', 'Team thrower'),
-    flagOutcome(rows, m => m.enemy_leaver, 'enemy_leaver', 'Enemy leaver'),
-    flagOutcome(rows, m => m.enemy_thrower, 'enemy_thrower', 'Enemy thrower'),
+    flagOutcome(rows, m => m.team_leaver, 'team_leaver', 'Team leaver', minGames),
+    flagOutcome(rows, m => m.team_thrower, 'team_thrower', 'Team thrower', minGames),
+    flagOutcome(rows, m => m.enemy_leaver, 'enemy_leaver', 'Enemy leaver', minGames),
+    flagOutcome(rows, m => m.enemy_thrower, 'enemy_thrower', 'Enemy thrower', minGames),
   ]
 }
 
@@ -272,14 +275,15 @@ export function teamVsEnemyByEnum<T extends string>(
   teamField: (m: FeelMatch) => T | null,
   enemyField: (m: FeelMatch) => T | null,
   order: T[],
+  minGames: number = MIN_GAMES,
 ): TeamEnemyRow[] {
-  const team = winRateByEnum(rows, teamField, order)
-  const enemy = winRateByEnum(rows, enemyField, order)
+  const team = winRateByEnum(rows, teamField, order, minGames)
+  const enemy = winRateByEnum(rows, enemyField, order, minGames)
   return order.map((o, i) => ({
     key: o, label: LABELS[o] ?? o,
     teamWinRate: team[i].winRate, enemyWinRate: enemy[i].winRate,
     teamGames: team[i].games, enemyGames: enemy[i].games,
-    lowConfidence: team[i].games < MIN_GAMES || enemy[i].games < MIN_GAMES,
+    lowConfidence: team[i].games < minGames || enemy[i].games < minGames,
   }))
 }
 
@@ -327,7 +331,7 @@ const ROLE_SHARE: Record<Role, { field: keyof Pick<FeelStatRow, 'damage_pct' | '
 // For each (performance_feel × role), the average role-appropriate share.
 // "Do games I FELT I carried actually show a higher damage share than games I
 // felt I struggled?" — read down a role's column across the three feels.
-export function feelVsStats(rows: FeelStatRow[]): FeelStatBucket[] {
+export function feelVsStats(rows: FeelStatRow[], minGames: number = MIN_GAMES): FeelStatBucket[] {
   const out: FeelStatBucket[] = []
   for (const role of ['tank', 'dps', 'support'] as Role[]) {
     const share = ROLE_SHARE[role]
@@ -337,7 +341,7 @@ export function feelVsStats(rows: FeelStatRow[]): FeelStatBucket[] {
       out.push({
         feel, role, n: subset.length,
         avgShare: mean(vals), shareLabel: share.label,
-        lowConfidence: subset.length < MIN_GAMES,
+        lowConfidence: subset.length < minGames,
       })
     }
   }

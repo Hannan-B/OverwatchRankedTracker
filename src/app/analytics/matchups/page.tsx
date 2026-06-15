@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { supabase } from '@/lib/supabase'
+import Select from '@/components/Select'
 import { keepVisible } from '@/lib/alpha'
 import { heroPortrait } from '@/lib/hero-image'
 import AnalyticsFilters, {
@@ -54,12 +55,19 @@ const ROLE_LABEL: Record<Role, string> = { tank: 'Tank', dps: 'DPS', support: 'S
 
 type Format = '5v5' | '6v6'
 
-function toMatchupFilters(f: AnalyticsFilterState, attribution: AttributionMode): MatchupFilters {
+function toMatchupFilters(
+  f: AnalyticsFilterState,
+  attribution: AttributionMode,
+  pctThreshold: number,
+  secThreshold: number,
+): MatchupFilters {
   return {
     queue: (f.queue ?? 'all') as MatchupFilters['queue'],
     mode: (f.mode ?? 'all') as MatchupFilters['mode'],
     map: (f.map ?? 'all') as MatchupFilters['map'],
     attribution,
+    pctThreshold,
+    secThreshold,
   }
 }
 
@@ -71,6 +79,11 @@ export default function MatchupsPage() {
   const [anchorHero, setAnchorHero] = useState<string>('')
   const [winFloor, setWinFloor] = useState<number | null>(null)
   const [attribution, setAttribution] = useState<AttributionMode>('all')
+  // Adjustable threshold VALUES for the attribution toggle (step 9). The toggle
+  // still picks the mode; these set the numbers it applies. Defaults match the
+  // old fixed behaviour (95% / 60s), reactive + per-visit.
+  const [pctThreshold, setPctThreshold] = useState<number>(95)
+  const [secThreshold, setSecThreshold] = useState<number>(60)
 
   // combination lab controls
   const [labLayout, setLabLayout] = useState<'ally' | 'enemy' | 'both'>('ally')
@@ -120,7 +133,7 @@ export default function MatchupsPage() {
     return () => { cancelled = true }
   }, [])
 
-  const mf = useMemo(() => toMatchupFilters(filters, attribution), [filters, attribution])
+  const mf = useMemo(() => toMatchupFilters(filters, attribution, pctThreshold, secThreshold), [filters, attribution, pctThreshold, secThreshold])
   const fixedRole = queueFixedRole(mf.queue)             // role pinned by Queue, or null
   const labFormat: Format = mf.queue === '6v6' ? '6v6' : '5v5'
   const activeAnchor = anchorMode === 'hero' ? (anchorHero || null) : null
@@ -252,7 +265,7 @@ export default function MatchupsPage() {
       />
 
       {/* surface controls */}
-      <div className="bg-ow-panel rounded-lg p-4 border border-white/10 space-y-4">
+      <div className="bg-ow-panel rounded-lg p-4 border border-ow-line space-y-4">
         <div className="flex flex-wrap items-center gap-3">
           <Segmented
             value={anchorMode}
@@ -270,64 +283,96 @@ export default function MatchupsPage() {
                 <img
                   src={heroPortrait(anchorHero)}
                   alt={anchorHero}
-                  className="w-9 h-9 rounded object-cover bg-ow-bg border border-white/15"
+                  className="w-9 h-9 rounded object-cover bg-ow-bg border border-ow-line"
                 />
               )}
-              <select
+              <Select<string>
                 value={anchorHero}
-                onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setAnchorHero(e.target.value)}
-                className="bg-ow-bg border border-white/15 rounded px-3 py-1.5 text-sm text-slate-200 [color-scheme:dark]"
-              >
-                <option value="">Choose a hero…</option>
-                {anchorRolesToShow.map((role) => (
-                  <optgroup key={role} label={ROLE_LABEL[role]}>
-                    {getHeroesByRole(role).map((h) => (
-                      <option key={h.name} value={h.name} disabled={!playedHeroes.has(h.name)}>
-                        {h.name}{!playedHeroes.has(h.name) ? ' — no games' : ''}
-                      </option>
-                    ))}
-                  </optgroup>
-                ))}
-              </select>
+                onChange={setAnchorHero}
+                placeholder="Choose a hero…"
+                className="text-sm"
+                options={[
+                  { value: '', label: 'Choose a hero…' },
+                  ...anchorRolesToShow.flatMap((role) =>
+                    getHeroesByRole(role).map((h) => ({
+                      value: h.name,
+                      label: `${ROLE_LABEL[role]} — ${h.name}${!playedHeroes.has(h.name) ? ' — no games' : ''}`,
+                      disabled: !playedHeroes.has(h.name),
+                    })),
+                  ),
+                ]}
+              />
               {fixedRole && (
-                <span className="text-xs text-slate-500">
+                <span className="text-xs text-ow-faint">
                   scoped to {ROLE_LABEL[fixedRole]} by the Queue filter
                 </span>
               )}
             </div>
           )}
 
-          <label className="flex items-center gap-2 text-sm text-slate-400 ml-auto">
+          <label className="flex items-center gap-2 text-sm text-ow-muted ml-auto">
             My hero counts as
-            <select
+            <Select<AttributionMode>
               value={attribution}
-              onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setAttribution(e.target.value as AttributionMode)}
-              className="bg-ow-bg border border-white/15 rounded px-2 py-1.5 text-sm text-slate-200 [color-scheme:dark]"
-              title="How committed I was to my primary hero for a game to count"
-            >
-              <option value="all">All games</option>
-              <option value="min1">Played ≥ 1 min</option>
-              <option value="pct95">Played ≥ 95%</option>
-            </select>
+              onChange={setAttribution}
+              className="text-sm"
+              options={[
+                { value: 'all', label: 'All games' },
+                { value: 'min1', label: 'Played \u2265 time' },
+                { value: 'pct95', label: 'Played \u2265 %' },
+              ]}
+            />
           </label>
 
-          <label className="flex items-center gap-2 text-sm text-slate-400">
+          {/* Adjustable value for the chosen attribution mode (step 9). Appears
+              only for the mode it applies to; 'all' shows nothing. The toggle
+              picks the mode, this sets the number it enforces. */}
+          {attribution === 'min1' && (
+            <label className="flex items-center gap-2 text-sm text-ow-muted">
+              Min time
+              <Select<number>
+                value={secThreshold}
+                onChange={setSecThreshold}
+                className="text-sm"
+                options={[
+                  { value: 60, label: '\u2265 60s' },
+                  { value: 30, label: '\u2265 30s' },
+                ]}
+              />
+            </label>
+          )}
+          {attribution === 'pct95' && (
+            <label className="flex items-center gap-2 text-sm text-ow-muted">
+              Min %
+              <Select<number>
+                value={pctThreshold}
+                onChange={setPctThreshold}
+                className="text-sm"
+                options={[
+                  { value: 95, label: '\u2265 95%' },
+                  { value: 90, label: '\u2265 90%' },
+                ]}
+              />
+            </label>
+          )}
+
+          <label className="flex items-center gap-2 text-sm text-ow-muted">
             Win-rate floor
-            <select
-              value={winFloor ?? ''}
-              onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
-                setWinFloor(e.target.value === '' ? null : Number(e.target.value))}
-              className="bg-ow-bg border border-white/15 rounded px-2 py-1.5 text-sm text-slate-200 [color-scheme:dark]"
-            >
-              <option value="">Off</option>
-              <option value="50">≥ 50%</option>
-              <option value="55">≥ 55%</option>
-              <option value="60">≥ 60%</option>
-            </select>
+            <Select<string>
+              value={winFloor == null ? '' : String(winFloor)}
+              onChange={v => setWinFloor(v === '' ? null : Number(v))}
+              className="text-sm"
+              options={[
+                { value: '', label: 'Off' },
+                { value: '50', label: '\u2265 50%' },
+                { value: '55', label: '\u2265 55%' },
+                { value: '60', label: '\u2265 60%' },
+              ]}
+            />
           </label>
         </div>
 
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-ow-faint">
           Win rate excludes draws from the percentage (shown separately). Anything under{' '}
           {CONFIDENCE_MIN_GAMES} games is dimmed — a confidence boundary, not a cutoff. Roles
           come from the hero you played, not the scoreboard icon. The &ldquo;my hero counts as&rdquo;
@@ -390,7 +435,7 @@ export default function MatchupsPage() {
             />
 
             {conf.total > 0 && (
-              <p className="text-xs text-slate-500">
+              <p className="text-xs text-ow-faint">
                 6v6 note: slots assume 2-2-2 (adjustable in the lab). Of your {conf.total} 6v6
                 games, {conf.conforming} fit 2-2-2 and {conf.deviating} didn&apos;t — deviating
                 games still appear, slotted by best effort.
@@ -408,10 +453,10 @@ export default function MatchupsPage() {
 // ====================================================================
 
 function Panel({ children }: { children: React.ReactNode }) {
-  return <div className="bg-ow-panel rounded-lg p-6 border border-white/10">{children}</div>
+  return <div className="bg-ow-panel rounded-lg p-6 border border-ow-line">{children}</div>
 }
 function Muted({ children }: { children: React.ReactNode }) {
-  return <p className="text-sm text-slate-400 text-center">{children}</p>
+  return <p className="text-sm text-ow-muted text-center">{children}</p>
 }
 
 type Tone = 'green' | 'blue' | 'red'
@@ -431,7 +476,7 @@ function Segmented({
   toneByValue?: Record<string, Tone>   // per-option active tone (ally=blue, enemy=red)
 }) {
   return (
-    <div className="inline-flex rounded-md border border-white/15 overflow-hidden">
+    <div className="inline-flex rounded-md border border-ow-line overflow-hidden">
       {options.map((o) => {
         const active = value === o.value
         const t = toneByValue?.[o.value] ?? tone
@@ -440,8 +485,8 @@ function Segmented({
             key={o.value}
             onClick={() => onChange(o.value)}
             className={
-              'px-3 py-1.5 text-sm transition-colors border-l first:border-l-0 border-white/10 ' +
-              (active ? TONE_ACTIVE[t] : 'text-slate-400 hover:text-slate-200 hover:bg-white/5')
+              'px-3 py-1.5 text-sm transition-colors border-l first:border-l-0 border-ow-line ' +
+              (active ? TONE_ACTIVE[t] : 'text-ow-muted hover:text-ow-fg hover:bg-white/5')
             }
           >
             {o.label}
@@ -455,10 +500,10 @@ function Segmented({
 function WinRateBadge({ cell, big }: { cell: Cell; big?: boolean }) {
   const rate = cell.winRate
   const color =
-    rate == null ? 'text-slate-500'
+    rate == null ? 'text-ow-faint'
       : rate >= 55 ? 'text-emerald-300'
         : rate <= 45 ? 'text-rose-300'
-          : 'text-slate-200'
+          : 'text-ow-fg'
   return (
     <span className={`font-display tabular-nums ${color} ${big ? 'text-2xl' : ''}`}>
       {rate == null ? '—' : rate.toFixed(2) + '%'}
@@ -468,7 +513,7 @@ function WinRateBadge({ cell, big }: { cell: Cell; big?: boolean }) {
 
 function RecordLine({ cell }: { cell: Cell }) {
   return (
-    <span className="text-xs text-slate-500 tabular-nums">
+    <span className="text-xs text-ow-faint tabular-nums">
       {cell.wins}W–{cell.losses}L{cell.draws ? `–${cell.draws}D` : ''} · {cell.games} {cell.games === 1 ? 'game' : 'games'}
     </span>
   )
@@ -478,7 +523,7 @@ function RecordLine({ cell }: { cell: Cell }) {
 function HeroBox({ name, size = 56 }: { name: string; size?: number }) {
   return (
     <div
-      className="relative rounded-md overflow-hidden bg-ow-bg border border-white/10 shrink-0"
+      className="relative rounded-md overflow-hidden bg-ow-bg border border-ow-line shrink-0"
       style={{ width: size, height: size }}
     >
       <img src={heroPortrait(name)} alt={name} className="w-full h-full object-cover" loading="lazy" />
@@ -490,14 +535,14 @@ function HeroRankRow({ cell }: { cell: Cell }) {
   return (
     <li
       className={
-        'flex items-center gap-3 py-2 border-b border-white/5 last:border-0 ' +
+        'flex items-center gap-3 py-2 border-b border-ow-line last:border-0 ' +
         (cell.lowConfidence ? 'opacity-45' : '')
       }
       title={cell.lowConfidence ? `Low confidence — under ${CONFIDENCE_MIN_GAMES} games` : undefined}
     >
       <HeroBox name={cell.hero} size={44} />
       <div className="min-w-0 flex-1">
-        <div className="text-sm text-slate-200 truncate flex items-center gap-1.5">
+        <div className="text-sm text-ow-fg truncate flex items-center gap-1.5">
           {cell.hero}
           {cell.anyRoleDisagreement && (
             <span title="Scoreboard role icon disagreed with hero role on at least one game" className="text-amber-400/70 text-xs">⚠</span>
@@ -517,10 +562,10 @@ function ListCard({
 }) {
   const empty = ROLES.every((r) => data[r].length === 0)
   return (
-    <div className="bg-ow-panel rounded-lg border border-white/10 overflow-hidden">
-      <div className="px-4 py-3 border-b border-white/10">
-        <h3 className="font-display tracking-wider text-slate-200 text-sm uppercase">{title}</h3>
-        <p className="text-xs text-slate-500 mt-0.5">{hint}</p>
+    <div className="bg-ow-panel rounded-lg border border-ow-line overflow-hidden">
+      <div className="px-4 py-3 border-b border-ow-line">
+        <h3 className="font-display tracking-wider text-ow-fg text-sm uppercase">{title}</h3>
+        <p className="text-xs text-ow-faint mt-0.5">{hint}</p>
       </div>
       <div className="p-4 space-y-4">
         {empty ? (
@@ -529,7 +574,7 @@ function ListCard({
           ROLES.map((role) =>
             data[role].length === 0 ? null : (
               <div key={role}>
-                <div className="text-[11px] uppercase tracking-widest text-slate-500 mb-1">{ROLE_LABEL[role]}</div>
+                <div className="text-[11px] uppercase tracking-widest text-ow-faint mb-1">{ROLE_LABEL[role]}</div>
                 <ul>{data[role].map((cell) => <HeroRankRow key={cell.hero} cell={cell} />)}</ul>
               </div>
             ),
@@ -577,10 +622,10 @@ function Scoreboard({
   const dot = accent === 'blue' ? 'bg-sky-400' : accent === 'red' ? 'bg-rose-400' : 'bg-emerald-400'
 
   return (
-    <div className="bg-ow-bg rounded-md border border-white/10 p-3">
+    <div className="bg-ow-bg rounded-md border border-ow-line p-3">
       <div className="flex items-center gap-2 mb-3">
         <span className={`w-2 h-2 rounded-full ${dot}`} />
-        <span className="text-xs uppercase tracking-widest text-slate-400">{teamLabel}</span>
+        <span className="text-xs uppercase tracking-widest text-ow-muted">{teamLabel}</span>
       </div>
       <div className="space-y-2">
         {ROLES.map((role) => {
@@ -588,7 +633,7 @@ function Scoreboard({
           if (slots <= 0 && !(isUserTeam && userRole === role)) return null
           return (
             <div key={role} className="flex items-center gap-2">
-              <span className="w-12 text-[11px] uppercase tracking-wider text-slate-500">{ROLE_LABEL[role]}</span>
+              <span className="w-12 text-[11px] uppercase tracking-wider text-ow-faint">{ROLE_LABEL[role]}</span>
               <div className="flex flex-wrap gap-2">
                 {Array.from({ length: slots }).map((_, i) => {
                   const hero = pick[role][i] ?? ''
@@ -596,19 +641,18 @@ function Scoreboard({
                     <div key={i} className="flex flex-col items-center gap-1">
                       {hero
                         ? <HeroBox name={hero} size={56} />
-                        : <div className="w-14 h-14 rounded-md border border-dashed border-white/15 bg-ow-panel" />}
-                      <select
+                        : <div className="w-14 h-14 rounded-md border border-dashed border-ow-line bg-ow-panel" />}
+                      <Select<string>
                         value={hero}
-                        onChange={(e: React.ChangeEvent<HTMLSelectElement>) => setSlot(role, i, e.target.value)}
-                        className="bg-ow-panel border border-white/15 rounded text-[11px] text-slate-300 [color-scheme:dark] max-w-[64px]"
-                      >
-                        <option value="">—</option>
-                        {getHeroesByRole(role)
-                          .filter((h) => h.name === hero || !taken.has(h.name))
-                          .map((h) => (
-                            <option key={h.name} value={h.name}>{h.name}</option>
-                          ))}
-                      </select>
+                        onChange={v => setSlot(role, i, v)}
+                        className="text-[11px] max-w-[64px]"
+                        options={[
+                          { value: '', label: '—' },
+                          ...getHeroesByRole(role)
+                            .filter((h) => h.name === hero || !taken.has(h.name))
+                            .map((h) => ({ value: h.name, label: h.name })),
+                        ]}
+                      />
                     </div>
                   )
                 })}
@@ -633,14 +677,14 @@ function Scoreboard({
 function ResultBlock({ label, cell }: { label: string; cell: Cell | null }) {
   if (!cell) return null
   return (
-    <div className="bg-ow-bg rounded-md p-4 border border-white/10 flex items-center justify-between">
+    <div className="bg-ow-bg rounded-md p-4 border border-ow-line flex items-center justify-between">
       <div>
-        <div className="text-sm text-slate-300">{label}</div>
+        <div className="text-sm text-ow-muted">{label}</div>
         <RecordLine cell={cell} />
         {cell.lowConfidence && cell.games > 0 && (
           <div className="text-[11px] text-amber-400/70 mt-1">Low confidence — under {CONFIDENCE_MIN_GAMES} games</div>
         )}
-        {cell.games === 0 && <div className="text-[11px] text-slate-500 mt-1">No matching games — expected on a small sample.</div>}
+        {cell.games === 0 && <div className="text-[11px] text-ow-faint mt-1">No matching games — expected on a small sample.</div>}
       </div>
       <WinRateBadge cell={cell} big />
     </div>
@@ -707,9 +751,9 @@ function ComboLab(props: {
   const showEnemy = layout === 'enemy' || layout === 'both'
 
   return (
-    <div className="bg-ow-panel rounded-lg border border-white/10 overflow-hidden">
-      <div className="px-4 py-3 border-b border-white/10 flex flex-wrap items-center gap-3">
-        <h3 className="font-display tracking-wider text-slate-200 text-sm uppercase">Combination lab</h3>
+    <div className="bg-ow-panel rounded-lg border border-ow-line overflow-hidden">
+      <div className="px-4 py-3 border-b border-ow-line flex flex-wrap items-center gap-3">
+        <h3 className="font-display tracking-wider text-ow-fg text-sm uppercase">Combination lab</h3>
         <Segmented
           value={layout}
           onChange={(v) => setLayout(v as 'ally' | 'enemy' | 'both')}
@@ -723,11 +767,11 @@ function ComboLab(props: {
       </div>
 
       <div className="p-4 space-y-4">
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-ow-faint">
           Build a team like a scoreboard, then read the win rate. Fill some slots for{' '}
-          <strong className="text-slate-400">co-occurrence</strong> (those heroes present, others
+          <strong className="text-ow-muted">co-occurrence</strong> (those heroes present, others
           allowed); fill every slot and switch to{' '}
-          <strong className="text-slate-400">exact comp</strong> for that precise team only.
+          <strong className="text-ow-muted">exact comp</strong> for that precise team only.
         </p>
 
         <div className={`grid gap-4 ${layout === 'both' ? 'md:grid-cols-2' : 'grid-cols-1'}`}>
@@ -837,10 +881,10 @@ function LiftDrillDown({
   setSixEnemy: (s: SlotShape) => void
 }) {
   function deltaColor(d: number | null): string {
-    if (d == null) return 'text-slate-600'
+    if (d == null) return 'text-ow-faint'
     if (d > 0) return 'text-emerald-300'
     if (d < 0) return 'text-rose-300'
-    return 'text-slate-400'
+    return 'text-ow-muted'
   }
   function deltaText(d: number | null): string {
     if (d == null) return '·'
@@ -940,7 +984,7 @@ function LiftDrillDown({
 
             return (
               <div key={role}>
-                <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">{ROLE_LABEL[role]}</div>
+                <div className="text-[10px] uppercase tracking-widest text-ow-faint mb-1">{ROLE_LABEL[role]}</div>
                 <div className="space-y-1.5">
                   {slots.map((slot, i) => (
                     <div key={i} className="flex items-center gap-2">
@@ -958,36 +1002,34 @@ function LiftDrillDown({
                             <HeroBox name={slot.hero} size={52} />
                             <button
                               onClick={() => replacePick(role, slot.indexInRole, '')}
-                              className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-ow-panel border border-white/20 text-slate-400 hover:text-rose-300 text-[10px] leading-none flex items-center justify-center"
+                              className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-ow-panel border border-ow-line text-ow-muted hover:text-rose-300 text-[10px] leading-none flex items-center justify-center"
                               aria-label={`Remove ${slot.hero}`}
                             >×</button>
                           </div>
                         ) : (
-                          <div className="w-[52px] h-[52px] rounded-md border border-dashed border-white/15 bg-ow-panel" />
+                          <div className="w-[52px] h-[52px] rounded-md border border-dashed border-ow-line bg-ow-panel" />
                         )}
                       </div>
 
                       {/* selector ~60%, role-locked */}
                       <div className="basis-3/5 min-w-0">
                         {slot.kind === 'you' ? (
-                          <div className="text-[11px] text-slate-500 px-1">Your hero ({anchorHero})</div>
+                          <div className="text-[11px] text-ow-faint px-1">Your hero ({anchorHero})</div>
                         ) : (
-                          <select
+                          <Select<string>
                             value={slot.kind === 'pick' ? slot.hero : ''}
-                            onChange={(e: React.ChangeEvent<HTMLSelectElement>) => {
-                              const v = e.target.value
+                            onChange={v => {
                               if (slot.kind === 'pick') replacePick(role, slot.indexInRole, v)
                               else addPick(v)
                             }}
-                            className="w-full bg-ow-panel border border-white/15 rounded px-2 py-1.5 text-sm text-slate-300 [color-scheme:dark]"
-                          >
-                            <option value="">{ROLE_LABEL[role]} —</option>
-                            {getHeroesByRole(role)
-                              .filter((h) => (slot.kind === 'pick' && h.name === slot.hero) || !taken.has(h.name))
-                              .map((h) => (
-                                <option key={h.name} value={h.name}>{h.name}</option>
-                              ))}
-                          </select>
+                            className="w-full text-sm"
+                            options={[
+                              { value: '', label: `${ROLE_LABEL[role]} —` },
+                              ...getHeroesByRole(role)
+                                .filter((h) => (slot.kind === 'pick' && h.name === slot.hero) || !taken.has(h.name))
+                                .map((h) => ({ value: h.name, label: h.name })),
+                            ]}
+                          />
                         )}
                       </div>
                     </div>
@@ -1002,9 +1044,9 @@ function LiftDrillDown({
   }
 
   return (
-    <div className="border-t border-white/10 pt-4 mt-2 space-y-3">
+    <div className="border-t border-ow-line pt-4 mt-2 space-y-3">
       <div className="flex flex-wrap items-center gap-3">
-        <h4 className="font-display tracking-wider text-slate-200 text-sm uppercase">Combination lift</h4>
+        <h4 className="font-display tracking-wider text-ow-fg text-sm uppercase">Combination lift</h4>
         <Segmented
           value={mode}
           onChange={(v) => { setMode(v as 'ally' | 'enemy' | 'both'); resetAll() }}
@@ -1016,11 +1058,11 @@ function LiftDrillDown({
           ]}
         />
         {(allySet.length > 0 || enemySet.length > 0) && (
-          <button onClick={resetAll} className="text-xs text-slate-500 hover:text-slate-300">reset</button>
+          <button onClick={resetAll} className="text-xs text-ow-faint hover:text-ow-muted">reset</button>
         )}
       </div>
 
-      <p className="text-xs text-slate-500">
+      <p className="text-xs text-ow-faint">
         {mode === 'both'
           ? 'Build your team and the enemy team together; each candidate below shows how adding it — on either side — moves your win rate against the current combined base.'
           : `Start from ${mode === 'ally' ? 'your hero' : 'an empty enemy set'}, add one ${mode === 'ally' ? 'teammate' : 'opponent'} at a time, and see how each addition moves your win rate.`}
@@ -1031,7 +1073,7 @@ function LiftDrillDown({
           a picker per side. In Both mode the two sides sit side by side,
           giving four columns (ally portraits | ally picker | enemy
           portraits | enemy picker). */}
-      <div className="bg-ow-bg rounded-md border border-white/10 p-3">
+      <div className="bg-ow-bg rounded-md border border-ow-line p-3">
         <div className="flex flex-col sm:flex-row gap-4 sm:divide-x divide-white/10">
           {showAlly && <SetColumn side="ally" set={allySet} />}
           {showEnemy && <SetColumn side="enemy" set={enemySet} />}
@@ -1039,9 +1081,9 @@ function LiftDrillDown({
       </div>
 
       {/* base rate */}
-      <div className="bg-ow-bg rounded-md p-3 border border-white/10 flex items-center justify-between">
+      <div className="bg-ow-bg rounded-md p-3 border border-ow-line flex items-center justify-between">
         <div>
-          <div className="text-[11px] uppercase tracking-widest text-slate-500">Base set win rate</div>
+          <div className="text-[11px] uppercase tracking-widest text-ow-faint">Base set win rate</div>
           <RecordLine cell={baseCell} />
         </div>
         <WinRateBadge cell={baseCell} big />
@@ -1052,26 +1094,26 @@ function LiftDrillDown({
         <Muted>All role slots filled — no more heroes to add.</Muted>
       ) : (
         <>
-          <div className="text-[11px] uppercase tracking-widest text-slate-500">Add one more — ranked by lift</div>
+          <div className="text-[11px] uppercase tracking-widest text-ow-faint">Add one more — ranked by lift</div>
           <div className="space-y-1.5">
             {rows.map((r) => (
               <button
                 key={`${r.side}:${r.hero}`}
                 onClick={() => addHero(r.hero, r.side)}
                 className={
-                  'w-full flex items-center gap-3 bg-ow-bg border border-white/10 rounded-md px-3 py-2 text-left hover:border-white/25 transition-colors ' +
+                  'w-full flex items-center gap-3 bg-ow-bg border border-ow-line rounded-md px-3 py-2 text-left hover:border-ow-line transition-colors ' +
                   (r.cell.lowConfidence && r.cell.games > 0 ? 'opacity-50' : '')
                 }
               >
                 <HeroBox name={r.hero} size={36} />
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm text-slate-200 flex items-center gap-2">
+                  <div className="text-sm text-ow-fg flex items-center gap-2">
                     {r.hero}{mode === 'both' && sideBadge(r.side)}
                   </div>
                   <RecordLine cell={r.cell} />
                 </div>
                 <div className="text-right">
-                  <div className={`font-display tabular-nums text-sm ${r.cell.winRate == null ? 'text-slate-600' : r.cell.winRate >= 55 ? 'text-emerald-300' : r.cell.winRate <= 45 ? 'text-rose-300' : 'text-slate-200'}`}>
+                  <div className={`font-display tabular-nums text-sm ${r.cell.winRate == null ? 'text-ow-faint' : r.cell.winRate >= 55 ? 'text-emerald-300' : r.cell.winRate <= 45 ? 'text-rose-300' : 'text-ow-fg'}`}>
                     {r.cell.winRate == null ? '—' : r.cell.winRate.toFixed(0) + '%'}
                   </div>
                   <div className={`font-display tabular-nums text-sm ${deltaColor(r.delta)}`}>{deltaText(r.delta)}</div>
@@ -1090,14 +1132,14 @@ function LiftDrillDown({
 // diagonal (solo rate); cross (Both) matrices don't.
 function MatrixGrid({ matrix, cross, youHero }: { matrix: PairingMatrix; cross: boolean; youHero: string | null }) {
   function cellTint(c: MatrixCell): string {
-    if (c.winRate == null) return 'text-slate-600'
+    if (c.winRate == null) return 'text-ow-faint'
     if (c.winRate >= 55) return 'text-emerald-300'
     if (c.winRate <= 45) return 'text-rose-300'
-    return 'text-slate-200'
+    return 'text-ow-fg'
   }
   return (
     <div className="overflow-x-auto">
-      <div className="text-[11px] uppercase tracking-widest text-slate-500 mb-2">
+      <div className="text-[11px] uppercase tracking-widest text-ow-faint mb-2">
         Pairing grid {cross ? '(your team ↓ vs enemy →)' : '(win rate when both present; diagonal = solo)'}
       </div>
       <table className="border-collapse">
@@ -1110,7 +1152,7 @@ function MatrixGrid({ matrix, cross, youHero }: { matrix: PairingMatrix; cross: 
                   <div className={h === youHero ? 'rounded-md ring-2 ring-emerald-500/60' : ''}>
                     <HeroBox name={h} size={36} />
                   </div>
-                  <span className={`text-[10px] leading-tight text-center truncate w-full ${h === youHero ? 'text-emerald-300' : 'text-slate-400'}`}>
+                  <span className={`text-[10px] leading-tight text-center truncate w-full ${h === youHero ? 'text-emerald-300' : 'text-ow-muted'}`}>
                     {h === youHero ? 'YOU' : h}
                   </span>
                 </div>
@@ -1126,7 +1168,7 @@ function MatrixGrid({ matrix, cross, youHero }: { matrix: PairingMatrix; cross: 
                   <div className={rh === youHero ? 'rounded-md ring-2 ring-emerald-500/60' : ''}>
                     <HeroBox name={rh} size={36} />
                   </div>
-                  <span className={`text-[11px] whitespace-nowrap ${rh === youHero ? 'text-emerald-300' : 'text-slate-400'}`}>
+                  <span className={`text-[11px] whitespace-nowrap ${rh === youHero ? 'text-emerald-300' : 'text-ow-muted'}`}>
                     {rh === youHero ? `${rh} (you)` : rh}
                   </span>
                 </div>
@@ -1138,7 +1180,7 @@ function MatrixGrid({ matrix, cross, youHero }: { matrix: PairingMatrix; cross: 
                   <td
                     key={ch}
                     className={
-                      'text-center border border-white/5 w-14 h-12 ' +
+                      'text-center border border-ow-line w-14 h-12 ' +
                       (isDiag ? 'bg-white/5 ' : '') +
                       (c.lowConfidence && c.games > 0 ? 'opacity-50' : '')
                     }
@@ -1151,7 +1193,7 @@ function MatrixGrid({ matrix, cross, youHero }: { matrix: PairingMatrix; cross: 
                       {c.winRate == null ? '·' : c.winRate.toFixed(0) + '%'}
                     </div>
                     {c.games > 0 && (
-                      <div className="text-[9px] text-slate-600 tabular-nums">{c.games}g</div>
+                      <div className="text-[9px] text-ow-faint tabular-nums">{c.games}g</div>
                     )}
                   </td>
                 )
@@ -1160,7 +1202,7 @@ function MatrixGrid({ matrix, cross, youHero }: { matrix: PairingMatrix; cross: 
           ))}
         </tbody>
       </table>
-      <p className="text-[10px] text-slate-600 mt-2">
+      <p className="text-[10px] text-ow-faint mt-2">
         Cells show win rate (2dp in the lists above; rounded here) and game count. Faded = under{' '}
         {CONFIDENCE_MIN_GAMES} games. A dot means no games for that pairing yet.
       </p>
@@ -1170,18 +1212,20 @@ function MatrixGrid({ matrix, cross, youHero }: { matrix: PairingMatrix; cross: 
 
 function SixShapeChooser({ shape, setShape }: { shape: SlotShape; setShape: (s: SlotShape) => void }) {
   function bump(role: Role, delta: number) {
-    const next = { ...shape, [role]: Math.max(0, Math.min(6, shape[role] + delta)) }
+    // Tank is capped at 2 (Overwatch's max-2-tanks rule); dps/support clamp 0-6.
+    const max = role === 'tank' ? 2 : 6
+    const next = { ...shape, [role]: Math.max(0, Math.min(max, shape[role] + delta)) }
     setShape(next)
   }
   return (
-    <div className="flex items-center gap-2 text-xs text-slate-400">
+    <div className="flex items-center gap-2 text-xs text-ow-muted">
       <span>6v6 shape:</span>
       {ROLES.map((role) => (
-        <span key={role} className="inline-flex items-center gap-1 bg-ow-bg border border-white/15 rounded px-1.5 py-0.5">
+        <span key={role} className="inline-flex items-center gap-1 bg-ow-bg border border-ow-line rounded px-1.5 py-0.5">
           {ROLE_LABEL[role]}
-          <button onClick={() => bump(role, -1)} className="text-slate-500 hover:text-slate-200 px-1">−</button>
-          <span className="tabular-nums w-3 text-center text-slate-300">{shape[role]}</span>
-          <button onClick={() => bump(role, 1)} className="text-slate-500 hover:text-slate-200 px-1">+</button>
+          <button onClick={() => bump(role, -1)} className="text-ow-faint hover:text-ow-fg px-1">−</button>
+          <span className="tabular-nums w-3 text-center text-ow-muted">{shape[role]}</span>
+          <button onClick={() => bump(role, 1)} className="text-ow-faint hover:text-ow-fg px-1">+</button>
         </span>
       ))}
     </div>
@@ -1204,7 +1248,7 @@ function SparsityNote({ pairs, anchor, mf }: { pairs: PairRow[]; anchor: string 
   }, [pairs, anchor, mf])
 
   return (
-    <p className="text-xs text-slate-500">
+    <p className="text-xs text-ow-faint">
       Based on {games} {games === 1 ? 'game' : 'games'} in the current selection.
       {games < 20 && ' Small sample — read the dimmed rows with caution.'}
     </p>

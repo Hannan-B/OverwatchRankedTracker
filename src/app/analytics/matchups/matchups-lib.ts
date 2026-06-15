@@ -79,6 +79,11 @@ export interface MatchupFilters {
   //   min1  = require >=60s on the primary hero
   //   pct95 = require >=95% of the match on the primary hero
   attribution: AttributionMode
+  // The threshold VALUES the toggle applies. Adjustable (step 9): the toggle
+  // still picks the MODE (all / min-seconds / min-pct); these set the numbers.
+  // Optional + defaulted so existing callers are unchanged (95% / 60s).
+  pctThreshold?: number   // used when attribution === 'pct95' (default 95)
+  secThreshold?: number   // used when attribution === 'min1'  (default 60)
   // anchor hero is matchups-specific (the surface's defining control),
   // not part of the shared filter bar's semantics.
 }
@@ -142,9 +147,11 @@ export function passesFilters(
   // If the playtime fields are absent (older data / null), we DON'T
   // exclude — absence shouldn't silently drop games. 'all' never filters.
   if (f.attribution === 'pct95') {
-    if (r.anchor_pct != null && r.anchor_pct < 95) return false
+    const pct = f.pctThreshold ?? 95
+    if (r.anchor_pct != null && r.anchor_pct < pct) return false
   } else if (f.attribution === 'min1') {
-    if (r.anchor_seconds != null && r.anchor_seconds < 60) return false
+    const secs = f.secThreshold ?? 60
+    if (r.anchor_seconds != null && r.anchor_seconds < secs) return false
   }
   return true
 }

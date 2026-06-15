@@ -4,6 +4,9 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
+import Select from '@/components/Select'
+import { matchQuery } from '@/lib/alpha'
+import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
 import { HEROES, MAPS, GAME_MODE_CONFIG, type GameMode } from '@/data/reference'
 import { normaliseStat, formatStatValue, HERO_BREAKDOWN_ORDER, type BreakdownStat } from '@/data/stat-meta'
 
@@ -32,20 +35,22 @@ const ROLE_STAT: Record<Role, string[]> = {
 interface StatFact {
   hero_name: string; match_id: number; map: string | null; game_mode: string | null
   starting_side: string | null; result: string; game_length_seconds: number | null
-  is_single_hero: boolean; stat_canonical: string; stat_num: number | null
+  is_single_hero: boolean; percent_played: number | null; stat_canonical: string; stat_num: number | null
 }
 interface MatchFact {
   match_id: number; map: string | null; game_mode: string | null; starting_side: string | null
-  result: 'victory' | 'defeat' | 'draw'; played_at: string | null; is_single_hero: boolean
+  result: 'victory' | 'defeat' | 'draw'; played_at: string | null; is_single_hero: boolean; percent_played: number | null
   user_elims: number | null; user_assists: number | null; user_deaths: number | null
   damage_pct: number | null; healing_pct: number | null; mitigation_pct: number | null
 }
-interface Filters { format: Format; mode: GameMode | ''; map: string; side: 'attack' | 'defense' | '' }
-const emptyFilters: Filters = { format: '5v5', mode: '', map: '', side: '' }
+interface Filters { format: Format; mode: GameMode | ''; map: string; side: 'attack' | 'defense' | ''; playtimePct: number }
+// Playtime-% options for the single-hero stat block (default 95; can loosen to 90).
+const PLAYTIME_PCT_OPTIONS = [95, 90] as const
+const emptyFilters: Filters = { format: '5v5', mode: '', map: '', side: '', playtimePct: 95 }
 
 const selectCls =
-  'bg-ow-dark border border-white/20 rounded-lg px-3 py-2 text-sm text-slate-100 font-display tracking-wider focus:border-ow-orange focus:outline-none [color-scheme:dark]'
-const labelCls = 'text-[11px] text-slate-400 font-display tracking-wider uppercase'
+  'bg-ow-dark border border-ow-line rounded-lg px-3 py-2 text-sm text-ow-fg font-display tracking-wider focus:border-ow-orange focus:outline-none [color-scheme:dark]'
+const labelCls = 'text-[11px] text-ow-muted font-display tracking-wider uppercase'
 
 function heroPortrait(name: string): string {
   const cleaned = name.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/:/g, '')
@@ -68,6 +73,9 @@ export default function HeroDetailPage() {
   const [statFacts, setStatFacts] = useState<StatFact[]>([])
   const [matchFacts, setMatchFacts] = useState<MatchFact[]>([])
   const [loading, setLoading] = useState(true)
+  // Match ids of leaver games, to exclude from this hero's stats (a performance
+  // surface) unless the Settings switch is on. Empty when leaver games are shown.
+  const [excludedIds, setExcludedIds] = useState<Set<number>>(new Set())
 
   const buildQuery = useCallback((table: string, f: Filters) => {
     let q = supabase.from(table).select('*').eq('hero_name', heroName).eq('match_format', f.format)
@@ -76,6 +84,22 @@ export default function HeroDetailPage() {
     if (f.side && modeHasSide(f.mode)) q = q.eq('starting_side', f.side)
     return q
   }, [heroName])
+
+  // Load the leaver preference + the set of leaver match ids ONCE. When the
+  // switch is off, those ids are excluded from this hero's stats below.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      await loadLeaverPref()
+      if (showLeaverGames()) { if (!cancelled) setExcludedIds(new Set()); return }
+      const res = await matchQuery('id, team_leaver, enemy_leaver').order('played_at', { ascending: false })
+      const rows =
+        (((res as unknown) as { data: { id: number; team_leaver: boolean | null; enemy_leaver: boolean | null }[] | null }).data) || []
+      const ids = rows.filter(r => r.team_leaver === true || r.enemy_leaver === true).map(r => r.id)
+      if (!cancelled) setExcludedIds(new Set(ids))
+    })()
+    return () => { cancelled = true }
+  }, [])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -90,11 +114,17 @@ export default function HeroDetailPage() {
 
   useEffect(() => { load() }, [load])
 
+  // Leaver games are excluded from this performance surface (unless the switch is
+  // on, in which case excludedIds is empty). Applied to BOTH fact grains before
+  // any aggregation, so games / W-L / breakdown / last-5 all honour it.
+  const visibleStatFacts = statFacts.filter(r => !excludedIds.has(r.match_id))
+  const visibleMatchFacts = matchFacts.filter(r => !excludedIds.has(r.match_id))
+
   // ---- aggregate stat facts: per canonical stat, avg per game + per 10 ----
   const statAgg = new Map<string, { perGame: number | null; per10: number | null; n: number }>()
   {
     const byStat = new Map<string, StatFact[]>()
-    for (const r of statFacts) {
+    for (const r of visibleStatFacts) {
       if (!byStat.has(r.stat_canonical)) byStat.set(r.stat_canonical, [])
       byStat.get(r.stat_canonical)!.push(r)
     }
@@ -110,18 +140,22 @@ export default function HeroDetailPage() {
   }
 
   // games / W-L / single-hero stats from match facts
-  const games = matchFacts.length
-  const wins = matchFacts.filter(m => m.result === 'victory').length
-  const losses = matchFacts.filter(m => m.result === 'defeat').length
+  const games = visibleMatchFacts.length
+  const wins = visibleMatchFacts.filter(m => m.result === 'victory').length
+  const losses = visibleMatchFacts.filter(m => m.result === 'defeat').length
   const winRate = (wins + losses) === 0 ? null : Math.round((1000 * wins) / (wins + losses)) / 10
-  const sh = matchFacts.filter(m => m.is_single_hero)
+  // Single-hero block uses a LIVE playtime-% cut (default 95 == the old
+  // is_single_hero flag; loosening to 90 includes 90-94% games). Falls back to
+  // the frozen flag only if percent_played is missing on a row.
+  const sh = visibleMatchFacts.filter(m =>
+    m.percent_played != null ? m.percent_played >= filters.playtimePct : m.is_single_hero)
   const eadPct = {
     elims: mean(sh.map(m => m.user_elims)), assists: mean(sh.map(m => m.user_assists)),
     deaths: mean(sh.map(m => m.user_deaths)), dmg: mean(sh.map(m => m.damage_pct)),
     heal: mean(sh.map(m => m.healing_pct)), mit: mean(sh.map(m => m.mitigation_pct)),
   }
 
-  const last5 = matchFacts.slice(0, 5)
+  const last5 = visibleMatchFacts.slice(0, 5)
 
   // role-specific stats (top), drawn from statAgg
   const roleStats = role ? ROLE_STAT[role] : []
@@ -130,19 +164,19 @@ export default function HeroDetailPage() {
   const orderedBreakdown: BreakdownStat[] = (HERO_BREAKDOWN_ORDER[heroName] || [])
     .filter(s => !roleStats.includes(s.canonical))
 
-  // Column header row for the three-column stat layout.
+  // Column header row for the two-column stat layout (per-game / per-10-min).
   function StatHeader() {
     return (
-      <div className="grid grid-cols-[1.6fr_1fr_1fr_1fr] gap-2 text-[10px] text-slate-500 font-display tracking-wider uppercase pb-1 border-b border-white/10">
+      <div className="grid grid-cols-[1.6fr_1fr_1fr] gap-2 text-[10px] text-ow-faint font-display tracking-wider uppercase pb-1 border-b border-ow-line">
         <span>Stat</span>
         <span className="text-right">Per Game</span>
-        <span className="text-right">Per Round</span>
         <span className="text-right">Per 10 Min</span>
       </div>
     )
   }
 
-  // Three columns: per-game / per-round (placeholder — '—' for now) / per-10-min.
+  // Two columns: per-game / per-10-min. (Per-round removed — rounds/match isn't
+  // stored, so it was always a '—' placeholder; dropped from the UX per user.)
   // Accepts either a BreakdownStat (label/canonical/fmt from the user-ordered list)
   // or a bare role-stat name. Values formatted per type (% / m:ss / number).
   function StatLine({ stat, name, hasPer10 }: { stat?: BreakdownStat; name?: string; hasPer10?: boolean }) {
@@ -151,18 +185,17 @@ export default function HeroDetailPage() {
     const showPer10 = stat ? stat.hasPer10 : !!hasPer10
     const a = statAgg.get(canon) || statAgg.get((name || '').toUpperCase())
     return (
-      <div className="grid grid-cols-[1.6fr_1fr_1fr_1fr] gap-2 text-sm py-1.5 border-b border-white/5">
-        <span className="text-slate-300 font-display tracking-wide">{titleCase(label)}</span>
-        <span className="text-white font-display text-right">{formatStatValue(canon, a?.perGame ?? null)}</span>
-        <span className="text-slate-500 font-display text-right">—</span>
-        <span className="text-slate-400 font-display text-right">{showPer10 ? formatStatValue(canon, a?.per10 ?? null) : '—'}</span>
+      <div className="grid grid-cols-[1.6fr_1fr_1fr] gap-2 text-sm py-1.5 border-b border-ow-line">
+        <span className="text-ow-muted font-display tracking-wide">{titleCase(label)}</span>
+        <span className="text-ow-fg font-display text-right">{formatStatValue(canon, a?.perGame ?? null)}</span>
+        <span className="text-ow-muted font-display text-right">{showPer10 ? formatStatValue(canon, a?.per10 ?? null) : '—'}</span>
       </div>
     )
   }
 
   return (
     <div className="space-y-6">
-      <Link href="/analytics/heroes" className="text-sm text-slate-400 hover:text-ow-orange font-display tracking-wider">← Heroes</Link>
+      <Link href="/analytics/heroes" className="text-sm text-ow-muted hover:text-ow-orange font-display tracking-wider">← Heroes</Link>
 
       {/* header */}
       <div className="flex items-center gap-4">
@@ -171,8 +204,8 @@ export default function HeroDetailPage() {
           className="w-16 h-16 rounded bg-ow-panel object-cover"
           onError={e => { (e.currentTarget as HTMLImageElement).style.visibility = 'hidden' }} />
         <div>
-          <h1 className="font-display text-3xl tracking-[0.1em] text-slate-100 uppercase">{heroName}</h1>
-          <p className="text-sm text-slate-400 mt-0.5">
+          <h1 className="font-display text-3xl tracking-[0.1em] text-ow-fg uppercase">{heroName}</h1>
+          <p className="text-sm text-ow-muted mt-0.5">
             {role ? role.toUpperCase() : ''} · {games} games · {winRate == null ? '—' : `${winRate}% WR`}
           </p>
         </div>
@@ -181,37 +214,67 @@ export default function HeroDetailPage() {
       {/* filters */}
       <div className="flex flex-wrap gap-3">
         <label className="flex flex-col gap-1"><span className={labelCls}>Format</span>
-          <select className={selectCls} value={filters.format}
-            onChange={e => setFilters({ ...filters, format: e.target.value as Format })}>
-            <option value="5v5">5v5</option><option value="6v6">6v6</option>
-          </select></label>
+          <Select<Format>
+            className={selectCls}
+            value={filters.format}
+            onChange={format => setFilters({ ...filters, format })}
+            options={[
+              { value: '5v5', label: '5v5' },
+              { value: '6v6', label: '6v6' },
+            ]}
+          /></label>
         <label className="flex flex-col gap-1"><span className={labelCls}>Game Mode</span>
-          <select className={selectCls} value={filters.mode}
-            onChange={e => { const mode = e.target.value as GameMode | ''; setFilters({ ...filters, mode, map: '', side: modeHasSide(mode) ? filters.side : '' }) }}>
-            <option value="">All modes</option>
-            {GAME_MODES.map(m => <option key={m} value={m}>{m}</option>)}
-          </select></label>
+          <Select<GameMode | ''>
+            className={selectCls}
+            value={filters.mode}
+            onChange={mode => setFilters({ ...filters, mode, map: '', side: modeHasSide(mode) ? filters.side : '' })}
+            options={[
+              { value: '', label: 'All modes' },
+              ...GAME_MODES.map(m => ({ value: m, label: m })),
+            ]}
+          /></label>
         {filters.mode && (
           <label className="flex flex-col gap-1"><span className={labelCls}>Map</span>
-            <select className={selectCls} value={filters.map} onChange={e => setFilters({ ...filters, map: e.target.value })}>
-              <option value="">All {filters.mode} maps</option>
-              {mapsForMode(filters.mode).map(m => <option key={m} value={m}>{m}</option>)}
-            </select></label>
+            <Select<string>
+              className={selectCls}
+              value={filters.map}
+              onChange={map => setFilters({ ...filters, map })}
+              options={[
+                { value: '', label: `All ${filters.mode} maps` },
+                ...mapsForMode(filters.mode).map(m => ({ value: m, label: m })),
+              ]}
+            /></label>
         )}
         {modeHasSide(filters.mode) && (
           <label className="flex flex-col gap-1"><span className={labelCls}>Starting Side</span>
-            <select className={selectCls} value={filters.side} onChange={e => setFilters({ ...filters, side: e.target.value as 'attack' | 'defense' | '' })}>
-              <option value="">Either side</option><option value="attack">Attack first</option><option value="defense">Defense first</option>
-            </select></label>
+            <Select<'attack' | 'defense' | ''>
+              className={selectCls}
+              value={filters.side}
+              onChange={side => setFilters({ ...filters, side })}
+              options={[
+                { value: '', label: 'Either side' },
+                { value: 'attack', label: 'Attack first' },
+                { value: 'defense', label: 'Defense first' },
+              ]}
+            /></label>
         )}
+        {/* Playtime-% — the single-hero cut for the E/A/D + share block. Default
+            95 matches the old behaviour; 90 loosens it to include 90–94% games. */}
+        <label className="flex flex-col gap-1"><span className={labelCls}>Playtime %</span>
+          <Select<number>
+            className={selectCls}
+            value={filters.playtimePct}
+            onChange={playtimePct => setFilters({ ...filters, playtimePct })}
+            options={PLAYTIME_PCT_OPTIONS.map(p => ({ value: p, label: `${p}%+` }))}
+          /></label>
       </div>
 
       {loading ? (
-        <div className="text-center py-12 text-slate-300 font-display tracking-wider">LOADING…</div>
+        <div className="text-center py-12 text-ow-muted font-display tracking-wider">LOADING…</div>
       ) : games === 0 ? (
-        <div className="text-center py-16 text-slate-300">
+        <div className="text-center py-16 text-ow-muted">
           <p className="font-display text-lg tracking-wider">No games</p>
-          <p className="text-sm mt-1 text-slate-400">No {heroName} games match these filters.</p>
+          <p className="text-sm mt-1 text-ow-muted">No {heroName} games match these filters.</p>
         </div>
       ) : (
         <>
@@ -225,10 +288,10 @@ export default function HeroDetailPage() {
           )}
 
           {/* FULL BREAKDOWN SET — user-specified order */}
-          <div className="bg-ow-panel rounded-lg p-4 border border-white/10">
-            <h2 className="font-display text-slate-200 text-sm tracking-wider uppercase mb-2">Hero breakdown stats</h2>
+          <div className="bg-ow-panel rounded-lg p-4 border border-ow-line">
+            <h2 className="font-display text-ow-fg text-sm tracking-wider uppercase mb-2">Hero breakdown stats</h2>
             {orderedBreakdown.length === 0 ? (
-              <p className="text-sm text-slate-500">No breakdown stats configured for this hero.</p>
+              <p className="text-sm text-ow-faint">No breakdown stats configured for this hero.</p>
             ) : (
               <div>
                 <StatHeader />
@@ -238,13 +301,13 @@ export default function HeroDetailPage() {
           </div>
 
           {/* LAST 5 GAMES */}
-          <div className="bg-ow-panel rounded-lg p-4 border border-white/10">
-            <h2 className="font-display text-slate-200 text-sm tracking-wider uppercase mb-2">Last {last5.length} games</h2>
+          <div className="bg-ow-panel rounded-lg p-4 border border-ow-line">
+            <h2 className="font-display text-ow-fg text-sm tracking-wider uppercase mb-2">Last {last5.length} games</h2>
             <div className="space-y-1.5">
               {last5.map(m => (
-                <div key={m.match_id} className="flex items-center justify-between text-sm border-b border-white/5 pb-1.5">
-                  <span className="text-white font-display">{m.map || '—'}</span>
-                  <span className="text-slate-400 text-xs">{m.game_mode || ''}{m.starting_side ? ` · ${m.starting_side}` : ''}</span>
+                <div key={m.match_id} className="flex items-center justify-between text-sm border-b border-ow-line pb-1.5">
+                  <span className="text-ow-fg font-display">{m.map || '—'}</span>
+                  <span className="text-ow-muted text-xs">{m.game_mode || ''}{m.starting_side ? ` · ${m.starting_side}` : ''}</span>
                   <span className={`font-display font-bold text-xs ${m.result === 'victory' ? 'text-ow-victory' : m.result === 'defeat' ? 'text-ow-defeat' : 'text-ow-draw'}`}>
                     {m.result.toUpperCase()}
                   </span>
@@ -254,25 +317,25 @@ export default function HeroDetailPage() {
           </div>
 
           {/* PERFORMANCE — single-hero E/A/D + % (bottom) */}
-          <div className="bg-ow-panel rounded-lg p-4 border border-white/10">
-            <h2 className="font-display text-slate-200 text-sm tracking-wider uppercase mb-2">
-              Performance <span className="text-[10px] text-slate-500">· single-hero games ({sh.length})</span>
+          <div className="bg-ow-panel rounded-lg p-4 border border-ow-line">
+            <h2 className="font-display text-ow-fg text-sm tracking-wider uppercase mb-2">
+              Performance <span className="text-[10px] text-ow-faint">· single-hero games ({sh.length})</span>
             </h2>
             {sh.length === 0 ? (
-              <p className="text-sm text-slate-500">No ≥95%-played games in this filter, so per-match performance stats aren’t available.</p>
+              <p className="text-sm text-ow-faint">No ≥{filters.playtimePct}%-played games in this filter, so per-match performance stats aren’t available.</p>
             ) : (
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
-                <div><p className="text-slate-400 text-xs">Avg E/A/D</p><p className="text-white font-display">{eadPct.elims?.toFixed(1) ?? '—'} / {eadPct.assists?.toFixed(1) ?? '—'} / {eadPct.deaths?.toFixed(1) ?? '—'}</p></div>
-                <div><p className="text-slate-400 text-xs">Damage % (team)</p><p className="text-white font-display">{eadPct.dmg != null ? `${Math.round(eadPct.dmg * 10) / 10}%` : '—'}</p></div>
-                <div><p className="text-slate-400 text-xs">Healing % (vs enemy)</p><p className="text-white font-display">{eadPct.heal != null ? `${Math.round(eadPct.heal * 10) / 10}%` : '—'}</p></div>
-                <div><p className="text-slate-400 text-xs">Mitigation % (vs enemy)</p><p className="text-white font-display">{eadPct.mit != null ? `${Math.round(eadPct.mit * 10) / 10}%` : '—'}</p></div>
+                <div><p className="text-ow-muted text-xs">Avg E/A/D</p><p className="text-ow-fg font-display">{eadPct.elims?.toFixed(1) ?? '—'} / {eadPct.assists?.toFixed(1) ?? '—'} / {eadPct.deaths?.toFixed(1) ?? '—'}</p></div>
+                <div><p className="text-ow-muted text-xs">Damage % (team)</p><p className="text-ow-fg font-display">{eadPct.dmg != null ? `${Math.round(eadPct.dmg * 10) / 10}%` : '—'}</p></div>
+                <div><p className="text-ow-muted text-xs">Healing % (vs enemy)</p><p className="text-ow-fg font-display">{eadPct.heal != null ? `${Math.round(eadPct.heal * 10) / 10}%` : '—'}</p></div>
+                <div><p className="text-ow-muted text-xs">Mitigation % (vs enemy)</p><p className="text-ow-fg font-display">{eadPct.mit != null ? `${Math.round(eadPct.mit * 10) / 10}%` : '—'}</p></div>
               </div>
             )}
           </div>
 
-          <p className="text-[11px] text-slate-500">
+          <p className="text-[11px] text-ow-faint">
             Per-game uses all games where you played {heroName} ≥1 min. “/10min” shown for stats that have a per-10-min figure.
-            Performance %s use only ≥95%-played games. For side-by-side splits, use the <Link href="/compare" className="text-ow-orange hover:underline">Compare</Link> page.
+            Performance %s use only ≥{filters.playtimePct}%-played games. For side-by-side splits, use the <Link href="/compare" className="text-ow-orange hover:underline">Compare</Link> page.
           </p>
         </>
       )}

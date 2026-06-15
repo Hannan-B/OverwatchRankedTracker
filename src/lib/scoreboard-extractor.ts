@@ -65,6 +65,11 @@ const HERO_ROLE_MAP: Record<string, RoleType> = {
   'Wuyang': 'support', 'Zenyatta': 'support',
 }
 
+/** Hero names present in the scoreboard HERO_ROLE_MAP above. Exported so the
+ *  testing page's new-content readiness check can confirm a new hero was added
+ *  here (one of the required New-Season steps). Read-only; do not mutate. */
+export const SCOREBOARD_ROLE_HERO_NAMES: string[] = Object.keys(HERO_ROLE_MAP)
+
 /** Override icon-detected roles with the identified hero's known role.
  *  Call after identifyHeroes() — mutates roles in place, returns override count. */
 export function overrideRolesFromHeroes(

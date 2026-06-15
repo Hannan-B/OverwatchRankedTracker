@@ -41,7 +41,7 @@ export default function AlphaToggle() {
         <p className="font-display font-bold tracking-wider text-sm text-amber-400">
           DEV · ALPHA DATA {on ? 'VISIBLE' : 'HIDDEN'}
         </p>
-        <p className="text-slate-400 text-xs mt-0.5">
+        <p className="text-ow-muted text-xs mt-0.5">
           {on
             ? 'Showing test (alpha) matches alongside real data. Localhost only.'
             : 'Hiding alpha matches — this is exactly what the live site shows.'}
@@ -49,7 +49,7 @@ export default function AlphaToggle() {
       </div>
       <button
         onClick={toggle}
-        className="bg-ow-panel border border-white/15 text-slate-200 font-display px-4 py-2 rounded-lg tracking-wider text-xs hover:border-ow-orange/40 transition-colors whitespace-nowrap">
+        className="bg-ow-panel border border-ow-line text-ow-fg font-display px-4 py-2 rounded-lg tracking-wider text-xs hover:border-ow-orange/40 transition-colors whitespace-nowrap">
         {on ? 'HIDE ALPHA' : 'SHOW ALPHA'}
       </button>
     </div>

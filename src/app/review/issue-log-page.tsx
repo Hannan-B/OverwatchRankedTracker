@@ -16,10 +16,10 @@ function pct(n: number) { return `${(n * 100).toFixed(1)}%` }
 
 function StatTile({ label, value, hint }: { label: string; value: string; hint?: string }) {
   return (
-    <div className="bg-ow-panel rounded-lg border border-white/5 p-4">
-      <p className="text-xs font-display tracking-wider text-slate-500">{label}</p>
-      <p className="text-2xl text-white font-bold mt-1 tabular-nums">{value}</p>
-      {hint && <p className="text-[11px] text-slate-500 mt-0.5">{hint}</p>}
+    <div className="bg-ow-panel rounded-lg border border-ow-line p-4">
+      <p className="text-xs font-display tracking-wider text-ow-faint">{label}</p>
+      <p className="text-2xl text-ow-fg font-bold mt-1 tabular-nums">{value}</p>
+      {hint && <p className="text-[11px] text-ow-faint mt-0.5">{hint}</p>}
     </div>
   )
 }
@@ -66,11 +66,11 @@ export default function IssueLogPage() {
       <div className="flex items-end justify-between">
         <div>
           <h1 className="text-3xl text-ow-orange">Issue Log</h1>
-          <p className="text-sm text-slate-400 mt-1">Beta-season extraction confidence</p>
+          <p className="text-sm text-ow-muted mt-1">Beta-season extraction confidence</p>
         </div>
         <button onClick={downloadReport}
           disabled={rows.length === 0}
-          className="bg-ow-panel border border-white/10 text-white font-display
+          className="bg-ow-panel border border-ow-line text-ow-fg font-display
                      px-4 py-2 rounded-lg tracking-wider text-xs hover:border-ow-orange/30
                      disabled:opacity-40 transition-colors">
           ↓ DOWNLOAD .MD
@@ -87,18 +87,18 @@ export default function IssueLogPage() {
       </div>
 
       <section>
-        <h2 className="text-sm font-display tracking-wider text-slate-300 mb-2">SIGNAL PRECISION</h2>
-        <p className="text-xs text-slate-500 mb-3">
+        <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2">SIGNAL PRECISION</h2>
+        <p className="text-xs text-ow-faint mb-3">
           How often each flag was a real error. Low precision → relax that threshold; it’s over-firing.
         </p>
-        <div className="bg-ow-panel rounded-lg border border-white/5 divide-y divide-white/5">
+        <div className="bg-ow-panel rounded-lg border border-ow-line divide-y divide-ow-line/60">
           {Object.keys(s.precisionBySignal).length === 0 ? (
-            <p className="p-4 text-sm text-slate-500">No signals logged yet.</p>
+            <p className="p-4 text-sm text-ow-faint">No signals logged yet.</p>
           ) : Object.entries(s.precisionBySignal).sort().map(([sig, e]) => (
             <div key={sig} className="flex items-center justify-between p-3">
-              <span className="text-sm text-slate-300 font-mono">{sig}</span>
-              <span className="text-xs text-slate-500">
-                {e.corrected}/{e.corrected + e.confirmed} → <span className="text-white font-bold">{pct(e.precision)}</span>
+              <span className="text-sm text-ow-muted font-mono">{sig}</span>
+              <span className="text-xs text-ow-faint">
+                {e.corrected}/{e.corrected + e.confirmed} → <span className="text-ow-fg font-bold">{pct(e.precision)}</span>
               </span>
             </div>
           ))}
@@ -106,7 +106,7 @@ export default function IssueLogPage() {
       </section>
 
       <section>
-        <h2 className="text-sm font-display tracking-wider text-slate-300 mb-2">
+        <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2">
           CORRECTIONS ({corrections.length})
         </h2>
         {corrections.length === 0 ? (
@@ -114,16 +114,16 @@ export default function IssueLogPage() {
             No corrections logged — pipeline clean so far.
           </div>
         ) : (
-          <div className="bg-ow-panel rounded-lg border border-white/5 divide-y divide-white/5">
+          <div className="bg-ow-panel rounded-lg border border-ow-line divide-y divide-ow-line/60">
             {corrections.map((r, i) => (
               <div key={i} className="p-3 flex items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <p className="text-sm text-slate-300 truncate">{r.field_detail ?? r.field}</p>
-                  <p className="text-[11px] text-slate-500 font-mono">{r.match_id} · {r.signal}</p>
+                  <p className="text-sm text-ow-muted truncate">{r.field_detail ?? r.field}</p>
+                  <p className="text-[11px] text-ow-faint font-mono">{r.match_id} · {r.signal}</p>
                 </div>
                 <div className="text-sm whitespace-nowrap">
                   <span className="text-ow-defeat line-through">{r.read_value}</span>
-                  <span className="text-slate-500 mx-1">→</span>
+                  <span className="text-ow-faint mx-1">→</span>
                   <span className="text-ow-victory font-bold">{r.corrected_value}</span>
                 </div>
               </div>
@@ -133,20 +133,20 @@ export default function IssueLogPage() {
       </section>
 
       <section>
-        <h2 className="text-sm font-display tracking-wider text-slate-300 mb-2">
+        <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2">
           NEW-CONTENT LEDGER ({s.unrecognizedLedger.length})
         </h2>
-        <p className="text-xs text-slate-500 mb-3">
+        <p className="text-xs text-ow-faint mb-3">
           Unrecognized heroes / maps / modes / stats — each is a heads-up to add a catalog entry.
         </p>
         {s.unrecognizedLedger.length === 0 ? (
-          <p className="text-sm text-slate-500">None seen.</p>
+          <p className="text-sm text-ow-faint">None seen.</p>
         ) : (
-          <div className="bg-ow-panel rounded-lg border border-white/5 divide-y divide-white/5">
+          <div className="bg-ow-panel rounded-lg border border-ow-line divide-y divide-ow-line/60">
             {s.unrecognizedLedger.map((u, i) => (
               <div key={i} className="p-3 flex items-center justify-between gap-3">
-                <span className="text-sm text-slate-300 truncate">{u.fieldDetail}</span>
-                <span className="text-xs text-slate-500 font-mono">{u.value}</span>
+                <span className="text-sm text-ow-muted truncate">{u.fieldDetail}</span>
+                <span className="text-xs text-ow-faint font-mono">{u.value}</span>
               </div>
             ))}
           </div>

@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
+import Select from '@/components/Select'
 import {
   MAPS, HEROES, GAME_MODE_CONFIG,
   getGameModeForMap, needsStartingSide, getHeroesByRole,
@@ -10,7 +11,7 @@ import {
 } from '@/data/reference'
 import type {
   MatchResult, RoleType, StartingSide,
-  MatchFeel, PerformanceFeel, NotableEvent
+  MatchFeel, PerformanceFeel
 } from '@/lib/types'
 
 // ============================================================
@@ -48,46 +49,7 @@ function ChipSelect<T extends string>({
           className={`px-4 py-2 rounded-lg text-sm font-display tracking-wider transition-all
             ${value === opt
               ? `${colors?.[opt] || 'bg-ow-orange text-ow-dark'} font-bold`
-              : 'bg-ow-dark text-slate-400 border border-white/10 hover:text-white hover:border-white/20'
-            }`}
-        >
-          {labels[opt]}
-        </button>
-      ))}
-    </div>
-  )
-}
-
-function MultiChipSelect<T extends string>({
-  options,
-  value,
-  onChange,
-  labels,
-}: {
-  options: T[]
-  value: T[]
-  onChange: (v: T[]) => void
-  labels: Record<T, string>
-}) {
-  function toggle(opt: T) {
-    if (value.includes(opt)) {
-      onChange(value.filter(v => v !== opt))
-    } else {
-      onChange([...value, opt])
-    }
-  }
-
-  return (
-    <div className="flex flex-wrap gap-2">
-      {options.map(opt => (
-        <button
-          key={opt}
-          type="button"
-          onClick={() => toggle(opt)}
-          className={`px-4 py-2 rounded-lg text-sm font-display tracking-wider transition-all
-            ${value.includes(opt)
-              ? 'bg-ow-orange text-ow-dark font-bold'
-              : 'bg-ow-dark text-slate-400 border border-white/10 hover:text-white hover:border-white/20'
+              : 'bg-ow-dark text-ow-muted border border-ow-line hover:text-ow-fg hover:border-ow-line'
             }`}
         >
           {labels[opt]}
@@ -106,7 +68,7 @@ function StarRating({ value, onChange }: { value: number | null; onChange: (v: n
           type="button"
           onClick={() => onChange(value === star ? null : star)}
           className={`text-2xl transition-colors ${
-            value && star <= value ? 'text-ow-orange' : 'text-slate-600 hover:text-slate-400'
+            value && star <= value ? 'text-ow-orange' : 'text-ow-faint hover:text-ow-muted'
           }`}
         >
           ★
@@ -135,15 +97,15 @@ function HeroSelector({
       {/* Selected heroes */}
       <div className="space-y-2 mb-3">
         {selectedHeroes.map((hero, i) => (
-          <div key={i} className="flex items-center justify-between bg-ow-dark rounded-lg px-4 py-2 border border-white/10">
+          <div key={i} className="flex items-center justify-between bg-ow-dark rounded-lg px-4 py-2 border border-ow-line">
             <div className="flex items-center gap-3">
-              <span className="text-xs text-slate-500 font-display">#{i + 1}</span>
-              <span className="text-white font-display">{hero}</span>
+              <span className="text-xs text-ow-faint font-display">#{i + 1}</span>
+              <span className="text-ow-fg font-display">{hero}</span>
             </div>
             <button
               type="button"
               onClick={() => onRemove(i)}
-              className="text-slate-500 hover:text-ow-defeat transition-colors text-sm"
+              className="text-ow-faint hover:text-ow-defeat transition-colors text-sm"
             >
               ✕
             </button>
@@ -157,15 +119,15 @@ function HeroSelector({
           <button
             type="button"
             onClick={() => setShowPicker(!showPicker)}
-            className="w-full border border-dashed border-white/10 rounded-lg py-3
-                       text-slate-400 hover:text-white hover:border-white/20
+            className="w-full border border-dashed border-ow-line rounded-lg py-3
+                       text-ow-muted hover:text-ow-fg hover:border-ow-line
                        font-display tracking-wider text-sm transition-colors"
           >
             + ADD HERO
           </button>
 
           {showPicker && (
-            <div className="mt-2 bg-ow-dark rounded-lg border border-white/10 p-3 max-h-60 overflow-y-auto">
+            <div className="mt-2 bg-ow-dark rounded-lg border border-ow-line p-3 max-h-60 overflow-y-auto">
               <div className="grid grid-cols-2 md:grid-cols-3 gap-1">
                 {heroes
                   .filter(h => !selectedHeroes.includes(h.name))
@@ -177,8 +139,8 @@ function HeroSelector({
                         onAdd(hero.name)
                         setShowPicker(false)
                       }}
-                      className="text-left px-3 py-2 rounded text-sm text-slate-300
-                                 hover:bg-ow-panel hover:text-white transition-colors"
+                      className="text-left px-3 py-2 rounded text-sm text-ow-muted
+                                 hover:bg-ow-panel hover:text-ow-fg transition-colors"
                     >
                       {hero.name}
                     </button>
@@ -221,7 +183,6 @@ export default function NewMatchPage() {
   // Qualitative
   const [matchFeel, setMatchFeel] = useState<MatchFeel | null>(null)
   const [perfFeel, setPerfFeel] = useState<PerformanceFeel | null>(null)
-  const [notableEvents, setNotableEvents] = useState<NotableEvent[]>([])
   const [funRating, setFunRating] = useState<number | null>(null)
   const [thoughts, setThoughts] = useState('')
 
@@ -288,7 +249,6 @@ export default function NewMatchPage() {
           total_deaths: deaths ? parseInt(deaths) : null,
           match_feel: matchFeel,
           performance_feel: perfFeel,
-          notable_events: notableEvents.length > 0 ? notableEvents : null,
           fun_rating: funRating,
           personal_thoughts: thoughts || null,
         })
@@ -323,32 +283,23 @@ export default function NewMatchPage() {
     <div className="max-w-lg mx-auto space-y-2 pb-8">
       <div>
         <h1 className="text-3xl text-ow-orange">Log Match</h1>
-        <p className="text-sm text-slate-400 mt-1">Enter your match details</p>
+        <p className="text-sm text-ow-muted mt-1">Enter your match details</p>
       </div>
 
       {/* ======================== MAP ======================== */}
       <SectionHeader>MAP</SectionHeader>
-      <select
+      <Select<string>
         value={map}
-        onChange={e => {
-          setMap(e.target.value)
-          setStartingSide(null)
-        }}
-        className="w-full bg-ow-dark border border-white/10 rounded-lg px-4 py-3
-                   text-white focus:border-ow-orange/50 focus:outline-none appearance-none"
-      >
-        <option value="">Select a map...</option>
-        {mapsByMode.map(([mode, maps]) => (
-          <optgroup key={mode} label={mode.charAt(0).toUpperCase() + mode.slice(1)}>
-            {maps.sort((a, b) => a.name.localeCompare(b.name)).map(m => (
-              <option key={m.name} value={m.name}>{m.name}</option>
-            ))}
-          </optgroup>
-        ))}
-      </select>
+        onChange={m => { setMap(m); setStartingSide(null) }}
+        placeholder="Select a map..."
+        className="w-full"
+        options={mapsByMode.flatMap(([, maps]) =>
+          maps.slice().sort((a, b) => a.name.localeCompare(b.name)).map(m => ({ value: m.name, label: m.name })),
+        )}
+      />
 
       {map && (
-        <p className="text-xs text-slate-500">
+        <p className="text-xs text-ow-faint">
           Mode: {gameMode?.charAt(0).toUpperCase()}{gameMode?.slice(1)}
           {showStartingSide ? ' (asymmetric)' : ' (symmetric)'}
         </p>
@@ -357,7 +308,7 @@ export default function NewMatchPage() {
       {/* Starting side (only for asymmetric maps) */}
       {showStartingSide && (
         <div className="mt-2">
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-2">
+          <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
             STARTING SIDE
           </label>
           <ChipSelect
@@ -385,7 +336,7 @@ export default function NewMatchPage() {
 
       {/* Score */}
       <div className="mt-2">
-        <label className="block text-xs text-slate-400 font-display tracking-wider mb-2">
+        <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
           SCORE
         </label>
         <input
@@ -393,15 +344,15 @@ export default function NewMatchPage() {
           value={score}
           onChange={e => setScore(e.target.value)}
           placeholder="e.g. 3-2, 1-0, 2 VS 3"
-          className="w-full bg-ow-dark border border-white/10 rounded-lg px-4 py-2.5
-                     text-white placeholder-slate-600 focus:border-ow-orange/50
+          className="w-full bg-ow-dark border border-ow-line rounded-lg px-4 py-2.5
+                     text-ow-fg placeholder-ow-faint focus:border-ow-orange/50
                      focus:outline-none transition-colors"
         />
       </div>
 
       {/* Game length */}
       <div className="mt-2">
-        <label className="block text-xs text-slate-400 font-display tracking-wider mb-2">
+        <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
           GAME LENGTH
         </label>
         <div className="flex items-center gap-2">
@@ -410,18 +361,18 @@ export default function NewMatchPage() {
             value={gameLengthMin}
             onChange={e => setGameLengthMin(e.target.value)}
             placeholder="Min"
-            className="w-20 bg-ow-dark border border-white/10 rounded-lg px-3 py-2.5
-                       text-white text-center placeholder-slate-600 focus:border-ow-orange/50
+            className="w-20 bg-ow-dark border border-ow-line rounded-lg px-3 py-2.5
+                       text-ow-fg text-center placeholder-ow-faint focus:border-ow-orange/50
                        focus:outline-none transition-colors"
           />
-          <span className="text-slate-500">:</span>
+          <span className="text-ow-faint">:</span>
           <input
             type="number"
             value={gameLengthSec}
             onChange={e => setGameLengthSec(e.target.value)}
             placeholder="Sec"
-            className="w-20 bg-ow-dark border border-white/10 rounded-lg px-3 py-2.5
-                       text-white text-center placeholder-slate-600 focus:border-ow-orange/50
+            className="w-20 bg-ow-dark border border-ow-line rounded-lg px-3 py-2.5
+                       text-ow-fg text-center placeholder-ow-faint focus:border-ow-orange/50
                        focus:outline-none transition-colors"
           />
         </div>
@@ -456,7 +407,7 @@ export default function NewMatchPage() {
       <SectionHeader>PERFORMANCE</SectionHeader>
       <div className="grid grid-cols-3 gap-3">
         <div>
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-1 text-center">
+          <label className="block text-xs text-ow-muted font-display tracking-wider mb-1 text-center">
             ELIMS
           </label>
           <input
@@ -464,13 +415,13 @@ export default function NewMatchPage() {
             value={elims}
             onChange={e => setElims(e.target.value)}
             placeholder="—"
-            className="w-full bg-ow-dark border border-white/10 rounded-lg px-3 py-2.5
-                       text-white text-center placeholder-slate-600 focus:border-ow-orange/50
+            className="w-full bg-ow-dark border border-ow-line rounded-lg px-3 py-2.5
+                       text-ow-fg text-center placeholder-ow-faint focus:border-ow-orange/50
                        focus:outline-none transition-colors"
           />
         </div>
         <div>
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-1 text-center">
+          <label className="block text-xs text-ow-muted font-display tracking-wider mb-1 text-center">
             ASSISTS
           </label>
           <input
@@ -478,13 +429,13 @@ export default function NewMatchPage() {
             value={assists}
             onChange={e => setAssists(e.target.value)}
             placeholder="—"
-            className="w-full bg-ow-dark border border-white/10 rounded-lg px-3 py-2.5
-                       text-white text-center placeholder-slate-600 focus:border-ow-orange/50
+            className="w-full bg-ow-dark border border-ow-line rounded-lg px-3 py-2.5
+                       text-ow-fg text-center placeholder-ow-faint focus:border-ow-orange/50
                        focus:outline-none transition-colors"
           />
         </div>
         <div>
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-1 text-center">
+          <label className="block text-xs text-ow-muted font-display tracking-wider mb-1 text-center">
             DEATHS
           </label>
           <input
@@ -492,8 +443,8 @@ export default function NewMatchPage() {
             value={deaths}
             onChange={e => setDeaths(e.target.value)}
             placeholder="—"
-            className="w-full bg-ow-dark border border-white/10 rounded-lg px-3 py-2.5
-                       text-white text-center placeholder-slate-600 focus:border-ow-orange/50
+            className="w-full bg-ow-dark border border-ow-line rounded-lg px-3 py-2.5
+                       text-ow-fg text-center placeholder-ow-faint focus:border-ow-orange/50
                        focus:outline-none transition-colors"
           />
         </div>
@@ -504,7 +455,7 @@ export default function NewMatchPage() {
 
       <div className="space-y-4">
         <div>
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-2">
+          <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
             MATCH FEEL
           </label>
           <ChipSelect
@@ -520,7 +471,7 @@ export default function NewMatchPage() {
         </div>
 
         <div>
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-2">
+          <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
             YOUR PERFORMANCE
           </label>
           <ChipSelect
@@ -536,31 +487,14 @@ export default function NewMatchPage() {
         </div>
 
         <div>
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-2">
-            NOTABLE EVENTS
-          </label>
-          <MultiChipSelect
-            options={['leaver', 'smurf', 'thrower', 'great_teamwork'] as NotableEvent[]}
-            value={notableEvents}
-            onChange={setNotableEvents}
-            labels={{
-              leaver: 'LEAVER',
-              smurf: 'SMURF',
-              thrower: 'THROWER',
-              great_teamwork: 'GREAT TEAMWORK',
-            }}
-          />
-        </div>
-
-        <div>
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-2">
+          <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
             FUN RATING
           </label>
           <StarRating value={funRating} onChange={setFunRating} />
         </div>
 
         <div>
-          <label className="block text-xs text-slate-400 font-display tracking-wider mb-2">
+          <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
             PERSONAL THOUGHTS
           </label>
           <textarea
@@ -568,8 +502,8 @@ export default function NewMatchPage() {
             onChange={e => setThoughts(e.target.value)}
             placeholder="What happened this match? What could you improve?"
             rows={3}
-            className="w-full bg-ow-dark border border-white/10 rounded-lg px-4 py-2.5
-                       text-white placeholder-slate-600 focus:border-ow-orange/50
+            className="w-full bg-ow-dark border border-ow-line rounded-lg px-4 py-2.5
+                       text-ow-fg placeholder-ow-faint focus:border-ow-orange/50
                        focus:outline-none transition-colors resize-none"
           />
         </div>

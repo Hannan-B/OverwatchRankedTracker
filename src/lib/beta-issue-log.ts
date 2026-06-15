@@ -107,6 +107,63 @@ export async function logMatchSummary(args: {
   })
 }
 
+/** Log a hard date-OCR failure (step 3a). The summary date couldn't be read or
+ *  parsed, so the pipeline fell back to processing time for played_at — which
+ *  drives BOTH season assignment and session boundaries, hence worth logging as
+ *  a background event. `reason` distinguishes the failure mode; `read_value`
+ *  carries whatever raw text (if any) was OCR'd. Logged as a `corrected`-class
+ *  event under the `date` field / `date_ocr_fail` signal so it surfaces in the
+ *  signal-precision + error-rate tables of the issue report. */
+export async function logDateOcrFailure(args: {
+  matchId: string
+  reason: 'missing' | 'unparseable'
+  rawText?: string | null
+  format?: '5v5' | '6v6' | null
+}): Promise<{ error: unknown }> {
+  return logIssueEvent({
+    match_id: args.matchId,
+    event: 'corrected',           // a real failure (not a confirmed-correct)
+    field: 'date',
+    field_detail: `date_ocr_${args.reason}`,
+    signal: 'date_ocr_fail',
+    read_value: args.rawText ?? null,
+    corrected_value: null,        // unknown — fell back to process time
+    format: args.format ?? null,
+  })
+}
+
+/** Log a map-detection miss (step 10). Fires when the phone's upload-time map
+ *  auto-detect missed AND/OR the laptop's summary OCR produced no usable map, so
+ *  the saved match would otherwise carry a null map (and null starting_side).
+ *  `phoneMissed` records whether the phone reported the miss; `ocrValue` carries
+ *  whatever the laptop OCR read (may be empty / unrecognized). When the reviewer
+ *  picks the map in the dropdown, `correctedValue` holds it and `side` the
+ *  attack/defend answer (escort/hybrid only). Logged as a `corrected`-class
+ *  event under the `map` field / `map_detect_fail` signal so it surfaces in the
+ *  signal-precision + error-rate tables, exactly like the date path. */
+export async function logMapDetectMiss(args: {
+  matchId: string
+  phoneMissed: boolean
+  ocrValue?: string | null
+  correctedValue?: string | null
+  side?: 'attack' | 'defense' | null
+  format?: '5v5' | '6v6' | null
+}): Promise<{ error: unknown }> {
+  const detail = args.side
+    ? `map_detect_${args.phoneMissed ? 'phone_miss' : 'ocr_miss'}+side_${args.side}`
+    : `map_detect_${args.phoneMissed ? 'phone_miss' : 'ocr_miss'}`
+  return logIssueEvent({
+    match_id: args.matchId,
+    event: 'corrected',
+    field: 'map',
+    field_detail: detail,
+    signal: 'map_detect_fail',
+    read_value: args.ocrValue ?? null,
+    corrected_value: args.correctedValue ?? null,
+    format: args.format ?? null,
+  })
+}
+
 /** Log a batch that failed to process. The error message is stored in
  *  `read_value` (no new column needed); `field_detail` carries a short reason.
  *  Files for this batch are intentionally LEFT in pending/ for retry, so the

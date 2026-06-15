@@ -4,23 +4,68 @@
 
 @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Exo+2:wght@300;400;500;600;700&display=swap');
 
+/* ============================================================
+   THEME PALETTES (NEXT-STEPS #16)
+   ------------------------------------------------------------
+   ow-* colours are stored as SPACE-SEPARATED RGB CHANNELS so Tailwind's
+   `rgb(var(--ow-*) / <alpha-value>)` tokens (tailwind.config.ts) keep opacity
+   modifiers working. The active theme is the data-theme attribute on <html>,
+   set by the no-FOUC script in layout.tsx, reconciled with user_settings.theme_mode.
+
+   NEW text/border tokens (fg / muted / faint / line) are theme-aware so text and
+   hairline borders flip automatically. Use them on new/edited code:
+     text-ow-fg     primary text       (replaces text-slate-100/200, text-white)
+     text-ow-muted  secondary text     (replaces text-slate-300/400)
+     text-ow-faint  hints / captions   (replaces text-slate-500/600)
+     border-ow-line hairline borders   (replaces border-white/5..20)
+
+   LIGHT is a cool steel-blue wash (per the OW menu reference): blue-grey page,
+   faint blue-grey panels, deepened orange. DARK keeps the navy, panel lifted.
+   ============================================================ */
 :root {
   --font-display: 'Rajdhani', sans-serif;
   --font-body: 'Exo 2', sans-serif;
-  --ow-blue: #1e3a5f;
-  --ow-orange: #f99e1a;
-  --ow-dark: #0a1628;
-  --ow-panel: #132038;
-  --ow-accent: #ff6b35;
-  --ow-victory: #4ade80;
-  --ow-defeat: #f87171;
-  --ow-draw: #fbbf24;
+}
+
+/* DARK (default) */
+:root,
+[data-theme="dark"] {
+  --ow-blue: 30 58 95;
+  --ow-orange: 249 158 26;
+  --ow-dark: 10 22 40;
+  --ow-panel: 24 41 74;
+  --ow-accent: 255 107 53;
+  --ow-victory: 74 222 128;
+  --ow-defeat: 248 113 113;
+  --ow-draw: 251 191 36;
+  --ow-fg: 226 232 240;    /* slate-200 */
+  --ow-muted: 148 163 184; /* slate-400 */
+  --ow-faint: 100 116 139; /* slate-500 */
+  --ow-line: 51 65 85;     /* slate-700 */
+  color-scheme: dark;
+}
+
+/* LIGHT - cool steel-blue */
+[data-theme="light"] {
+  --ow-blue: 88 120 160;
+  --ow-orange: 224 122 0;
+  --ow-dark: 219 227 238;  /* page bg: cool blue-grey */
+  --ow-panel: 238 242 248; /* panels: faint blue-grey, lifts off the page */
+  --ow-accent: 230 90 37;
+  --ow-victory: 22 163 74;
+  --ow-defeat: 220 38 38;
+  --ow-draw: 217 119 6;
+  --ow-fg: 28 39 51;       /* cool dark slate */
+  --ow-muted: 74 90 110;
+  --ow-faint: 107 123 143;
+  --ow-line: 159 176 196;
+  color-scheme: light;
 }
 
 body {
   font-family: var(--font-body);
-  background-color: var(--ow-dark);
-  color: #e2e8f0;
+  background-color: rgb(var(--ow-dark));
+  color: rgb(var(--ow-fg));
   min-height: 100vh;
 }
 
@@ -36,9 +81,10 @@ h1, h2, h3, h4, h5, h6 {
   width: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: var(--ow-dark);
+  background: rgb(var(--ow-dark));
 }
 ::-webkit-scrollbar-thumb {
-  background: var(--ow-blue);
+  background: rgb(var(--ow-blue));
   border-radius: 3px;
 }
+

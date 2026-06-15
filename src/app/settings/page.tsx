@@ -4,6 +4,8 @@ import { useEffect, useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
 import { formatBritishDate } from '@/lib/date-format'
 import AlphaToggle from '@/components/AlphaToggle'
+import LeaverToggle from '@/components/LeaverToggle'
+import ThemeControl from '@/components/ThemeControl'
 
 // ============================================================
 // SETTINGS + SEASON MANAGEMENT (Phase 2)
@@ -158,19 +160,19 @@ export default function SettingsPage() {
   return (
     <div className="space-y-6 max-w-2xl mx-auto">
       <div>
-        <h1 className="font-display text-3xl tracking-[0.12em] text-slate-100 uppercase">Settings</h1>
-        <p className="text-sm text-slate-500 mt-1">Profile, security &amp; seasons</p>
+        <h1 className="font-display text-3xl tracking-[0.12em] text-ow-fg uppercase">Settings</h1>
+        <p className="text-sm text-ow-faint mt-1">Profile, security &amp; seasons</p>
       </div>
 
       {/* ---------- PROFILE ---------- */}
-      <section className="bg-ow-panel rounded-xl p-6 border border-white/5 space-y-4">
-        <h2 className="font-display text-lg tracking-wider text-white uppercase">Profile</h2>
+      <section className="bg-ow-panel rounded-xl p-6 border border-ow-line space-y-4">
+        <h2 className="font-display text-lg tracking-wider text-ow-fg uppercase">Profile</h2>
         <div>
-          <label className="block text-xs font-display tracking-[0.15em] text-slate-400 uppercase mb-2">Gamertag</label>
+          <label className="block text-xs font-display tracking-[0.15em] text-ow-muted uppercase mb-2">Gamertag</label>
           <input type="text" value={gamertag} onChange={e => setGamertag(e.target.value)}
             placeholder="Your in-game name"
-            className="w-full bg-ow-dark border border-white/10 rounded-lg px-4 py-2.5 text-white placeholder-slate-600 focus:border-ow-orange/50 focus:outline-none transition-colors" />
-          <p className="text-xs text-slate-600 mt-1">Used for scoreboard identification during processing.</p>
+            className="w-full bg-ow-dark border border-ow-line rounded-lg px-4 py-2.5 text-ow-fg placeholder-ow-faint focus:border-ow-orange/50 focus:outline-none transition-colors" />
+          <p className="text-xs text-ow-faint mt-1">Used for scoreboard identification during processing.</p>
         </div>
         <button onClick={saveProfile} disabled={savingProfile}
           className="w-full bg-ow-orange hover:bg-ow-accent disabled:bg-slate-700 text-ow-dark font-display font-bold py-2.5 rounded-lg tracking-wider transition-colors text-sm">
@@ -178,39 +180,45 @@ export default function SettingsPage() {
         </button>
       </section>
 
+      {/* ---------- APPEARANCE ---------- */}
+      <section className="bg-ow-panel rounded-xl p-6 border border-ow-line space-y-4">
+        <h2 className="font-display text-lg tracking-wider text-ow-fg uppercase">Appearance</h2>
+        <ThemeControl />
+      </section>
+
       {/* ---------- SECURITY ---------- */}
-      <section className="bg-ow-panel rounded-xl p-6 border border-white/5 space-y-4">
-        <h2 className="font-display text-lg tracking-wider text-white uppercase">Change Password</h2>
+      <section className="bg-ow-panel rounded-xl p-6 border border-ow-line space-y-4">
+        <h2 className="font-display text-lg tracking-wider text-ow-fg uppercase">Change Password</h2>
         <div className="space-y-3">
           <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)}
             placeholder="New password" autoComplete="new-password"
-            className="w-full bg-ow-dark border border-white/10 rounded-lg px-4 py-2.5 text-white placeholder-slate-600 focus:border-ow-orange/50 focus:outline-none transition-colors" />
+            className="w-full bg-ow-dark border border-ow-line rounded-lg px-4 py-2.5 text-ow-fg placeholder-ow-faint focus:border-ow-orange/50 focus:outline-none transition-colors" />
           <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
             placeholder="Confirm new password" autoComplete="new-password"
             onKeyDown={e => e.key === 'Enter' && changePassword()}
-            className="w-full bg-ow-dark border border-white/10 rounded-lg px-4 py-2.5 text-white placeholder-slate-600 focus:border-ow-orange/50 focus:outline-none transition-colors" />
+            className="w-full bg-ow-dark border border-ow-line rounded-lg px-4 py-2.5 text-ow-fg placeholder-ow-faint focus:border-ow-orange/50 focus:outline-none transition-colors" />
         </div>
         {pwMsg && <p className={`text-xs ${pwStatus === 'error' ? 'text-ow-defeat' : 'text-ow-victory'}`}>{pwMsg}</p>}
         <button onClick={changePassword} disabled={pwStatus === 'saving' || !newPassword || !confirmPassword}
-          className="w-full bg-ow-panel border border-white/15 hover:border-ow-orange/40 disabled:opacity-40 text-white font-display font-bold py-2.5 rounded-lg tracking-wider transition-colors text-sm">
+          className="w-full bg-ow-panel border border-ow-line hover:border-ow-orange/40 disabled:opacity-40 text-ow-fg font-display font-bold py-2.5 rounded-lg tracking-wider transition-colors text-sm">
           {pwStatus === 'saving' ? 'UPDATING…' : 'UPDATE PASSWORD'}
         </button>
       </section>
 
       {/* ---------- SEASON MANAGEMENT ---------- */}
-      <section className="bg-ow-panel rounded-xl p-6 border border-white/5 space-y-5">
+      <section className="bg-ow-panel rounded-xl p-6 border border-ow-line space-y-5">
         <div className="flex items-center justify-between">
-          <h2 className="font-display text-lg tracking-wider text-white uppercase">Seasons</h2>
-          <span className="text-xs text-slate-500">{seasons.length} total</span>
+          <h2 className="font-display text-lg tracking-wider text-ow-fg uppercase">Seasons</h2>
+          <span className="text-xs text-ow-faint">{seasons.length} total</span>
         </div>
-        <p className="text-xs text-slate-500 -mt-2">
+        <p className="text-xs text-ow-faint -mt-2">
           Matches auto-assign to a season by their real played date. Ranges can't overlap.
         </p>
 
         {/* existing seasons */}
         <div className="space-y-2">
           {seasons.length === 0 && (
-            <p className="text-sm text-slate-600">No seasons yet — add your first one below.</p>
+            <p className="text-sm text-ow-faint">No seasons yet — add your first one below.</p>
           )}
           {seasons.map(s => {
             const count = seasonCounts[s.id] || 0
@@ -219,20 +227,20 @@ export default function SettingsPage() {
               <div key={s.id} className="bg-ow-dark/60 rounded-lg p-3 flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
-                    <p className="font-display text-white tracking-wider truncate">{s.name}</p>
+                    <p className="font-display text-ow-fg tracking-wider truncate">{s.name}</p>
                     {isCurrent && <span className="text-[10px] bg-ow-orange text-ow-dark font-bold px-1.5 py-0.5 rounded font-display tracking-wider">CURRENT</span>}
                   </div>
-                  <p className="text-xs text-slate-500 mt-0.5">
+                  <p className="text-xs text-ow-faint mt-0.5">
                     {formatBritishDate(s.start_date)} – {formatBritishDate(s.end_date)} · {count} match{count !== 1 ? 'es' : ''}
                   </p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <button onClick={() => startEdit(s)}
-                    className="text-xs font-display tracking-wider text-slate-400 hover:text-ow-orange transition-colors">EDIT</button>
+                    className="text-xs font-display tracking-wider text-ow-muted hover:text-ow-orange transition-colors">EDIT</button>
                   <button onClick={() => deleteSeason(s)}
                     disabled={count > 0}
                     title={count > 0 ? 'Has matches — cannot delete' : 'Delete season'}
-                    className="text-xs font-display tracking-wider text-slate-500 hover:text-ow-defeat disabled:opacity-30 disabled:hover:text-slate-500 transition-colors">DELETE</button>
+                    className="text-xs font-display tracking-wider text-ow-faint hover:text-ow-defeat disabled:opacity-30 disabled:hover:text-ow-faint transition-colors">DELETE</button>
                 </div>
               </div>
             )
@@ -240,23 +248,23 @@ export default function SettingsPage() {
         </div>
 
         {/* create / edit form */}
-        <div className="border-t border-white/5 pt-4 space-y-3">
-          <p className="text-xs font-display tracking-[0.15em] text-slate-400 uppercase">
+        <div className="border-t border-ow-line pt-4 space-y-3">
+          <p className="text-xs font-display tracking-[0.15em] text-ow-muted uppercase">
             {editing ? `Edit: ${editing.name}` : 'Add a season'}
           </p>
           <input type="text" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })}
             placeholder="Season name (e.g. Season 3)"
-            className="w-full bg-ow-dark border border-white/10 rounded-lg px-4 py-2.5 text-white placeholder-slate-600 focus:border-ow-orange/50 focus:outline-none transition-colors" />
+            className="w-full bg-ow-dark border border-ow-line rounded-lg px-4 py-2.5 text-ow-fg placeholder-ow-faint focus:border-ow-orange/50 focus:outline-none transition-colors" />
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="block text-[11px] text-slate-500 font-display tracking-wider uppercase mb-1">Start date</label>
+              <label className="block text-[11px] text-ow-faint font-display tracking-wider uppercase mb-1">Start date</label>
               <input type="date" value={form.start_date} onChange={e => setForm({ ...form, start_date: e.target.value })}
-                className="w-full bg-ow-dark border border-white/10 rounded-lg px-3 py-2.5 text-white focus:border-ow-orange/50 focus:outline-none transition-colors [color-scheme:dark]" />
+                className="w-full bg-ow-dark border border-ow-line rounded-lg px-3 py-2.5 text-ow-fg focus:border-ow-orange/50 focus:outline-none transition-colors [color-scheme:dark]" />
             </div>
             <div>
-              <label className="block text-[11px] text-slate-500 font-display tracking-wider uppercase mb-1">End date</label>
+              <label className="block text-[11px] text-ow-faint font-display tracking-wider uppercase mb-1">End date</label>
               <input type="date" value={form.end_date} onChange={e => setForm({ ...form, end_date: e.target.value })}
-                className="w-full bg-ow-dark border border-white/10 rounded-lg px-3 py-2.5 text-white focus:border-ow-orange/50 focus:outline-none transition-colors [color-scheme:dark]" />
+                className="w-full bg-ow-dark border border-ow-line rounded-lg px-3 py-2.5 text-ow-fg focus:border-ow-orange/50 focus:outline-none transition-colors [color-scheme:dark]" />
             </div>
           </div>
           {seasonErr && <p className="text-xs text-ow-defeat">{seasonErr}</p>}
@@ -267,13 +275,16 @@ export default function SettingsPage() {
             </button>
             {editing && (
               <button onClick={startNew}
-                className="px-5 bg-ow-dark border border-white/10 text-slate-300 hover:text-white font-display font-bold py-2.5 rounded-lg tracking-wider transition-colors text-sm">
+                className="px-5 bg-ow-dark border border-ow-line text-ow-muted hover:text-ow-fg font-display font-bold py-2.5 rounded-lg tracking-wider transition-colors text-sm">
                 CANCEL
               </button>
             )}
           </div>
         </div>
       </section>
+
+      {/* ---------- LEAVER GAME VISIBILITY ---------- */}
+      <LeaverToggle />
 
       {/* ---------- DEV: ALPHA DATA VISIBILITY (localhost only) ---------- */}
       <AlphaToggle />

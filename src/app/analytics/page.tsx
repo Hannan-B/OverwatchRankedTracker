@@ -15,15 +15,14 @@ export default function AnalyticsLandingPage() {
     <div className="space-y-6">
       <AnalyticsHeader
         title="Analytics"
-        subtitle="Curated views plus a generic builder. Pick a surface to explore."
+        subtitle="Every view of your match history. Pick a surface to explore."
       />
       <AnalyticsNav />
 
       <AnalyticsMenu />
 
-      <p className="text-xs text-slate-500">
-        {ANALYTICS_TABS.length} surfaces, grouped above. Curated pages are the
-        designed views; the Builder is the generic laboratory.
+      <p className="text-xs text-ow-faint">
+        {ANALYTICS_TABS.length} surfaces, grouped above.
       </p>
     </div>
   )

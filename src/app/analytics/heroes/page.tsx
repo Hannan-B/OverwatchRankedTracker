@@ -3,7 +3,10 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
+import Select from '@/components/Select'
 import { matchQuery } from '@/lib/alpha'
+import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
+import { defaultSeasonSelection } from '@/lib/season-util'
 import { HEROES, MAPS, GAME_MODE_CONFIG, type GameMode } from '@/data/reference'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 
@@ -91,11 +94,11 @@ const STAT_LABEL: Record<string, string> = {
 const ROLE_LABEL: Record<string, string> = { tank: 'TANK', dps: 'DPS', support: 'SUPPORT' }
 
 const winRateColor = (wr: number | null) =>
-  wr == null ? 'text-slate-400' : wr >= 55 ? 'text-ow-victory' : wr <= 45 ? 'text-ow-defeat' : 'text-ow-draw'
+  wr == null ? 'text-ow-muted' : wr >= 55 ? 'text-ow-victory' : wr <= 45 ? 'text-ow-defeat' : 'text-ow-draw'
 
 const selectCls =
-  'bg-ow-dark border border-white/20 rounded-lg px-3 py-2 text-sm text-slate-100 font-display tracking-wider focus:border-ow-orange focus:outline-none [color-scheme:dark]'
-const labelCls = 'text-[11px] text-slate-400 font-display tracking-wider uppercase'
+  'bg-ow-dark border border-ow-line rounded-lg px-3 py-2 text-sm text-ow-fg font-display tracking-wider focus:border-ow-orange focus:outline-none [color-scheme:dark]'
+const labelCls = 'text-[11px] text-ow-muted font-display tracking-wider uppercase'
 
 function num(v: number | string | null): number | null {
   if (v == null) return null
@@ -118,33 +121,38 @@ export default function AnalyticsHeroesPage() {
   const [mode, setMode] = useState<GameMode | ''>('')
   const [mapName, setMapName] = useState<string>('')
   const [seasons, setSeasons] = useState<SeasonRow[]>([])
-  const [currentSeasonId, setCurrentSeasonId] = useState<number | null>(null)
-  const [scope, setScope] = useState<'current' | 'all' | number>('current')
+  // Season multi-select: [] = All Time; else exactly these season ids.
+  const [seasonSel, setSeasonSel] = useState<number[]>([])
   const [expanded, setExpanded] = useState<string | null>(null)
-  const scopeDefaulted = useRef(false)
+  const seasonDefaulted = useRef(false)
 
   const load = useCallback(async () => {
     setLoading(true)
-    const today = new Date().toISOString().slice(0, 10)
     const { data: seasonData } = await supabase
       .from('seasons').select('id, name, start_date, end_date')
       .order('start_date', { ascending: false })
     const seasonsList = (seasonData as SeasonRow[] | null) || []
     setSeasons(seasonsList)
-    const current = seasonsList.find(s => s.start_date <= today && today <= s.end_date)
-    setCurrentSeasonId(current?.id ?? null)
-    if (!scopeDefaulted.current) {
-      scopeDefaulted.current = true
-      if (current?.id == null) setScope('all')
+    if (!seasonDefaulted.current) {
+      seasonDefaulted.current = true
+      setSeasonSel(defaultSeasonSelection(seasonsList))
     }
 
     const [mIds, { data: mf }, { data: sf }] = await Promise.all([
-      matchQuery('id').order('played_at', { ascending: false }),
+      matchQuery('id, team_leaver, enemy_leaver').order('played_at', { ascending: false }),
       supabase.from('hero_match_facts').select(MATCH_FACT_COLS),
       supabase.from('hero_stat_facts').select(STAT_FACT_COLS),
     ])
-    const ids = (((mIds as unknown) as { data: { id: number }[] | null }).data) || []
-    setVisibleIds(new Set(ids.map(r => r.id)))
+    await loadLeaverPref()
+    // visibleIds gates every fact row (match + stat). The set already honours the
+    // alpha rule (matchQuery). Heroes is a performance surface, so leaver games are
+    // ALSO excluded here unless the Settings switch is on — by dropping their ids
+    // from the visible set, which removes them from both grains at once.
+    const idRows =
+      (((mIds as unknown) as { data: { id: number; team_leaver: boolean | null; enemy_leaver: boolean | null }[] | null }).data) || []
+    const showLeavers = showLeaverGames()
+    const keptIds = idRows.filter(r => showLeavers || (r.team_leaver !== true && r.enemy_leaver !== true))
+    setVisibleIds(new Set(keptIds.map(r => r.id)))
     setMatchFacts((mf as MatchFactRow[] | null) || [])
     setStatFacts((sf as StatFactRow[] | null) || [])
     setLoading(false)
@@ -152,36 +160,35 @@ export default function AnalyticsHeroesPage() {
 
   useEffect(() => { load() }, [load])
 
-  const seasonId = scope === 'current' ? currentSeasonId : scope === 'all' ? null : scope
+  // Season predicate: [] = All Time (no filter); else the row's season must be
+  // one of the selected ids (null season only shows under All Time).
+  const seasonOk = useCallback((sid: number | null) => {
+    if (seasonSel.length === 0) return true
+    return sid != null && seasonSel.includes(sid)
+  }, [seasonSel])
 
-  // Shared row filter: alpha-excluded, format, season scope, mode, map.
+  // Shared row filter: alpha-excluded, format, season, mode, map.
   const matchRowsInScope = useMemo(() => {
     return matchFacts.filter(r => {
       if (!visibleIds.has(r.match_id)) return false
       if (r.match_format !== format) return false
-      if (scope !== 'all') {
-        if (seasonId == null) return false
-        if (r.season_id !== seasonId) return false
-      }
+      if (!seasonOk(r.season_id)) return false
       if (mode && r.game_mode !== mode) return false
       if (mapName && r.map !== mapName) return false
       return true
     })
-  }, [matchFacts, visibleIds, format, scope, seasonId, mode, mapName])
+  }, [matchFacts, visibleIds, format, seasonOk, mode, mapName])
 
   const statRowsInScope = useMemo(() => {
     return statFacts.filter(r => {
       if (!visibleIds.has(r.match_id)) return false
       if (r.match_format !== format) return false
-      if (scope !== 'all') {
-        if (seasonId == null) return false
-        if (r.season_id !== seasonId) return false
-      }
+      if (!seasonOk(r.season_id)) return false
       if (mode && r.game_mode !== mode) return false
       if (mapName && r.map !== mapName) return false
       return true
     })
-  }, [statFacts, visibleIds, format, scope, seasonId, mode, mapName])
+  }, [statFacts, visibleIds, format, seasonOk, mode, mapName])
 
   // ---- aggregate per hero (games-weighted, one match counted once) ----
   interface HeroAgg {
@@ -268,7 +275,7 @@ export default function AnalyticsHeroesPage() {
     <button key={f} onClick={() => { setFormat(f); setExpanded(null) }}
       className={`px-5 py-1.5 rounded-lg text-sm font-display tracking-wider transition-colors
         ${format === f ? 'bg-ow-orange text-ow-dark font-bold'
-                       : 'bg-ow-panel text-slate-400 hover:text-white border border-white/10'}`}>
+                       : 'bg-ow-panel text-ow-muted hover:text-ow-fg border border-ow-line'}`}>
       {f.toUpperCase()}
     </button>
   )
@@ -287,30 +294,55 @@ export default function AnalyticsHeroesPage() {
           <span className={labelCls}>Format</span>
           <div className="flex gap-2">{(['5v5', '6v6'] as Format[]).map(fmtToggle)}</div>
         </div>
-        <label className="flex flex-col gap-1">
+        <div className="flex flex-col gap-1">
           <span className={labelCls}>Season</span>
-          <select className={selectCls} value={String(scope)}
-            onChange={e => { const v = e.target.value; setScope(v === 'current' || v === 'all' ? v : Number(v)); setExpanded(null) }}>
-            {currentSeasonId && <option value="current">Current</option>}
-            {seasons.filter(s => s.id !== currentSeasonId).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-            <option value="all">All Time</option>
-          </select>
-        </label>
+          <div className="flex flex-wrap items-center gap-2 bg-ow-dark border border-ow-line rounded-lg px-3 py-2 min-h-[2.5rem]">
+            <label className="flex items-center gap-1.5 cursor-pointer select-none">
+              <input type="checkbox" className="accent-ow-orange w-3.5 h-3.5"
+                checked={seasonSel.length === 0}
+                onChange={() => { setSeasonSel([]); setExpanded(null) }} />
+              <span className={`text-sm font-display tracking-wider ${seasonSel.length === 0 ? 'text-ow-orange' : 'text-ow-muted'}`}>All Time</span>
+            </label>
+            {seasons.map(s => {
+              const checked = seasonSel.includes(s.id)
+              return (
+                <label key={s.id} className="flex items-center gap-1.5 cursor-pointer select-none">
+                  <input type="checkbox" className="accent-ow-orange w-3.5 h-3.5"
+                    checked={checked}
+                    onChange={() => {
+                      setSeasonSel(sel => sel.includes(s.id) ? sel.filter(x => x !== s.id) : [...sel, s.id])
+                      setExpanded(null)
+                    }} />
+                  <span className={`text-sm font-display tracking-wider ${checked ? 'text-ow-fg' : 'text-ow-muted'}`}>{s.name}</span>
+                </label>
+              )
+            })}
+          </div>
+        </div>
         <label className="flex flex-col gap-1">
           <span className={labelCls}>Game Mode</span>
-          <select className={selectCls} value={mode}
-            onChange={e => { const m = e.target.value as GameMode | ''; setMode(m); setMapName(''); setExpanded(null) }}>
-            <option value="">All modes</option>
-            {GAME_MODES.map(m => <option key={m} value={m}>{m}</option>)}
-          </select>
+          <Select<GameMode | ''>
+            className={selectCls}
+            value={mode}
+            onChange={m => { setMode(m); setMapName(''); setExpanded(null) }}
+            options={[
+              { value: '', label: 'All modes' },
+              ...GAME_MODES.map(m => ({ value: m, label: m })),
+            ]}
+          />
         </label>
         {mode && (
           <label className="flex flex-col gap-1">
             <span className={labelCls}>Map</span>
-            <select className={selectCls} value={mapName} onChange={e => { setMapName(e.target.value); setExpanded(null) }}>
-              <option value="">All {mode} maps</option>
-              {mapsForMode(mode).map(m => <option key={m} value={m}>{m}</option>)}
-            </select>
+            <Select<string>
+              className={selectCls}
+              value={mapName}
+              onChange={m => { setMapName(m); setExpanded(null) }}
+              options={[
+                { value: '', label: `All ${mode} maps` },
+                ...mapsForMode(mode).map(m => ({ value: m, label: m })),
+              ]}
+            />
           </label>
         )}
       </div>
@@ -320,23 +352,23 @@ export default function AnalyticsHeroesPage() {
           <button key={role} onClick={() => { setRoleTab(role); setExpanded(null) }}
             className={`px-4 py-1.5 rounded-lg text-sm font-display tracking-wider transition-colors
               ${roleTab === role ? 'bg-ow-orange text-ow-dark font-bold'
-                                 : 'bg-ow-panel text-slate-400 hover:text-white border border-white/10'}`}>
+                                 : 'bg-ow-panel text-ow-muted hover:text-ow-fg border border-ow-line'}`}>
             {role.toUpperCase()}
           </button>
         ))}
       </div>
 
-      <p className="text-sm text-slate-400">{heroes.length} heroes · {format.toUpperCase()} · min {MIN_GAMES} games</p>
+      <p className="text-sm text-ow-muted">{heroes.length} heroes · {format.toUpperCase()} · min {MIN_GAMES} games</p>
 
       {loading ? (
-        <div className="text-center py-12 text-slate-300 font-display tracking-wider">LOADING…</div>
+        <div className="text-center py-12 text-ow-muted font-display tracking-wider">LOADING…</div>
       ) : heroes.length === 0 ? (
-        <div className="text-center py-16 text-slate-300">
+        <div className="text-center py-16 text-ow-muted">
           <p className="font-display text-lg tracking-wider">No heroes yet</p>
-          <p className="text-sm mt-1 text-slate-400">
-            {scope === 'current' && !currentSeasonId
-              ? 'No current season set. Add one in Settings → Seasons, or pick All Time.'
-              : `No heroes with ${MIN_GAMES}+ games in ${format.toUpperCase()} for this scope/filters.`}
+          <p className="text-sm mt-1 text-ow-muted">
+            {seasonSel.length > 0 && seasons.length === 0
+              ? 'No seasons set up yet. Add one in Settings → Seasons, or pick All Time.'
+              : `No heroes with ${MIN_GAMES}+ games in ${format.toUpperCase()} for these filters.`}
           </p>
         </div>
       ) : (
@@ -351,7 +383,7 @@ export default function AnalyticsHeroesPage() {
 
             return (
               <div key={h.hero_name}
-                className="bg-ow-panel rounded-lg border border-white/10 hover:border-ow-orange/30 transition-colors overflow-hidden">
+                className="bg-ow-panel rounded-lg border border-ow-line hover:border-ow-orange/30 transition-colors overflow-hidden">
                 <button onClick={() => setExpanded(isOpen ? null : h.hero_name)} className="w-full text-left p-4">
                   <div className="flex items-center gap-3">
                     {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -359,8 +391,8 @@ export default function AnalyticsHeroesPage() {
                       className="w-12 h-12 rounded object-cover bg-ow-dark shrink-0"
                       onError={e => { (e.currentTarget as HTMLImageElement).style.visibility = 'hidden' }} />
                     <div className="min-w-0 flex-1">
-                      <h3 className="font-display text-white text-lg truncate">{h.hero_name}</h3>
-                      <p className="text-[11px] text-slate-400 font-display tracking-wide uppercase">
+                      <h3 className="font-display text-ow-fg text-lg truncate">{h.hero_name}</h3>
+                      <p className="text-[11px] text-ow-muted font-display tracking-wide uppercase">
                         {role ? ROLE_LABEL[role] : ''} · {h.games} games
                       </p>
                     </div>
@@ -370,25 +402,25 @@ export default function AnalyticsHeroesPage() {
                   </div>
 
                   <div className="grid grid-cols-3 gap-2 text-center mt-3">
-                    <div><p className="text-base font-display text-white">{h.games}</p><p className="text-[10px] text-slate-500 tracking-wider">PLAYED</p></div>
-                    <div><p className="text-base font-display text-ow-victory">{h.wins}</p><p className="text-[10px] text-slate-500 tracking-wider">WINS</p></div>
-                    <div><p className="text-base font-display text-ow-defeat">{h.losses}</p><p className="text-[10px] text-slate-500 tracking-wider">LOSSES</p></div>
+                    <div><p className="text-base font-display text-ow-fg">{h.games}</p><p className="text-[10px] text-ow-faint tracking-wider">PLAYED</p></div>
+                    <div><p className="text-base font-display text-ow-victory">{h.wins}</p><p className="text-[10px] text-ow-faint tracking-wider">WINS</p></div>
+                    <div><p className="text-base font-display text-ow-defeat">{h.losses}</p><p className="text-[10px] text-ow-faint tracking-wider">LOSSES</p></div>
                   </div>
                 </button>
 
                 {isOpen && (
-                  <div className="px-4 pb-4 pt-1 border-t border-white/10 space-y-3">
+                  <div className="px-4 pb-4 pt-1 border-t border-ow-line space-y-3">
                     {roleStats.length > 0 && (
                       <div className="space-y-1.5">
                         {roleStats.map(sc => {
                           const v = bd?.get(sc)
                           return (
                             <div key={sc} className="flex items-center justify-between text-sm">
-                              <span className="text-slate-300 font-display tracking-wide">{STAT_LABEL[sc] || sc}</span>
-                              <span className="text-white font-display">
+                              <span className="text-ow-muted font-display tracking-wide">{STAT_LABEL[sc] || sc}</span>
+                              <span className="text-ow-fg font-display">
                                 {v?.perGame != null ? v.perGame.toFixed(1) : '—'}
-                                <span className="text-slate-500 text-xs"> /game</span>
-                                {v?.per10 != null && <span className="text-slate-400 text-xs ml-2">{v.per10.toFixed(1)}/10min</span>}
+                                <span className="text-ow-faint text-xs"> /game</span>
+                                {v?.per10 != null && <span className="text-ow-muted text-xs ml-2">{v.per10.toFixed(1)}/10min</span>}
                               </span>
                             </div>
                           )
@@ -399,27 +431,27 @@ export default function AnalyticsHeroesPage() {
                     {showStats ? (
                       <div className="space-y-1.5">
                         <div className="flex items-center justify-between text-sm">
-                          <span className="text-slate-300 font-display tracking-wide">Avg E / A / D</span>
-                          <span className="text-white font-display">
+                          <span className="text-ow-muted font-display tracking-wide">Avg E / A / D</span>
+                          <span className="text-ow-fg font-display">
                             {h.avg_elims?.toFixed(1) ?? '—'} / {h.avg_assists?.toFixed(1) ?? '—'} / {h.avg_deaths?.toFixed(1) ?? '—'}
                           </span>
                         </div>
                         <div className="flex items-center justify-between text-sm">
-                          <span className="text-slate-300 font-display tracking-wide">Damage % (of team)</span>
-                          <span className="text-white font-display">{h.avg_damage_pct != null ? `${Math.round(h.avg_damage_pct * 10) / 10}%` : '—'}</span>
+                          <span className="text-ow-muted font-display tracking-wide">Damage % (of team)</span>
+                          <span className="text-ow-fg font-display">{h.avg_damage_pct != null ? `${Math.round(h.avg_damage_pct * 10) / 10}%` : '—'}</span>
                         </div>
                         <div className="flex items-center justify-between text-sm">
-                          <span className="text-slate-300 font-display tracking-wide">Healing % (vs enemy dmg)</span>
-                          <span className="text-white font-display">{h.avg_healing_pct != null ? `${Math.round(h.avg_healing_pct * 10) / 10}%` : '—'}</span>
+                          <span className="text-ow-muted font-display tracking-wide">Healing % (vs enemy dmg)</span>
+                          <span className="text-ow-fg font-display">{h.avg_healing_pct != null ? `${Math.round(h.avg_healing_pct * 10) / 10}%` : '—'}</span>
                         </div>
                         <div className="flex items-center justify-between text-sm">
-                          <span className="text-slate-300 font-display tracking-wide">Mitigation % (vs enemy dmg)</span>
-                          <span className="text-white font-display">{h.avg_mitigation_pct != null ? `${Math.round(h.avg_mitigation_pct * 10) / 10}%` : '—'}</span>
+                          <span className="text-ow-muted font-display tracking-wide">Mitigation % (vs enemy dmg)</span>
+                          <span className="text-ow-fg font-display">{h.avg_mitigation_pct != null ? `${Math.round(h.avg_mitigation_pct * 10) / 10}%` : '—'}</span>
                         </div>
-                        <p className="text-[10px] text-slate-500 pt-1">From {shg} single-hero games (≥{SINGLE_HERO_PCT}% played).</p>
+                        <p className="text-[10px] text-ow-faint pt-1">From {shg} single-hero games (≥{SINGLE_HERO_PCT}% played).</p>
                       </div>
                     ) : (
-                      <p className="text-[11px] text-slate-500">
+                      <p className="text-[11px] text-ow-faint">
                         Damage/healing/mitigation and avg E/A/D need more than {MIN_PCT_GAMES} single-hero games
                         (≥{SINGLE_HERO_PCT}% played). This hero has {shg}.
                       </p>

@@ -21,7 +21,7 @@
 // per-match timings stay clean for the 6b ~2-min validation.
 // ============================================================
 
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import {
   processMatchPhotos,
   classifyPageType,
@@ -31,6 +31,15 @@ import {
   type PageType,
   type ClassifiedPhoto,
 } from '@/lib/image-processor'
+import {
+  computeMatchReadiness,
+  generateHeroRoleRefSql,
+  generateNormaliseClausesForHero,
+  type HeroReadiness,
+  type MatchReadiness,
+} from '@/lib/new-content-readiness'
+import { SCOREBOARD_ROLE_HERO_NAMES } from '@/lib/scoreboard-extractor'
+import { findMapName } from '@/lib/ocr-extractor'
 
 // ============================================================
 // CONSOLE CAPTURE
@@ -481,6 +490,28 @@ interface MatchTestResult {
   error: string | null
 }
 
+/** Blob URLs a processed match keeps for on-screen display (summary, each hero
+ *  breakdown, scoreboard). These must NOT be revoked until the result card is
+ *  removed, or the <img> tags fail with "WebKitBlobResource error 1". */
+function displayedImageUrls(res: ProcessedMatch | null): string[] {
+  if (!res) return []
+  const urls: string[] = []
+  if (res.summaryImageUrl) urls.push(res.summaryImageUrl)
+  for (const bd of res.heroBreakdowns) if (bd.imageUrl) urls.push(bd.imageUrl)
+  if (res.scoreboard?.imageUrl) urls.push(res.scoreboard.imageUrl)
+  return urls
+}
+
+/** Revoke the displayed blob URLs across a set of results (called when results
+ *  are cleared, e.g. starting a new test), so the kept screenshots don't leak. */
+function revokeResultImageUrls(results: MatchTestResult[]): void {
+  for (const r of results) {
+    for (const u of displayedImageUrls(r.result)) {
+      try { URL.revokeObjectURL(u) } catch { /* already revoked */ }
+    }
+  }
+}
+
 // ============================================================
 // CONFIDENCE HELPERS (shared by UI + report)
 // ============================================================
@@ -714,16 +745,251 @@ function ConfBadge({ score, margin }: { score: number; margin?: number | null })
 // UI — RESULT CARD
 // ============================================================
 
+// ============================================================
+// ENLARGEABLE SOURCE IMAGE  (click thumbnail → fit-to-screen overlay)
+// Mirrors the /process ConfirmationCard lightbox behaviour: click to enlarge,
+// close on backdrop / Escape / X, background scroll locked, click-image-to-keep.
+// ============================================================
+
+function EnlargeableImage({ src, label }: { src: string; label: string }) {
+  const [zoomed, setZoomed] = useState(false)
+
+  useEffect(() => {
+    if (!zoomed) return
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setZoomed(false)
+    }
+    document.addEventListener('keydown', onKey)
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      document.body.style.overflow = prev
+    }
+  }, [zoomed])
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => setZoomed(true)}
+        aria-label={`Enlarge ${label}`}
+        title="Click to enlarge"
+        className="relative block w-full rounded overflow-hidden bg-ow-dark border border-ow-line cursor-zoom-in group"
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={src} alt={label} className="w-full object-contain max-h-64" />
+        <span className="absolute bottom-1 right-1 text-[10px] font-display tracking-wider px-1.5 py-0.5 rounded bg-black/60 text-slate-200 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+          CLICK TO ENLARGE
+        </span>
+      </button>
+      {zoomed && (
+        <div
+          onClick={() => setZoomed(false)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 sm:p-8"
+          role="dialog"
+          aria-modal="true"
+        >
+          <button
+            onClick={() => setZoomed(false)}
+            aria-label="Close enlarged image"
+            className="absolute top-4 right-4 w-10 h-10 flex items-center justify-center rounded-full bg-ow-panel/80 hover:bg-ow-panel text-ow-fg border border-ow-line text-xl leading-none transition-colors"
+          >
+            {'\u2715'}
+          </button>
+          <div onClick={(e) => e.stopPropagation()} className="relative inline-block max-w-full max-h-full">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={src} alt={`${label} enlarged`} className="block max-w-full max-h-[88vh] object-contain rounded" />
+          </div>
+        </div>
+      )}
+    </>
+  )
+}
+
+// ============================================================
+// NEW-CONTENT READINESS PANEL
+// Shows whether every hero/map in this match is fully wired up; for anything
+// new, lists exactly what's missing + generates the Supabase SQL to paste.
+// ============================================================
+
+function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        void navigator.clipboard?.writeText(text).then(
+          () => { setCopied(true); setTimeout(() => setCopied(false), 1500) },
+          () => {},
+        )
+      }}
+      className="text-[10px] font-display tracking-wider px-2 py-1 rounded bg-ow-dark border border-ow-line text-ow-muted hover:border-ow-orange/40 transition-colors"
+    >
+      {copied ? '\u2713 COPIED' : label}
+    </button>
+  )
+}
+
+function Check({ ok }: { ok: boolean }) {
+  return ok
+    ? <span className="text-ow-victory">{'\u2713'}</span>
+    : <span className="text-ow-defeat font-bold">{'\u2717'}</span>
+}
+
+function HeroReadinessRow({ h }: { h: HeroReadiness }) {
+  const fmtColor: Record<string, string> = {
+    percent: 'text-ow-orange',
+    time: 'text-blue-300',
+    number: 'text-ow-muted',
+  }
+  const normaliseClauses = h.unknownStatNames.length > 0
+    ? generateNormaliseClausesForHero(h)
+    : []
+  return (
+    <div className="bg-ow-dark rounded border border-ow-line p-3 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm font-display font-bold text-ow-fg">{h.heroName}</span>
+        <span className="text-[10px] text-ow-faint uppercase tracking-wider">
+          seen on {h.seenOn.join(' + ')}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 text-xs">
+        <span className="flex items-center gap-1.5"><Check ok={h.inHeroes} /> <span className="text-ow-muted">HEROES list</span></span>
+        <span className="flex items-center gap-1.5"><Check ok={h.inScoreboardRoleMap} /> <span className="text-ow-muted">Scoreboard role</span></span>
+        <span className="flex items-center gap-1.5"><Check ok={h.inBreakdownOrder} /> <span className="text-ow-muted">Breakdown order</span></span>
+        <span className="flex items-center gap-1.5"><Check ok={h.inCatalog} /> <span className="text-ow-muted">Stat catalog</span></span>
+      </div>
+
+      {/* Resolved stat formats */}
+      {h.statResolutions.length > 0 && (
+        <div className="pt-1">
+          <p className="text-[10px] text-ow-faint uppercase tracking-wider mb-1">Breakdown stats (resolved format)</p>
+          <div className="flex flex-wrap gap-1.5">
+            {h.statResolutions.map((s) => (
+              <span key={s.raw} className="text-[11px] bg-ow-panel rounded px-2 py-0.5 border border-ow-line">
+                <span className="text-ow-fg">{s.canonical}</span>{' '}
+                <span className={fmtColor[s.format] ?? 'text-ow-muted'}>{s.format}</span>
+                {!s.known && <span className="text-ow-defeat ml-1" title="Not recognised — needs registering">{'\u26a0'}</span>}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Generated SQL for a hero missing its DB role */}
+      {!h.inHeroes && (
+        <p className="text-[11px] text-ow-defeat/90">
+          Add to <code className="text-ow-orange">HEROES</code> in reference.ts first (step 1) — then run the role SQL below.
+        </p>
+      )}
+      {h.unknownStatNames.length > 0 && (
+        <div className="pt-1 space-y-1">
+          <div className="flex items-center justify-between">
+            <p className="text-[10px] text-ow-faint uppercase tracking-wider">
+              New stat names — also add to <code className="text-ow-orange">hero_stats_normalised</code> (SQL)
+            </p>
+            <CopyButton text={normaliseClauses.join('\n')} label="COPY WHEN CLAUSES" />
+          </div>
+          <pre className="text-[10px] bg-ow-panel border border-ow-line rounded p-2 overflow-x-auto text-ow-muted whitespace-pre">{normaliseClauses.join('\n')}</pre>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ReadinessPanel({ readiness }: { readiness: MatchReadiness }) {
+  const { allRecognised, newHeroes, newMaps, heroes, maps } = readiness
+  // Only show the per-hero detail for heroes that need attention; known heroes
+  // are summarised. This keeps a normal match (all known) quiet.
+  const heroesToShow = newHeroes.length > 0 ? newHeroes : []
+
+  return (
+    <div className={`rounded-lg border p-4 space-y-3 ${
+      allRecognised ? 'bg-ow-victory/5 border-ow-victory/30' : 'bg-ow-orange/5 border-ow-orange/40'
+    }`}>
+      <div className="flex items-center gap-2">
+        <span className="text-lg leading-none">{allRecognised ? '\u2713' : '\u26a0'}</span>
+        <p className={`text-sm font-display tracking-wider font-bold ${
+          allRecognised ? 'text-ow-victory' : 'text-ow-orange'
+        }`}>
+          {allRecognised ? 'ALL HEROES & MAPS RECOGNISED' : 'NEW CONTENT DETECTED — SETUP NEEDED'}
+        </p>
+      </div>
+
+      {!allRecognised && (
+        <p className="text-xs text-ow-muted">
+          {heroes.length} hero{heroes.length !== 1 ? 'es' : ''}, {maps.length} map{maps.length !== 1 ? 's' : ''} seen ·{' '}
+          {newHeroes.length} hero{newHeroes.length !== 1 ? 'es' : ''} and {newMaps.length} map{newMaps.length !== 1 ? 's' : ''} need attention.
+        </p>
+      )}
+
+      {/* New / incomplete heroes */}
+      {heroesToShow.length > 0 && (
+        <div className="space-y-2">
+          {heroesToShow.map((h) => <HeroReadinessRow key={h.heroName} h={h} />)}
+          <div className="flex items-center justify-between bg-ow-dark rounded border border-ow-line p-2">
+            <span className="text-[11px] text-ow-muted">
+              Run this once in Supabase so new heroes have a role in Matchups (<code className="text-ow-orange">hero_role_ref</code>):
+            </span>
+            <CopyButton text={generateHeroRoleRefSql()} label="COPY hero_role_ref SQL" />
+          </div>
+        </div>
+      )}
+
+      {/* New maps */}
+      {newMaps.length > 0 && (
+        <div className="space-y-1">
+          {newMaps.map((m) => (
+            <div key={m.mapName} className="bg-ow-dark rounded border border-ow-line p-2 text-xs flex items-center gap-3">
+              <span className="font-display font-bold text-ow-fg">{m.mapName}</span>
+              <span className="flex items-center gap-1.5"><Check ok={m.inMaps} /> <span className="text-ow-muted">MAPS list</span></span>
+              {m.detectKeywordKnown !== null && (
+                <span className="flex items-center gap-1.5"><Check ok={m.detectKeywordKnown} /> <span className="text-ow-muted">Detect keyword</span></span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ResultCard({ r }: { r: MatchTestResult }) {
   const [showLog, setShowLog] = useState(false)
   const res = r.result
 
+  // New-content readiness: cross-reference every hero/map this match contains
+  // against the code + DB registration points. Memoised on the result.
+  const readiness = useMemo<MatchReadiness | null>(() => {
+    if (!res) return null
+    const summaryHeroNames = res.heroes.map((h) => h.name)
+    const scoreboardHeroNames = (res.scoreboard?.stats ?? [])
+      .map((s) => s.heroName)
+      .filter((n): n is string => !!n)
+    const detectableMapNames = res.mapName && findMapName(res.mapName.toUpperCase()) === res.mapName
+      ? [res.mapName]
+      : []
+    return computeMatchReadiness(
+      {
+        mapName: res.mapName,
+        summaryHeroNames,
+        scoreboardHeroNames,
+        heroBreakdowns: res.heroBreakdowns.map((b) => ({
+          heroName: b.heroName,
+          stats: b.stats.map((s) => ({ statName: s.statName, statValue: s.statValue })),
+        })),
+      },
+      { scoreboardRoleNames: SCOREBOARD_ROLE_HERO_NAMES, detectableMapNames },
+    )
+  }, [res])
+
   return (
-    <div className="bg-ow-panel rounded-lg border border-white/5 overflow-hidden">
+    <div className="bg-ow-panel rounded-lg border border-ow-line overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-5 py-4 border-b border-white/5">
+      <div className="flex items-center justify-between px-5 py-4 border-b border-ow-line">
         <div className="flex items-center gap-3">
-          <span className="text-white font-display font-bold">{r.key}</span>
+          <span className="text-ow-fg font-display font-bold">{r.key}</span>
           {res?.matchFormat && (
             <span className="text-[10px] font-display font-bold px-1.5 py-0.5 rounded bg-ow-orange/10 text-ow-orange">
               {res.matchFormat.toUpperCase()}
@@ -735,7 +1001,7 @@ function ResultCard({ r }: { r: MatchTestResult }) {
             </span>
           )}
         </div>
-        <span className="text-xs text-slate-500 font-display">
+        <span className="text-xs text-ow-faint font-display">
           {(r.processingMs / 1000).toFixed(1)}s · {r.filenames.length} files
         </span>
       </div>
@@ -749,30 +1015,30 @@ function ResultCard({ r }: { r: MatchTestResult }) {
           {/* Match summary strip */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center">
             <div>
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider">Map</p>
-              <p className="text-white font-display text-sm">{res.mapName || '—'}</p>
+              <p className="text-[10px] text-ow-faint uppercase tracking-wider">Map</p>
+              <p className="text-ow-fg font-display text-sm">{res.mapName || '—'}</p>
             </div>
             <div>
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider">Result</p>
+              <p className="text-[10px] text-ow-faint uppercase tracking-wider">Result</p>
               <p
                 className={`font-display font-bold text-sm ${
                   res.result === 'victory'
                     ? 'text-ow-victory'
                     : res.result === 'defeat'
                       ? 'text-ow-defeat'
-                      : 'text-slate-300'
+                      : 'text-ow-muted'
                 }`}
               >
                 {res.result?.toUpperCase() || '—'}
               </p>
             </div>
             <div>
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider">Score</p>
-              <p className="text-white font-display text-sm">{res.score || '—'}</p>
+              <p className="text-[10px] text-ow-faint uppercase tracking-wider">Score</p>
+              <p className="text-ow-fg font-display text-sm">{res.score || '—'}</p>
             </div>
             <div>
-              <p className="text-[10px] text-slate-500 uppercase tracking-wider">E / A / D</p>
-              <p className="text-white font-display text-sm">
+              <p className="text-[10px] text-ow-faint uppercase tracking-wider">E / A / D</p>
+              <p className="text-ow-fg font-display text-sm">
                 {res.eliminations ?? '—'} / {res.assists ?? '—'} / {res.deaths ?? '—'}
               </p>
             </div>
@@ -782,12 +1048,12 @@ function ResultCard({ r }: { r: MatchTestResult }) {
             <div className="flex gap-4 text-xs font-display">
               {res.allyComp && (
                 <span className="text-blue-400">
-                  Ally <span className="text-white font-bold">{res.allyComp}</span>
+                  Ally <span className="text-ow-fg font-bold">{res.allyComp}</span>
                 </span>
               )}
               {res.enemyComp && (
                 <span className="text-red-400">
-                  Enemy <span className="text-white font-bold">{res.enemyComp}</span>
+                  Enemy <span className="text-ow-fg font-bold">{res.enemyComp}</span>
                 </span>
               )}
               {res.correctedRole && (
@@ -798,19 +1064,32 @@ function ResultCard({ r }: { r: MatchTestResult }) {
             </div>
           )}
 
+          {/* New-content readiness (heroes / maps wired up?) */}
+          {readiness && <ReadinessPanel readiness={readiness} />}
+
+          {/* Summary source screenshot (click to enlarge) */}
+          {res.summaryImageUrl && (
+            <div>
+              <p className="text-[10px] text-ow-muted font-display tracking-wider uppercase mb-2">
+                Summary Screenshot
+              </p>
+              <EnlargeableImage src={res.summaryImageUrl} label="summary screenshot" />
+            </div>
+          )}
+
           {/* Summary portrait confidence */}
           {r.confidence.summary.length > 0 && (
             <div>
-              <p className="text-[10px] text-slate-400 font-display tracking-wider uppercase mb-2">
+              <p className="text-[10px] text-ow-muted font-display tracking-wider uppercase mb-2">
                 Summary Portraits
               </p>
               <div className="flex flex-wrap gap-2">
                 {r.confidence.summary.map((s) => (
                   <span
                     key={s.slot}
-                    className="bg-ow-dark rounded px-2.5 py-1 text-xs border border-white/5"
+                    className="bg-ow-dark rounded px-2.5 py-1 text-xs border border-ow-line"
                   >
-                    <span className="text-slate-300">{s.hero}</span>{' '}
+                    <span className="text-ow-muted">{s.hero}</span>{' '}
                     <ConfBadge score={s.score} />
                   </span>
                 ))}
@@ -821,7 +1100,7 @@ function ResultCard({ r }: { r: MatchTestResult }) {
           {/* Breakdown portrait confidence */}
           {r.confidence.breakdown.length > 0 && (
             <div>
-              <p className="text-[10px] text-slate-400 font-display tracking-wider uppercase mb-2">
+              <p className="text-[10px] text-ow-muted font-display tracking-wider uppercase mb-2">
                 Hero Breakdown Portraits
               </p>
               <div className="flex flex-wrap gap-2">
@@ -830,12 +1109,12 @@ function ResultCard({ r }: { r: MatchTestResult }) {
                   return (
                     <span
                       key={b.hero}
-                      className="bg-ow-dark rounded px-2.5 py-1 text-xs border border-white/5"
+                      className="bg-ow-dark rounded px-2.5 py-1 text-xs border border-ow-line"
                     >
-                      <span className="text-slate-300">{b.hero}</span>{' '}
+                      <span className="text-ow-muted">{b.hero}</span>{' '}
                       <ConfBadge score={b.score} />
                       {bd && (
-                        <span className="text-slate-500 ml-1">
+                        <span className="text-ow-faint ml-1">
                           {bd.foundStatCount}/{bd.expectedStatCount}
                         </span>
                       )}
@@ -846,16 +1125,74 @@ function ResultCard({ r }: { r: MatchTestResult }) {
             </div>
           )}
 
+          {/* Hero breakdown — screenshot beside extracted stats (per hero) */}
+          {res.heroBreakdowns.length > 0 && (
+            <div className="space-y-3">
+              <p className="text-[10px] text-ow-muted font-display tracking-wider uppercase">
+                Hero Breakdown — Screenshot vs Data
+              </p>
+              {res.heroBreakdowns.map((bd) => {
+                const pct = bd.percentPlayed != null ? `${bd.percentPlayed}%` : '—'
+                const pt = bd.playTimeSeconds != null
+                  ? `${Math.floor(bd.playTimeSeconds / 60)}:${String(bd.playTimeSeconds % 60).padStart(2, '0')}`
+                  : '—'
+                return (
+                  <div key={bd.heroName} className="grid md:grid-cols-2 gap-3 bg-ow-dark rounded border border-ow-line p-3">
+                    <div>
+                      <p className="text-sm font-display font-bold text-ow-fg mb-1">{bd.heroName}</p>
+                      <p className="text-[11px] text-ow-faint mb-2">
+                        {pct} played · {pt} · {bd.foundStatCount}/{bd.expectedStatCount} stats
+                      </p>
+                      {bd.imageUrl
+                        ? <EnlargeableImage src={bd.imageUrl} label={`${bd.heroName} breakdown screenshot`} />
+                        : <p className="text-[11px] text-ow-faint">(no source image)</p>}
+                    </div>
+                    <div>
+                      {bd.stats.length === 0 ? (
+                        <p className="text-[11px] text-ow-faint">No stats extracted.</p>
+                      ) : (
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-ow-faint text-[10px] uppercase tracking-wider border-b border-ow-line">
+                              <th className="text-left py-1 px-1.5">Stat</th>
+                              <th className="text-right py-1 px-1.5">Value</th>
+                              <th className="text-right py-1 px-1.5">/10min</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {bd.stats.map((s) => {
+                              const unknown = s.statName.startsWith('UNKNOWN')
+                              return (
+                                <tr key={s.statName} className="border-b border-ow-line/60">
+                                  <td className="py-1 px-1.5 text-ow-fg">
+                                    {s.statName}
+                                    {unknown && <span className="text-ow-defeat ml-1">{'\u26a0'}</span>}
+                                  </td>
+                                  <td className="py-1 px-1.5 text-right font-mono text-ow-muted">{s.statValue}</td>
+                                  <td className="py-1 px-1.5 text-right font-mono text-ow-faint">{s.avgPer10Min ?? '—'}</td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
           {/* Scoreboard portrait confidence — the headline table */}
           {r.confidence.scoreboard.length > 0 && (
             <div>
-              <p className="text-[10px] text-slate-400 font-display tracking-wider uppercase mb-2">
+              <p className="text-[10px] text-ow-muted font-display tracking-wider uppercase mb-2">
                 Scoreboard Portraits
               </p>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
                   <thead>
-                    <tr className="text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/5">
+                    <tr className="text-ow-faint text-[10px] uppercase tracking-wider border-b border-ow-line">
                       <th className="text-left py-1.5 px-2">Slot</th>
                       <th className="text-left py-1.5 px-2">Team</th>
                       <th className="text-left py-1.5 px-2">Hero</th>
@@ -872,39 +1209,39 @@ function ResultCard({ r }: { r: MatchTestResult }) {
                     {r.confidence.scoreboard.map((p) => (
                       <tr
                         key={p.slot}
-                        className={`border-b border-white/5 ${
+                        className={`border-b border-ow-line ${
                           p.phase1Agrees === false ? 'bg-ow-defeat/5' : ''
                         }`}
                       >
-                        <td className="py-1.5 px-2 font-mono text-slate-500">{p.slot}</td>
+                        <td className="py-1.5 px-2 font-mono text-ow-faint">{p.slot}</td>
                         <td
                           className={`py-1.5 px-2 ${
                             p.team === 'ally'
                               ? 'text-blue-300'
                               : p.team === 'enemy'
                                 ? 'text-red-300'
-                                : 'text-slate-500'
+                                : 'text-ow-faint'
                           }`}
                         >
                           {p.team ?? '—'}
                         </td>
-                        <td className="py-1.5 px-2 text-slate-200">{p.hero}</td>
+                        <td className="py-1.5 px-2 text-ow-fg">{p.hero}</td>
                         <td className="py-1.5 px-2 text-right">
                           <ConfBadge score={p.score} margin={p.margin} />
                         </td>
-                        <td className="py-1.5 px-2 text-right font-mono text-slate-400">
+                        <td className="py-1.5 px-2 text-right font-mono text-ow-muted">
                           {fmt4(p.margin)}
                         </td>
-                        <td className="py-1.5 px-2 text-slate-500">{p.runnerUp ?? '—'}</td>
-                        <td className="py-1.5 px-2 text-center font-mono text-slate-400">
+                        <td className="py-1.5 px-2 text-ow-faint">{p.runnerUp ?? '—'}</td>
+                        <td className="py-1.5 px-2 text-center font-mono text-ow-muted">
                           {p.crop ?? '—'}
                         </td>
-                        <td className="py-1.5 px-2 font-mono text-slate-500">
+                        <td className="py-1.5 px-2 font-mono text-ow-faint">
                           {p.phase1Hero ? `${p.phase1Hero} ${fmt4(p.phase1Score)}` : '—'}
                         </td>
                         <td className="py-1.5 px-2 text-center">
                           {p.phase1Agrees === null ? (
-                            <span className="text-slate-600">—</span>
+                            <span className="text-ow-faint">—</span>
                           ) : p.phase1Agrees ? (
                             <span className="text-ow-victory">✓</span>
                           ) : (
@@ -915,7 +1252,7 @@ function ResultCard({ r }: { r: MatchTestResult }) {
                           {p.orbApplied ? (
                             <span className="text-ow-orange">✓</span>
                           ) : (
-                            <span className="text-slate-600">—</span>
+                            <span className="text-ow-faint">—</span>
                           )}
                         </td>
                       </tr>
@@ -927,18 +1264,29 @@ function ResultCard({ r }: { r: MatchTestResult }) {
           )}
 
           {/* Scoreboard stats (mirrors MATCH SAVED) */}
+          {/* Scoreboard source screenshot (click to enlarge) */}
+          {res.scoreboard?.imageUrl && (
+            <div>
+              <p className="text-[10px] text-ow-muted font-display tracking-wider uppercase mb-2">
+                Scoreboard Screenshot
+              </p>
+              <EnlargeableImage src={res.scoreboard.imageUrl} label="scoreboard screenshot" />
+            </div>
+          )}
+
+          {/* Scoreboard stats (mirrors MATCH SAVED) */}
           {res.scoreboard && <ScoreboardStats sb={res.scoreboard} />}
 
           {/* Raw log toggle */}
           <div>
             <button
               onClick={() => setShowLog((v) => !v)}
-              className="text-xs text-slate-400 hover:text-slate-200 font-display"
+              className="text-xs text-ow-muted hover:text-ow-fg font-display"
             >
               {showLog ? '▼' : '▶'} Raw console log ({r.logs.length} lines)
             </button>
             {showLog && (
-              <pre className="mt-2 bg-ow-dark rounded-lg p-3 text-[10px] leading-relaxed text-slate-400 overflow-x-auto max-h-80 overflow-y-auto whitespace-pre-wrap">
+              <pre className="mt-2 bg-ow-dark rounded-lg p-3 text-[10px] leading-relaxed text-ow-muted overflow-x-auto max-h-80 overflow-y-auto whitespace-pre-wrap">
                 {r.logs
                   .map(
                     (l) =>
@@ -973,7 +1321,7 @@ function ScoreboardStats({
       <div className="overflow-x-auto">
         <table className="w-full text-xs">
           <thead>
-            <tr className="text-slate-500 text-[10px] uppercase tracking-wider border-b border-white/5">
+            <tr className="text-ow-faint text-[10px] uppercase tracking-wider border-b border-ow-line">
               <th className="text-left py-1 px-2">Player</th>
               <th className="text-left py-1 px-2">Hero</th>
               <th className="text-left py-1 px-2">Role</th>
@@ -993,15 +1341,15 @@ function ScoreboardStats({
                 return (
                   <tr
                     key={s.slot}
-                    className={`border-b border-white/5 ${player?.isUser ? 'bg-ow-orange/5' : ''}`}
+                    className={`border-b border-ow-line ${player?.isUser ? 'bg-ow-orange/5' : ''}`}
                   >
                     <td
-                      className={`py-1.5 px-2 font-display ${player?.isUser ? 'text-ow-orange font-bold' : 'text-slate-300'}`}
+                      className={`py-1.5 px-2 font-display ${player?.isUser ? 'text-ow-orange font-bold' : 'text-ow-muted'}`}
                     >
                       {player?.displayName ||
                         `${team === 'ally' ? 'Ally' : 'Enemy'} ${team === 'ally' ? s.slot : s.slot - rowsPerTeam}`}
                     </td>
-                    <td className="py-1.5 px-2 text-slate-300">{s.heroName || '—'}</td>
+                    <td className="py-1.5 px-2 text-ow-muted">{s.heroName || '—'}</td>
                     <td
                       className={`py-1.5 px-2 uppercase font-display text-[10px] font-bold ${
                         s.role === 'tank'
@@ -1010,17 +1358,17 @@ function ScoreboardStats({
                             ? 'text-red-300'
                             : s.role === 'support'
                               ? 'text-green-300'
-                              : 'text-slate-600'
+                              : 'text-ow-faint'
                       }`}
                     >
                       {s.role || '—'}
                     </td>
-                    <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.eliminations ?? '—'}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.assists ?? '—'}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.deaths ?? '—'}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.damage?.toLocaleString() ?? '—'}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.healing?.toLocaleString() ?? '—'}</td>
-                    <td className="py-1.5 px-2 text-right font-mono text-slate-300">{s.mitigation?.toLocaleString() ?? '—'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-ow-muted">{s.eliminations ?? '—'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-ow-muted">{s.assists ?? '—'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-ow-muted">{s.deaths ?? '—'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-ow-muted">{s.damage?.toLocaleString() ?? '—'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-ow-muted">{s.healing?.toLocaleString() ?? '—'}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-ow-muted">{s.mitigation?.toLocaleString() ?? '—'}</td>
                   </tr>
                 )
               })}
@@ -1110,7 +1458,15 @@ export default function TestingPage() {
         errMsg = err?.message || String(err)
       } finally {
         restore()
-        for (const u of urls) URL.revokeObjectURL(u)
+        // Revoke only the blob URLs the result does NOT keep for display.
+        // The displayed ones (summary / breakdown / scoreboard screenshots) must
+        // stay valid until the result card is gone, or the <img> tags break with
+        // "WebKitBlobResource error 1". Those are revoked when results are cleared
+        // (startNewTest) via revokeResultImageUrls().
+        const keep = new Set(displayedImageUrls(res))
+        for (const u of urls) {
+          if (!keep.has(u)) URL.revokeObjectURL(u)
+        }
       }
 
       const elapsed = Date.now() - start
@@ -1147,11 +1503,12 @@ export default function TestingPage() {
   }, [testNumber, gamertag, results])
 
   const startNewTest = useCallback(() => {
+    revokeResultImageUrls(results)
     setTestNumber((n) => n + 1)
     setResults([])
     setGroups([])
     setError(null)
-  }, [])
+  }, [results])
 
   // Roll-up stats
   const done = results.filter((r) => r.result && !r.error).length
@@ -1162,25 +1519,25 @@ export default function TestingPage() {
   const disagree = allSb.filter((p) => p.phase1Agrees === false).length
 
   return (
-    <div className="min-h-screen bg-ow-dark text-white p-4 sm:p-6">
+    <div className="min-h-screen bg-ow-dark text-ow-fg p-4 sm:p-6">
       <div className="max-w-4xl mx-auto space-y-6">
         {/* Header */}
         <div className="flex items-baseline gap-3">
           <h1 className="text-2xl text-ow-orange font-display font-bold">
             Match Extraction — Testing
           </h1>
-          <span className="text-xs font-mono text-slate-500 bg-ow-panel px-2 py-0.5 rounded">
+          <span className="text-xs font-mono text-ow-faint bg-ow-panel px-2 py-0.5 rounded">
             Test #{testNumber}
           </span>
         </div>
-        <p className="text-xs text-slate-500 -mt-4">
-          Calls <code className="text-slate-400">processMatchPhotos()</code> — the same code path
-          as production. Files are grouped into matches by <code className="text-slate-400">Test_&lt;N&gt;_</code> prefix.
+        <p className="text-xs text-ow-faint -mt-4">
+          Calls <code className="text-ow-muted">processMatchPhotos()</code> — the same code path
+          as production. Files are grouped into matches by <code className="text-ow-muted">Test_&lt;N&gt;_</code> prefix.
         </p>
 
         {/* Gamertag */}
         <div>
-          <label className="text-[10px] uppercase tracking-wider text-slate-500 mb-1 block">
+          <label className="text-[10px] uppercase tracking-wider text-ow-faint mb-1 block">
             Gamertag
           </label>
           <input
@@ -1189,13 +1546,13 @@ export default function TestingPage() {
             onChange={(e) => setGamertag(e.target.value)}
             placeholder="Enter gamertag..."
             disabled={processing}
-            className="w-full sm:w-72 bg-ow-panel border border-white/10 rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-600 focus:border-ow-orange/40 focus:outline-none disabled:opacity-50"
+            className="w-full sm:w-72 bg-ow-panel border border-ow-line rounded-lg px-3 py-2 text-sm text-ow-fg placeholder-ow-faint focus:border-ow-orange/40 focus:outline-none disabled:opacity-50"
           />
         </div>
 
         {/* Upload */}
-        <div className="border border-dashed border-white/10 rounded-xl p-5 text-center hover:border-ow-orange/30 transition-colors">
-          <p className="text-sm text-slate-400 mb-3">
+        <div className="border border-dashed border-ow-line rounded-xl p-5 text-center hover:border-ow-orange/30 transition-colors">
+          <p className="text-sm text-ow-muted mb-3">
             Select all screenshots for one or more matches (summary, breakdown(s), scoreboard).
           </p>
           <input
@@ -1205,7 +1562,7 @@ export default function TestingPage() {
             accept="image/*"
             onChange={handleFiles}
             disabled={processing}
-            className="text-sm text-slate-400 file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-ow-panel file:text-slate-300 hover:file:bg-white/5 file:cursor-pointer disabled:opacity-50"
+            className="text-sm text-ow-muted file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-ow-panel file:text-ow-muted hover:file:bg-white/5 file:cursor-pointer disabled:opacity-50"
           />
         </div>
 
@@ -1219,11 +1576,11 @@ export default function TestingPage() {
 
         {/* Detected groups preview */}
         {!grouping && groups.length > 0 && results.length === 0 && (
-          <div className="bg-ow-panel rounded-lg border border-white/5 p-5 space-y-3">
+          <div className="bg-ow-panel rounded-lg border border-ow-line p-5 space-y-3">
             <div className="flex items-center justify-between">
               <p className="text-ow-orange font-display font-bold text-sm">
                 {groups.length} MATCH{groups.length !== 1 ? 'ES' : ''} DETECTED
-                <span className="ml-2 text-[10px] font-mono text-slate-500">
+                <span className="ml-2 text-[10px] font-mono text-ow-faint">
                   via {groups[0]?.via === 'content' ? 'page-content' : 'filename'} grouping
                 </span>
               </p>
@@ -1235,18 +1592,18 @@ export default function TestingPage() {
                 PROCESS ALL
               </button>
             </div>
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-ow-faint">
               Review grouping below before processing. Each group → one processMatchPhotos() call,
               ordered summary → breakdown(s) → scoreboard.
             </p>
             <div className="space-y-2">
               {groups.map((g) => (
-                <div key={g.key} className="bg-ow-dark rounded px-3 py-2 border border-white/5">
-                  <p className="text-sm text-white font-display">{g.key}</p>
+                <div key={g.key} className="bg-ow-dark rounded px-3 py-2 border border-ow-line">
+                  <p className="text-sm text-ow-fg font-display">{g.key}</p>
                   <div className="mt-1 space-y-0.5">
                     {g.files.map((f, i) => (
-                      <p key={f.name} className="text-[11px] text-slate-500 flex gap-2">
-                        <span className="inline-block w-20 shrink-0 uppercase tracking-wide text-slate-600">
+                      <p key={f.name} className="text-[11px] text-ow-faint flex gap-2">
+                        <span className="inline-block w-20 shrink-0 uppercase tracking-wide text-ow-faint">
                           {g.pageTypes?.[i] ?? pageLabelFromName(f.name)}
                         </span>
                         <span className="truncate">{f.name}</span>
@@ -1295,11 +1652,11 @@ export default function TestingPage() {
                 { label: 'Fragile', value: `${fragile}`, bad: fragile > 0 },
                 { label: 'Crop disagree', value: `${disagree}`, bad: disagree > 0 },
               ].map((item, i) => (
-                <div key={i} className="bg-ow-panel border border-white/5 rounded-lg p-3 text-center">
+                <div key={i} className="bg-ow-panel border border-ow-line rounded-lg p-3 text-center">
                   <p
                     className={`text-lg font-bold font-mono ${
                       item.bad === undefined
-                        ? 'text-slate-200'
+                        ? 'text-ow-fg'
                         : item.bad
                           ? 'text-ow-defeat'
                           : 'text-ow-victory'
@@ -1307,7 +1664,7 @@ export default function TestingPage() {
                   >
                     {item.value}
                   </p>
-                  <p className="text-[10px] uppercase tracking-wider text-slate-500 mt-0.5">{item.label}</p>
+                  <p className="text-[10px] uppercase tracking-wider text-ow-faint mt-0.5">{item.label}</p>
                 </div>
               ))}
             </div>
@@ -1324,7 +1681,7 @@ export default function TestingPage() {
               <button
                 onClick={startNewTest}
                 disabled={processing}
-                className="bg-ow-panel border border-white/10 text-slate-300 text-sm px-4 py-2 rounded-lg font-display tracking-wider hover:border-ow-orange/30 transition-colors disabled:opacity-50"
+                className="bg-ow-panel border border-ow-line text-ow-muted text-sm px-4 py-2 rounded-lg font-display tracking-wider hover:border-ow-orange/30 transition-colors disabled:opacity-50"
               >
                 NEW TEST (#{testNumber + 1})
               </button>

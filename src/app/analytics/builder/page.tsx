@@ -21,6 +21,9 @@ import AnalyticsFilters, {
   type AnalyticsFilterState,
 } from '@/components/AnalyticsFilters'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
+import Select from '@/components/Select'
+import { useChartColors } from '@/components/useChartColors'
+import { type ChartColors } from '@/lib/chart-theme'
 import {
   byKey, catVars, numVars, VARIABLES,
   MEASURES, chartAvailability, sortBuckets,
@@ -66,11 +69,7 @@ import {
 // percentages never averaged like counts.
 // ============================================================
 
-const OW = {
-  orange: '#f99e1a', accent: '#ffcb6b', victory: '#3fb950', defeat: '#f85149',
-  draw: '#8b949e', grid: 'rgba(255,255,255,0.08)', axis: 'rgba(255,255,255,0.45)',
-}
-const SERIES_COLORS = [OW.orange, '#5aa9e6', OW.victory, OW.accent, '#b072d6', OW.defeat, '#3fcaa8', '#e0934d']
+const seriesColors = (c: ChartColors): string[] => c.categorical
 
 const READY_BADGE: Record<Readiness, { label: string; cls: string }> = {
   ready: { label: 'READY', cls: 'text-ow-victory bg-ow-victory/10' },
@@ -95,6 +94,7 @@ function grouped(vars: VarDef[]): [string, VarDef[]][] {
 }
 
 function ChartBuilder() {
+  const cc = useChartColors()
   const [filters, setFilters] = useState<AnalyticsFilterState>(DEFAULT_FILTERS)
   const [matchRows, setMatchRows] = useState<MatchRow[]>([])
   const [heroRows, setHeroRows] = useState<HeroRow[]>([])
@@ -305,21 +305,20 @@ function ChartBuilder() {
   )
 
   const selectCls =
-    'bg-ow-dark border border-white/20 rounded-xl px-3 py-2 text-sm text-slate-100 ' +
+    'bg-ow-dark border border-ow-line rounded-xl px-3 py-2 text-sm text-ow-fg ' +
     'font-display tracking-wider focus:border-ow-orange focus:outline-none transition-colors ' +
     '[color-scheme:dark] max-w-[15rem]'
-  const labelCls = 'text-[11px] text-slate-400 font-display tracking-wider uppercase'
+  const labelCls = 'text-[11px] text-ow-muted font-display tracking-wider uppercase'
 
-  function renderVarOptions(vars: VarDef[]) {
-    return grouped(vars).map(([group, items]) => (
-      <optgroup key={group} label={group}>
-        {items.map(v => (
-          <option key={v.key} value={v.key}>
-            {v.label}{v.ready !== 'ready' ? ` (${READY_BADGE[v.ready].label.toLowerCase()})` : ''}
-          </option>
-        ))}
-      </optgroup>
-    ))
+  // Flat array form for the custom <Select>. Group name is folded into the
+  // label as a prefix since <Select> doesn't render optgroups.
+  function varSelectOptions(vars: VarDef[]): { value: string; label: string }[] {
+    return grouped(vars).flatMap(([group, items]) =>
+      items.map(v => ({
+        value: v.key,
+        label: `${group} — ${v.label}${v.ready !== 'ready' ? ` (${READY_BADGE[v.ready].label.toLowerCase()})` : ''}`,
+      })),
+    )
   }
 
   const hasData = measure === 'xy' ? scatter.length > 0 : (shown?.data.length ?? 0) > 0
@@ -329,10 +328,10 @@ function ChartBuilder() {
       <AnalyticsFilters value={filters} onChange={setFilters} show={{ queue: true, mode: true, map: true, hero: true }} />
 
       {/* Pickers */}
-      <div className="bg-ow-panel rounded-xl border border-white/10 p-4">
+      <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
         <div className="flex items-center gap-2 mb-4">
           <div className="h-1 w-10 bg-ow-orange rounded-full" />
-          <span className="font-display tracking-[0.15em] text-slate-300 uppercase text-xs">Build a chart</span>
+          <span className="font-display tracking-[0.15em] text-ow-muted uppercase text-xs">Build a chart</span>
           <span className={`text-[10px] font-display tracking-wider uppercase px-2 py-0.5 rounded ${READY_BADGE[xVar.ready].cls}`}>
             {grain === 'hero' ? 'per-hero data' : 'per-match data'} · {READY_BADGE[xVar.ready].label}
           </span>
@@ -341,68 +340,66 @@ function ChartBuilder() {
         <div className="flex flex-wrap gap-4">
           <label className="flex flex-col gap-1">
             <span className={labelCls}>{measure === 'xy' ? 'X-axis (numeric)' : 'Group by (X-axis)'}</span>
-            <select className={selectCls} value={xVarKey} onChange={e => setXVarKey(e.target.value)}>
-              {renderVarOptions(xOptions)}
-            </select>
+            <Select<string> className={selectCls} value={xVarKey} onChange={setXVarKey}
+              options={varSelectOptions(xOptions)} />
           </label>
 
           <label className="flex flex-col gap-1">
             <span className={labelCls}>Measure</span>
-            <select className={selectCls} value={measure} onChange={e => setMeasure(e.target.value as MeasureKind)}>
-              {MEASURES.map(m => <option key={m.kind} value={m.kind}>{m.label}</option>)}
-            </select>
+            <Select<MeasureKind> className={selectCls} value={measure} onChange={setMeasure}
+              options={MEASURES.map(m => ({ value: m.kind, label: m.label }))} />
           </label>
 
           {measure === 'avg' && (
             <label className="flex flex-col gap-1">
               <span className={labelCls}>Of which stat</span>
-              <select className={selectCls} value={avgVarKey} onChange={e => setAvgVarKey(e.target.value)}>
-                {renderVarOptions(numVars())}
-              </select>
+              <Select<string> className={selectCls} value={avgVarKey} onChange={setAvgVarKey}
+                options={varSelectOptions(numVars())} />
             </label>
           )}
 
           {measure === 'xy' && (
             <label className="flex flex-col gap-1">
               <span className={labelCls}>Y-axis (numeric)</span>
-              <select className={selectCls} value={yVarKey} onChange={e => setYVarKey(e.target.value)}>
-                {renderVarOptions(numVars())}
-              </select>
+              <Select<string> className={selectCls} value={yVarKey} onChange={setYVarKey}
+                options={varSelectOptions(numVars())} />
             </label>
           )}
 
           <label className="flex flex-col gap-1">
             <span className={labelCls}>Chart type</span>
-            <select className={selectCls} value={chartType} onChange={e => setChartType(e.target.value as ChartType)}>
-              {(['bar', 'line', 'area', 'pie', 'scatter', 'radar'] as ChartType[]).map(ct => {
+            <Select<ChartType> className={selectCls} value={chartType} onChange={setChartType}
+              options={(['bar', 'line', 'area', 'pie', 'scatter', 'radar'] as ChartType[]).map(ct => {
                 const reason = availability[ct]
-                return (
-                  <option key={ct} value={ct} disabled={reason !== null}>
-                    {ct[0].toUpperCase() + ct.slice(1)}{reason ? ' — N/A' : ''}
-                  </option>
-                )
-              })}
-            </select>
+                return {
+                  value: ct,
+                  label: `${ct[0].toUpperCase() + ct.slice(1)}${reason ? ' — N/A' : ''}`,
+                  disabled: reason !== null,
+                }
+              })} />
           </label>
 
           {measure !== 'xy' && (
             <label className="flex flex-col gap-1">
               <span className={labelCls}>Small samples (&lt;5)</span>
-              <select className={selectCls} value={subFive} onChange={e => setSubFive(e.target.value as 'show' | 'hide' | 'only')}>
-                <option value="show">Show all{subFiveCount ? ` (${subFiveCount} thin)` : ''}</option>
-                <option value="hide">Hide &lt;5-game buckets</option>
-                <option value="only">Only &lt;5-game buckets</option>
-              </select>
+              <Select<'show' | 'hide' | 'only'> className={selectCls} value={subFive} onChange={setSubFive}
+                options={[
+                  { value: 'show', label: `Show all${subFiveCount ? ` (${subFiveCount} thin)` : ''}` },
+                  { value: 'hide', label: 'Hide <5-game buckets' },
+                  { value: 'only', label: 'Only <5-game buckets' },
+                ]} />
             </label>
           )}
 
           {measure !== 'xy' && (
             <label className="flex flex-col gap-1">
               <span className={labelCls}>No-value (—) bucket</span>
-              <select className={selectCls} value={hideNull ? 'hide' : 'show'} onChange={e => setHideNull(e.target.value === 'hide')}>
-                <option value="hide">Hide —</option>
-                <option value="show">Show —</option>
-              </select>
+              <Select<'show' | 'hide'> className={selectCls} value={hideNull ? 'hide' : 'show'}
+                onChange={v => setHideNull(v === 'hide')}
+                options={[
+                  { value: 'hide', label: 'Hide —' },
+                  { value: 'show', label: 'Show —' },
+                ]} />
             </label>
           )}
         </div>
@@ -411,25 +408,25 @@ function ChartBuilder() {
           <p className="text-[11px] text-ow-accent/80 mt-3">{availability[chartType]}</p>
         )}
         {splitByFormat && measure !== 'xy' && (
-          <p className="text-[11px] text-slate-500 mt-3">
+          <p className="text-[11px] text-ow-faint mt-3">
             5v5 and 6v6 are shown as separate series (never blended). Pick a Queue to focus one format.
           </p>
         )}
         {grain === 'hero' && (
-          <p className="text-[11px] text-slate-500 mt-2">
+          <p className="text-[11px] text-ow-faint mt-2">
             Per-hero data: rates are games-weighted (a multi-hero game counts once). Combat columns are sparse on older matches.
           </p>
         )}
       </div>
 
       {/* Chart */}
-      <div className="bg-ow-panel rounded-xl border border-white/10 p-4">
+      <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
         <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
-          <h2 className="font-display tracking-[0.12em] text-slate-100 uppercase text-sm">
+          <h2 className="font-display tracking-[0.12em] text-ow-fg uppercase text-sm">
             {measureTitle}{measure !== 'xy' ? ` by ${xVar.label}` : ''}
           </h2>
           <div className="flex items-center gap-3">
-            <span className="text-xs text-slate-500 font-display tracking-wider">
+            <span className="text-xs text-ow-faint font-display tracking-wider">
               {measure === 'xy'
                 ? `${scatter.length} point${scatter.length === 1 ? '' : 's'}`
                 : `n = ${shown?.totalN ?? 0} match${(shown?.totalN ?? 0) === 1 ? '' : 'es'}`}
@@ -440,7 +437,7 @@ function ChartBuilder() {
               className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-display tracking-wider uppercase transition-colors border ${
                 saved
                   ? 'bg-ow-orange text-ow-dark border-ow-orange font-bold'
-                  : 'bg-ow-dark text-slate-300 border-white/20 hover:border-ow-orange/50'
+                  : 'bg-ow-dark text-ow-muted border-ow-line hover:border-ow-orange/50'
               }`}>
               <span>{saved ? '★' : '☆'}</span>
               {saved ? 'Saved' : 'Save chart'}
@@ -449,11 +446,11 @@ function ChartBuilder() {
         </div>
 
         {loading ? (
-          <div className="h-[360px] flex items-center justify-center text-slate-400 font-display tracking-wider">LOADING…</div>
+          <div className="h-[360px] flex items-center justify-center text-ow-muted font-display tracking-wider">LOADING…</div>
         ) : !hasData ? (
           <div className="h-[360px] flex flex-col items-center justify-center text-center">
-            <p className="font-display tracking-wider text-slate-300 uppercase text-sm">No data</p>
-            <p className="text-sm text-slate-500 mt-1">
+            <p className="font-display tracking-wider text-ow-muted uppercase text-sm">No data</p>
+            <p className="text-sm text-ow-faint mt-1">
               {subFive === 'only' ? 'No buckets under 5 games for this cut.' : 'No matches fit these filters.'}
             </p>
           </div>
@@ -462,10 +459,10 @@ function ChartBuilder() {
             <div className="h-[360px]">
               <ResponsiveContainer width="100%" height="100%">
                 {measure === 'xy'
-                  ? renderScatter(scatter, xVar.label, yVar.label, xVar.format, yVar.format)
+                  ? renderScatter(scatter, xVar.label, yVar.label, xVar.format, yVar.format, cc)
                   : renderChart(chartType, {
                       chartData: shown!.data, seriesKeys: shown!.seriesKeys, pieData, valueFormat: activeFormat, seriesLabel,
-                    })}
+                    }, cc)}
               </ResponsiveContainer>
             </div>
 
@@ -475,14 +472,14 @@ function ChartBuilder() {
                   {shown.data.map(d => {
                     const n = shown.perBucketN[String(d.bucket)] ?? 0
                     return (
-                      <span key={String(d.bucket)} className="text-[11px] text-slate-500">
-                        <span className="text-slate-400">{String(d.bucket)}</span>{' '}
+                      <span key={String(d.bucket)} className="text-[11px] text-ow-faint">
+                        <span className="text-ow-muted">{String(d.bucket)}</span>{' '}
                         <span className={n < 5 ? 'text-ow-defeat/80' : ''}>n={n}</span>
                       </span>
                     )
                   })}
                 </div>
-                <p className="text-[11px] text-slate-600 mt-2">
+                <p className="text-[11px] text-ow-faint mt-2">
                   Buckets under 5 matches are flagged — small samples aren&apos;t signal. Use the &lt;5 control to drop or isolate them.
                 </p>
               </>
@@ -492,26 +489,27 @@ function ChartBuilder() {
       </div>
 
       {/* Saved charts panel */}
-      <div className="bg-ow-panel rounded-xl border border-white/10 p-4">
+      <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
         <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
           <button
             onClick={() => setPanelOpen(o => !o)}
-            className="flex items-center gap-2 text-slate-200 hover:text-ow-orange transition-colors">
+            className="flex items-center gap-2 text-ow-fg hover:text-ow-orange transition-colors">
             <div className="h-1 w-10 bg-ow-orange rounded-full" />
             <span className="font-display tracking-[0.15em] uppercase text-xs">
               Saved charts ({savedStats.length})
             </span>
-            <span className="text-slate-500 text-xs">{panelOpen ? '▾' : '▸'}</span>
+            <span className="text-ow-faint text-xs">{panelOpen ? '▾' : '▸'}</span>
           </button>
           <label className="flex items-center gap-2">
             <span className={labelCls}>Showing</span>
-            <select
+            <Select<'season' | 'all'>
               className={selectCls}
               value={scope}
-              onChange={e => setScope(e.target.value as 'season' | 'all')}>
-              <option value="season">{season ? `This season (${season.name})` : 'This season'}</option>
-              <option value="all">All time</option>
-            </select>
+              onChange={setScope}
+              options={[
+                { value: 'season', label: season ? `This season (${season.name})` : 'This season' },
+                { value: 'all', label: 'All time' },
+              ]} />
           </label>
         </div>
 
@@ -523,7 +521,7 @@ function ChartBuilder() {
 
         {panelOpen && (
           savedStats.length === 0 ? (
-            <p className="text-sm text-slate-500">
+            <p className="text-sm text-ow-faint">
               No saved charts yet. Build a cut you like and hit ★ Save chart — revisits get counted here so you can see what you lean on across the season.
             </p>
           ) : (
@@ -534,16 +532,16 @@ function ChartBuilder() {
                   <button
                     key={s.config_key}
                     onClick={() => loadSaved(s)}
-                    className="w-full text-left bg-ow-dark rounded-lg px-3 py-2.5 border border-white/10
+                    className="w-full text-left bg-ow-dark rounded-lg px-3 py-2.5 border border-ow-line
                       hover:border-ow-orange/40 transition-colors flex items-center justify-between gap-3">
-                    <span className="font-display text-sm text-slate-100 truncate">{s.label}</span>
+                    <span className="font-display text-sm text-ow-fg truncate">{s.label}</span>
                     <span className="flex items-center gap-3 shrink-0 text-[11px] font-display tracking-wider">
                       <span className="text-ow-orange">{s.distinctSessions} session{s.distinctSessions === 1 ? '' : 's'}</span>
-                      <span className="text-slate-400">{s.totalViews} view{s.totalViews === 1 ? '' : 's'}</span>
+                      <span className="text-ow-muted">{s.totalViews} view{s.totalViews === 1 ? '' : 's'}</span>
                     </span>
                   </button>
                 ))}
-              <p className="text-[11px] text-slate-600 mt-1">
+              <p className="text-[11px] text-ow-faint mt-1">
                 Sorted by distinct sessions returned — the signal that a chart is worth promoting to a curated page.
               </p>
             </div>
@@ -555,12 +553,12 @@ function ChartBuilder() {
 }
 
 // ---- Renderers ----------------------------------------------------------
-const AXIS_TICK = { fill: OW.axis, fontSize: 11 }
-const TOOLTIP = {
-  contentStyle: { background: '#0f1419', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 8 },
-  labelStyle: { color: '#e6edf3' },
-  itemStyle: { color: '#e6edf3' },
-}
+const axisTickOf = (c: ChartColors) => ({ fill: c.axisLabel, fontSize: 11 })
+const tooltipOf = (c: ChartColors) => ({
+  contentStyle: { background: c.tooltipBg, border: `1px solid ${c.tooltipBorder}`, borderRadius: 8 },
+  labelStyle: { color: c.tooltipText },
+  itemStyle: { color: c.tooltipText },
+})
 
 interface RenderArgs {
   chartData: { bucket: string; [s: string]: number | string }[]
@@ -570,7 +568,7 @@ interface RenderArgs {
   seriesLabel: (s: string) => string
 }
 
-function renderChart(type: ChartType, a: RenderArgs) {
+function renderChart(type: ChartType, a: RenderArgs, cc: ChartColors) {
   const isPercent = a.valueFormat === 'percent'
   const yDomain = isPercent ? ([0, 100] as [number, number]) : (['auto', 'auto'] as ['auto', 'auto'])
   // Axis tick + tooltip both run values through the shared formatter, so a
@@ -584,14 +582,14 @@ function renderChart(type: ChartType, a: RenderArgs) {
   if (type === 'line') {
     return (
       <LineChart data={a.chartData} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-        <CartesianGrid stroke={OW.grid} vertical={false} />
-        <XAxis dataKey="bucket" tick={AXIS_TICK} stroke={OW.axis} />
-        <YAxis tick={AXIS_TICK} stroke={OW.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
-        <Tooltip {...TOOLTIP} formatter={tipFmt} />
+        <CartesianGrid stroke={cc.grid} vertical={false} />
+        <XAxis dataKey="bucket" tick={axisTickOf(cc)} stroke={cc.axis} />
+        <YAxis tick={axisTickOf(cc)} stroke={cc.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
+        <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
         {a.seriesKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 12 }} />}
         {a.seriesKeys.map((s, i) => (
           <Line key={s} type="monotone" dataKey={s} name={a.seriesLabel(s)}
-            stroke={SERIES_COLORS[i % SERIES_COLORS.length]} strokeWidth={2} dot={{ r: 3 }} />
+            stroke={seriesColors(cc)[i % seriesColors(cc).length]} strokeWidth={2} dot={{ r: 3 }} />
         ))}
       </LineChart>
     )
@@ -599,15 +597,15 @@ function renderChart(type: ChartType, a: RenderArgs) {
   if (type === 'area') {
     return (
       <AreaChart data={a.chartData} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-        <CartesianGrid stroke={OW.grid} vertical={false} />
-        <XAxis dataKey="bucket" tick={AXIS_TICK} stroke={OW.axis} />
-        <YAxis tick={AXIS_TICK} stroke={OW.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
-        <Tooltip {...TOOLTIP} formatter={tipFmt} />
+        <CartesianGrid stroke={cc.grid} vertical={false} />
+        <XAxis dataKey="bucket" tick={axisTickOf(cc)} stroke={cc.axis} />
+        <YAxis tick={axisTickOf(cc)} stroke={cc.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
+        <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
         {a.seriesKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 12 }} />}
         {a.seriesKeys.map((s, i) => (
           <Area key={s} type="monotone" dataKey={s} name={a.seriesLabel(s)}
-            stroke={SERIES_COLORS[i % SERIES_COLORS.length]}
-            fill={SERIES_COLORS[i % SERIES_COLORS.length]} fillOpacity={0.25} strokeWidth={2} />
+            stroke={seriesColors(cc)[i % seriesColors(cc).length]}
+            fill={seriesColors(cc)[i % seriesColors(cc).length]} fillOpacity={0.25} strokeWidth={2} />
         ))}
       </AreaChart>
     )
@@ -615,10 +613,10 @@ function renderChart(type: ChartType, a: RenderArgs) {
   if (type === 'pie') {
     return (
       <PieChart>
-        <Tooltip {...TOOLTIP} formatter={tipFmt} />
+        <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
         <Legend wrapperStyle={{ fontSize: 12 }} />
         <Pie data={a.pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={120} label>
-          {a.pieData.map((_, i) => <Cell key={i} fill={SERIES_COLORS[i % SERIES_COLORS.length]} />)}
+          {a.pieData.map((_, i) => <Cell key={i} fill={seriesColors(cc)[i % seriesColors(cc).length]} />)}
         </Pie>
       </PieChart>
     )
@@ -626,15 +624,15 @@ function renderChart(type: ChartType, a: RenderArgs) {
   if (type === 'radar') {
     return (
       <RadarChart data={a.chartData} outerRadius={130}>
-        <PolarGrid stroke={OW.grid} />
-        <PolarAngleAxis dataKey="bucket" tick={AXIS_TICK} />
-        <PolarRadiusAxis tick={AXIS_TICK} stroke={OW.axis} tickFormatter={tickFmt} />
-        <Tooltip {...TOOLTIP} formatter={tipFmt} />
+        <PolarGrid stroke={cc.grid} />
+        <PolarAngleAxis dataKey="bucket" tick={axisTickOf(cc)} />
+        <PolarRadiusAxis tick={axisTickOf(cc)} stroke={cc.axis} tickFormatter={tickFmt} />
+        <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
         {a.seriesKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 12 }} />}
         {a.seriesKeys.map((s, i) => (
           <Radar key={s} dataKey={s} name={a.seriesLabel(s)}
-            stroke={SERIES_COLORS[i % SERIES_COLORS.length]}
-            fill={SERIES_COLORS[i % SERIES_COLORS.length]} fillOpacity={0.3} />
+            stroke={seriesColors(cc)[i % seriesColors(cc).length]}
+            fill={seriesColors(cc)[i % seriesColors(cc).length]} fillOpacity={0.3} />
         ))}
       </RadarChart>
     )
@@ -642,13 +640,13 @@ function renderChart(type: ChartType, a: RenderArgs) {
   // bar (default)
   return (
     <BarChart data={a.chartData} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-      <CartesianGrid stroke={OW.grid} vertical={false} />
-      <XAxis dataKey="bucket" tick={AXIS_TICK} stroke={OW.axis} />
-      <YAxis tick={AXIS_TICK} stroke={OW.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
-      <Tooltip {...TOOLTIP} formatter={tipFmt} />
+      <CartesianGrid stroke={cc.grid} vertical={false} />
+      <XAxis dataKey="bucket" tick={axisTickOf(cc)} stroke={cc.axis} />
+      <YAxis tick={axisTickOf(cc)} stroke={cc.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
+      <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
       {a.seriesKeys.length > 1 && <Legend wrapperStyle={{ fontSize: 12 }} />}
       {a.seriesKeys.map((s, i) => (
-        <Bar key={s} dataKey={s} name={a.seriesLabel(s)} fill={SERIES_COLORS[i % SERIES_COLORS.length]} radius={[4, 4, 0, 0]} />
+        <Bar key={s} dataKey={s} name={a.seriesLabel(s)} fill={seriesColors(cc)[i % seriesColors(cc).length]} radius={[4, 4, 0, 0]} />
       ))}
     </BarChart>
   )
@@ -657,7 +655,8 @@ function renderChart(type: ChartType, a: RenderArgs) {
 function renderScatter(
   points: { x: number; y: number; label: string }[],
   xLabel: string, yLabel: string,
-  xFormat?: ValueFormat, yFormat?: ValueFormat,
+  xFormat: ValueFormat | undefined, yFormat: ValueFormat | undefined,
+  cc: ChartColors,
 ) {
   const xFmt = (v: number) => formatValue(v, xFormat)
   const yFmt = (v: number) => formatValue(v, yFormat)
@@ -667,13 +666,13 @@ function renderScatter(
   }
   return (
     <ScatterChart margin={{ top: 8, right: 16, bottom: 24, left: 8 }}>
-      <CartesianGrid stroke={OW.grid} />
-      <XAxis type="number" dataKey="x" name={xLabel} tick={AXIS_TICK} stroke={OW.axis} tickFormatter={xFmt}
-        label={{ value: xLabel, position: 'insideBottom', offset: -12, fill: OW.axis, fontSize: 11 }} />
-      <YAxis type="number" dataKey="y" name={yLabel} tick={AXIS_TICK} stroke={OW.axis} tickFormatter={yFmt} width={56} />
+      <CartesianGrid stroke={cc.grid} />
+      <XAxis type="number" dataKey="x" name={xLabel} tick={axisTickOf(cc)} stroke={cc.axis} tickFormatter={xFmt}
+        label={{ value: xLabel, position: 'insideBottom', offset: -12, fill: cc.axis, fontSize: 11 }} />
+      <YAxis type="number" dataKey="y" name={yLabel} tick={axisTickOf(cc)} stroke={cc.axis} tickFormatter={yFmt} width={56} />
       <ZAxis range={[50, 50]} />
-      <Tooltip {...TOOLTIP} cursor={{ strokeDasharray: '3 3' }} formatter={tipFmt} />
-      <Scatter data={points} fill={OW.orange} fillOpacity={0.7} />
+      <Tooltip {...tooltipOf(cc)} cursor={{ strokeDasharray: '3 3' }} formatter={tipFmt} />
+      <Scatter data={points} fill={cc.primary} fillOpacity={0.7} />
     </ScatterChart>
   )
 }
@@ -689,6 +688,7 @@ function renderFreeSingle(
   seriesKeys: string[],
   valueFormat: ValueFormat,
   seriesLabel: (s: string) => string,
+  cc: ChartColors,
   dimBucket?: (bucket: string) => boolean,
 ) {
   const isPercent = valueFormat === 'percent'
@@ -704,13 +704,13 @@ function renderFreeSingle(
   if (type === 'line') {
     return (
       <LineChart data={data} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-        <CartesianGrid stroke={OW.grid} vertical={false} />
-        <XAxis dataKey="bucket" tick={AXIS_TICK} stroke={OW.axis} />
-        <YAxis tick={AXIS_TICK} stroke={OW.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
-        <Tooltip {...TOOLTIP} formatter={tipFmt} />
+        <CartesianGrid stroke={cc.grid} vertical={false} />
+        <XAxis dataKey="bucket" tick={axisTickOf(cc)} stroke={cc.axis} />
+        <YAxis tick={axisTickOf(cc)} stroke={cc.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
+        <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
         {seriesKeys.map((s, i) => (
           <Line key={s} type="monotone" dataKey={s} name={seriesLabel(s)}
-            stroke={SERIES_COLORS[i % SERIES_COLORS.length]} strokeOpacity={filterOn ? 0.4 : 1}
+            stroke={seriesColors(cc)[i % seriesColors(cc).length]} strokeOpacity={filterOn ? 0.4 : 1}
             strokeWidth={2} dot={{ r: 3 }} />
         ))}
       </LineChart>
@@ -719,14 +719,14 @@ function renderFreeSingle(
   if (type === 'area') {
     return (
       <AreaChart data={data} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-        <CartesianGrid stroke={OW.grid} vertical={false} />
-        <XAxis dataKey="bucket" tick={AXIS_TICK} stroke={OW.axis} />
-        <YAxis tick={AXIS_TICK} stroke={OW.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
-        <Tooltip {...TOOLTIP} formatter={tipFmt} />
+        <CartesianGrid stroke={cc.grid} vertical={false} />
+        <XAxis dataKey="bucket" tick={axisTickOf(cc)} stroke={cc.axis} />
+        <YAxis tick={axisTickOf(cc)} stroke={cc.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
+        <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
         {seriesKeys.map((s, i) => (
           <Area key={s} type="monotone" dataKey={s} name={seriesLabel(s)}
-            stroke={SERIES_COLORS[i % SERIES_COLORS.length]}
-            fill={SERIES_COLORS[i % SERIES_COLORS.length]}
+            stroke={seriesColors(cc)[i % seriesColors(cc).length]}
+            fill={seriesColors(cc)[i % seriesColors(cc).length]}
             fillOpacity={filterOn ? 0.1 : 0.25} strokeOpacity={filterOn ? 0.4 : 1} strokeWidth={2} />
         ))}
       </AreaChart>
@@ -735,14 +735,14 @@ function renderFreeSingle(
   if (type === 'radar') {
     return (
       <RadarChart data={data} outerRadius={130}>
-        <PolarGrid stroke={OW.grid} />
-        <PolarAngleAxis dataKey="bucket" tick={AXIS_TICK} />
-        <PolarRadiusAxis tick={AXIS_TICK} stroke={OW.axis} tickFormatter={tickFmt} />
-        <Tooltip {...TOOLTIP} formatter={tipFmt} />
+        <PolarGrid stroke={cc.grid} />
+        <PolarAngleAxis dataKey="bucket" tick={axisTickOf(cc)} />
+        <PolarRadiusAxis tick={axisTickOf(cc)} stroke={cc.axis} tickFormatter={tickFmt} />
+        <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
         {seriesKeys.map((s, i) => (
           <Radar key={s} dataKey={s} name={seriesLabel(s)}
-            stroke={SERIES_COLORS[i % SERIES_COLORS.length]}
-            fill={SERIES_COLORS[i % SERIES_COLORS.length]} fillOpacity={filterOn ? 0.12 : 0.3} />
+            stroke={seriesColors(cc)[i % seriesColors(cc).length]}
+            fill={seriesColors(cc)[i % seriesColors(cc).length]} fillOpacity={filterOn ? 0.12 : 0.3} />
         ))}
       </RadarChart>
     )
@@ -750,14 +750,14 @@ function renderFreeSingle(
   // bar (default) — per-bar dimming via <Cell>
   return (
     <BarChart data={data} margin={{ top: 8, right: 8, bottom: 8, left: 0 }}>
-      <CartesianGrid stroke={OW.grid} vertical={false} />
-      <XAxis dataKey="bucket" tick={AXIS_TICK} stroke={OW.axis} />
-      <YAxis tick={AXIS_TICK} stroke={OW.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
-      <Tooltip {...TOOLTIP} formatter={tipFmt} />
-      <Bar dataKey={s0} name={seriesLabel(s0)} fill={OW.orange} radius={[4, 4, 0, 0]}>
+      <CartesianGrid stroke={cc.grid} vertical={false} />
+      <XAxis dataKey="bucket" tick={axisTickOf(cc)} stroke={cc.axis} />
+      <YAxis tick={axisTickOf(cc)} stroke={cc.axis} domain={yDomain} tickFormatter={tickFmt} width={56} />
+      <Tooltip {...tooltipOf(cc)} formatter={tipFmt} />
+      <Bar dataKey={s0} name={seriesLabel(s0)} fill={cc.primary} radius={[4, 4, 0, 0]}>
         {data.map((d, i) => {
           const dim = dimBucket ? dimBucket(String(d.bucket)) : false
-          return <Cell key={i} fill={OW.orange} fillOpacity={dim ? 0.18 : 1} />
+          return <Cell key={i} fill={cc.primary} fillOpacity={dim ? 0.18 : 1} />
         })}
       </Bar>
     </BarChart>
@@ -825,7 +825,7 @@ function FreeHeatmap({
             {ct.xBuckets.map(xb => (
               <th key={xb}
                 className="sticky top-0 z-10 bg-ow-panel px-2 py-1 text-[10px] font-display tracking-wider
-                  text-slate-400 uppercase whitespace-nowrap text-left align-bottom">
+                  text-ow-muted uppercase whitespace-nowrap text-left align-bottom">
                 {xb}
               </th>
             ))}
@@ -835,7 +835,7 @@ function FreeHeatmap({
           {ct.yBuckets.map(yb => (
             <tr key={yb}>
               <th className="sticky left-0 z-10 bg-ow-panel pr-2 text-[10px] font-display tracking-wider
-                text-slate-400 uppercase whitespace-nowrap text-right">
+                text-ow-muted uppercase whitespace-nowrap text-right">
                 {yb}
               </th>
               {ct.xBuckets.map(xb => {
@@ -873,6 +873,7 @@ function FreeHeatmap({
 }
 
 function FreeBuilder() {
+  const cc = useChartColors()
   const [filters, setFilters] = useState<AnalyticsFilterState>(DEFAULT_FILTERS)
   const [matchRows, setMatchRows] = useState<MatchRow[]>([])
   const [heroRows, setHeroRows] = useState<HeroRow[]>([])
@@ -1173,10 +1174,10 @@ function FreeBuilder() {
   }, [])
 
   const selectCls =
-    'bg-ow-dark border border-white/20 rounded-xl px-3 py-2 text-sm text-slate-100 ' +
+    'bg-ow-dark border border-ow-line rounded-xl px-3 py-2 text-sm text-ow-fg ' +
     'font-display tracking-wider focus:border-ow-orange focus:outline-none transition-colors ' +
     '[color-scheme:dark] max-w-[15rem]'
-  const labelCls = 'text-[11px] text-slate-400 font-display tracking-wider uppercase'
+  const labelCls = 'text-[11px] text-ow-muted font-display tracking-wider uppercase'
 
   const formatPinned = filters.queue !== 'all'
   const splitByFormat = !formatPinned && validity.shape === 'cat_num'
@@ -1198,10 +1199,10 @@ function FreeBuilder() {
       <AnalyticsFilters value={filters} onChange={setFilters} show={{ queue: true, mode: true, map: true, hero: true }} />
 
       {/* Pickers */}
-      <div className="bg-ow-panel rounded-xl border border-white/10 p-4">
+      <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
         <div className="flex items-center gap-2 mb-4">
           <div className="h-1 w-10 bg-ow-orange rounded-full" />
-          <span className="font-display tracking-[0.15em] text-slate-300 uppercase text-xs">Free chart — any X × any Y</span>
+          <span className="font-display tracking-[0.15em] text-ow-muted uppercase text-xs">Free chart — any X × any Y</span>
           <span className={`text-[10px] font-display tracking-wider uppercase px-2 py-0.5 rounded ${READY_BADGE[xVar.ready].cls}`}>
             {grain === 'hero' ? 'per-hero data' : 'per-match data'}
           </span>
@@ -1210,9 +1211,8 @@ function FreeBuilder() {
         <div className="flex flex-wrap gap-4">
           <label className="flex flex-col gap-1">
             <span className={labelCls}>X-axis variable</span>
-            <select className={selectCls} value={xVarKey} onChange={e => setXVarKey(e.target.value)}>
-              {renderVarOptionsAll(xVarKey)}
-            </select>
+            <Select<string> className={selectCls} value={xVarKey} onChange={setXVarKey}
+              options={varOptionsAllSelect()} />
           </label>
 
           <div className="flex flex-col gap-1 justify-end">
@@ -1221,7 +1221,7 @@ function FreeBuilder() {
               type="button"
               onClick={swapAxes}
               title="Swap X and Y"
-              className="bg-ow-dark border border-white/20 rounded-xl px-3 py-2 text-slate-300
+              className="bg-ow-dark border border-ow-line rounded-xl px-3 py-2 text-ow-muted
                 hover:border-ow-orange/50 hover:text-ow-orange transition-colors font-display text-sm">
               ⇄
             </button>
@@ -1229,86 +1229,82 @@ function FreeBuilder() {
 
           <label className="flex flex-col gap-1">
             <span className={labelCls}>Y-axis variable</span>
-            <select className={selectCls} value={yVarKey} onChange={e => setYVarKey(e.target.value)}>
-              <option value="">— None (one variable) —</option>
-              {renderVarOptionsAll(yVarKey)}
-            </select>
+            <Select<string> className={selectCls} value={yVarKey} onChange={setYVarKey}
+              options={[{ value: '', label: '— None (one variable) —' }, ...varOptionsAllSelect()]} />
           </label>
 
           {(validity.shape === 'crosstab' || validity.shape === 'single') && (
             <label className="flex flex-col gap-1">
               <span className={labelCls}>{validity.shape === 'single' ? 'Show' : 'Cell shows'}</span>
-              <select className={selectCls} value={cellMeasure} onChange={e => setCellMeasure(e.target.value as CellMeasure)}>
-                {CELL_MEASURES.map(m => <option key={m.kind} value={m.kind}>{m.label}</option>)}
-              </select>
+              <Select<CellMeasure> className={selectCls} value={cellMeasure} onChange={setCellMeasure}
+                options={CELL_MEASURES.map(m => ({ value: m.kind, label: m.label }))} />
             </label>
           )}
 
           {(validity.shape === 'crosstab' || validity.shape === 'single') && cellMeasure === 'avg' && (
             <label className="flex flex-col gap-1">
               <span className={labelCls}>Of which stat</span>
-              <select className={selectCls} value={avgVarKey} onChange={e => setAvgVarKey(e.target.value)}>
-                {numVars().filter(v => v.grain === grain).map(v => (
-                  <option key={v.key} value={v.key}>{v.label}</option>
-                ))}
-              </select>
+              <Select<string> className={selectCls} value={avgVarKey} onChange={setAvgVarKey}
+                options={numVars().filter(v => v.grain === grain).map(v => ({ value: v.key, label: v.label }))} />
             </label>
           )}
 
           {(validity.shape === 'crosstab' || validity.shape === 'cat_num' || validity.shape === 'single') && (
             <label className="flex flex-col gap-1">
               <span className={labelCls}>View as</span>
-              <select className={selectCls} value={freeChart} onChange={e => setFreeChart(e.target.value as FreeChartType)}>
-                {(validity.shape === 'crosstab'
+              <Select<FreeChartType> className={selectCls} value={freeChart} onChange={setFreeChart}
+                options={(validity.shape === 'crosstab'
                   ? (['heatmap', 'bars', 'line', 'area', 'radar'] as FreeChartType[])
                   : (['bars', 'line', 'area', 'radar'] as FreeChartType[])
-                ).map(ft => (
-                  <option key={ft} value={ft} disabled={chartAvail[ft] !== null}>
-                    {ft === 'bars' ? 'Bars' : ft[0].toUpperCase() + ft.slice(1)}{chartAvail[ft] ? ' — N/A' : ''}
-                  </option>
-                ))}
-              </select>
+                ).map(ft => ({
+                  value: ft,
+                  label: `${ft === 'bars' ? 'Bars' : ft[0].toUpperCase() + ft.slice(1)}${chartAvail[ft] ? ' — N/A' : ''}`,
+                  disabled: chartAvail[ft] !== null,
+                }))} />
             </label>
           )}
 
           {validity.shape !== 'scatter' && (
             <label className="flex flex-col gap-1">
               <span className={labelCls}>Small samples (&lt;5)</span>
-              <select className={selectCls} value={subFive} onChange={e => setSubFive(e.target.value as 'show' | 'hide' | 'only')}>
-                <option value="show">Show all</option>
-                <option value="hide">Hide &lt;5-game</option>
-                <option value="only">Only &lt;5-game</option>
-              </select>
+              <Select<'show' | 'hide' | 'only'> className={selectCls} value={subFive} onChange={setSubFive}
+                options={[
+                  { value: 'show', label: 'Show all' },
+                  { value: 'hide', label: 'Hide <5-game' },
+                  { value: 'only', label: 'Only <5-game' },
+                ]} />
             </label>
           )}
         </div>
 
         {/* Win-rate "nugget" filter — on any bucketed win-rate chart. */}
         {winFilterApplies && (
-          <div className="flex flex-wrap items-end gap-4 mt-4 pt-4 border-t border-white/10">
+          <div className="flex flex-wrap items-end gap-4 mt-4 pt-4 border-t border-ow-line">
             <label className="flex flex-col gap-1">
               <span className={labelCls}>Win-rate filter</span>
-              <select
+              <Select<WinFilter['mode']>
                 className={selectCls}
                 value={winFilter.mode}
-                onChange={e => setWinFilter({ ...winFilter, mode: e.target.value as WinFilter['mode'] })}>
-                <option value="off">Off — show everything</option>
-                <option value="threshold">Win rate is…</option>
-                <option value="vs_baseline">Compare to my average</option>
-              </select>
+                onChange={v => setWinFilter({ ...winFilter, mode: v })}
+                options={[
+                  { value: 'off', label: 'Off — show everything' },
+                  { value: 'threshold', label: 'Win rate is…' },
+                  { value: 'vs_baseline', label: 'Compare to my average' },
+                ]} />
             </label>
 
             {winFilter.mode === 'threshold' && (
               <>
                 <label className="flex flex-col gap-1">
                   <span className={labelCls}>Direction</span>
-                  <select
+                  <Select<WinFilter['dir']>
                     className={selectCls}
                     value={winFilter.dir}
-                    onChange={e => setWinFilter({ ...winFilter, dir: e.target.value as WinFilter['dir'] })}>
-                    <option value="above">At least (≥)</option>
-                    <option value="below">At most (≤)</option>
-                  </select>
+                    onChange={v => setWinFilter({ ...winFilter, dir: v })}
+                    options={[
+                      { value: 'above', label: 'At least (\u2265)' },
+                      { value: 'below', label: 'At most (\u2264)' },
+                    ]} />
                 </label>
                 <label className="flex flex-col gap-1">
                   <span className={labelCls}>Win rate %</span>
@@ -1324,18 +1320,19 @@ function FreeBuilder() {
             {winFilter.mode === 'vs_baseline' && (
               <label className="flex flex-col gap-1">
                 <span className={labelCls}>Show…</span>
-                <select
+                <Select<WinFilter['dir']>
                   className={selectCls}
                   value={winFilter.dir}
-                  onChange={e => setWinFilter({ ...winFilter, dir: e.target.value as WinFilter['dir'] })}>
-                  <option value="above">Above my average</option>
-                  <option value="below">Below my average</option>
-                </select>
+                  onChange={v => setWinFilter({ ...winFilter, dir: v })}
+                  options={[
+                    { value: 'above', label: 'Above my average' },
+                    { value: 'below', label: 'Below my average' },
+                  ]} />
               </label>
             )}
 
             {winFilterActive && (
-              <span className="text-[11px] text-slate-500 self-center max-w-[14rem]">
+              <span className="text-[11px] text-ow-faint self-center max-w-[14rem]">
                 Matches stay bright; everything else dims.
               </span>
             )}
@@ -1346,12 +1343,12 @@ function FreeBuilder() {
           <p className="text-[11px] text-ow-defeat/90 mt-3">{validity.reason}</p>
         )}
         {validity.ok && validity.shape === 'crosstab' && yVar && (
-          <p className="text-[11px] text-slate-500 mt-3">
+          <p className="text-[11px] text-ow-faint mt-3">
             Each cell is the {cellMeasure === 'avg' ? `average ${avgVar.label.toLowerCase()}` : cellMeasureLabel.toLowerCase()} of games where {xVar.label} meets {yVar.label}. Brighter = better; cells under 5 games are ringed in red.
           </p>
         )}
         {validity.ok && validity.shape === 'single' && (
-          <p className="text-[11px] text-slate-500 mt-3">
+          <p className="text-[11px] text-ow-faint mt-3">
             {measureWord} by {xVar.label}, one bar per value. Add a Y variable to cross-tabulate two variables instead.
           </p>
         )}
@@ -1361,19 +1358,19 @@ function FreeBuilder() {
           </p>
         )}
         {validity.ok && validity.shape === 'cat_num' && splitByFormat && (
-          <p className="text-[11px] text-slate-500 mt-3">5v5 and 6v6 are shown as separate series (never blended). Pick a Queue to focus one format.</p>
+          <p className="text-[11px] text-ow-faint mt-3">5v5 and 6v6 are shown as separate series (never blended). Pick a Queue to focus one format.</p>
         )}
         {validity.ok && grain === 'hero' && (
-          <p className="text-[11px] text-slate-500 mt-2">Per-hero data: rates are games-weighted (a multi-hero game counts once).</p>
+          <p className="text-[11px] text-ow-faint mt-2">Per-hero data: rates are games-weighted (a multi-hero game counts once).</p>
         )}
       </div>
 
       {/* Output */}
-      <div className="bg-ow-panel rounded-xl border border-white/10 p-4">
+      <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
         <div className="flex items-baseline justify-between mb-3 flex-wrap gap-2">
-          <h2 className="font-display tracking-[0.12em] text-slate-100 uppercase text-sm">{chartTitle}</h2>
+          <h2 className="font-display tracking-[0.12em] text-ow-fg uppercase text-sm">{chartTitle}</h2>
           <div className="flex items-center gap-3">
-            <span className="text-xs text-slate-500 font-display tracking-wider">
+            <span className="text-xs text-ow-faint font-display tracking-wider">
               {validity.shape === 'scatter'
                 ? `${scatter.length} point${scatter.length === 1 ? '' : 's'}`
                 : `n = ${totalN} match${totalN === 1 ? '' : 'es'}`}
@@ -1385,7 +1382,7 @@ function FreeBuilder() {
               className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-display tracking-wider uppercase transition-colors border disabled:opacity-40 ${
                 saved
                   ? 'bg-ow-orange text-ow-dark border-ow-orange font-bold'
-                  : 'bg-ow-dark text-slate-300 border-white/20 hover:border-ow-orange/50'
+                  : 'bg-ow-dark text-ow-muted border-ow-line hover:border-ow-orange/50'
               }`}>
               <span>{saved ? '★' : '☆'}</span>
               {saved ? 'Saved' : 'Save chart'}
@@ -1394,16 +1391,16 @@ function FreeBuilder() {
         </div>
 
         {loading ? (
-          <div className="h-[360px] flex items-center justify-center text-slate-400 font-display tracking-wider">LOADING…</div>
+          <div className="h-[360px] flex items-center justify-center text-ow-muted font-display tracking-wider">LOADING…</div>
         ) : !validity.ok ? (
           <div className="h-[360px] flex flex-col items-center justify-center text-center px-6">
-            <p className="font-display tracking-wider text-slate-300 uppercase text-sm">Pick a valid pair</p>
-            <p className="text-sm text-slate-500 mt-1 max-w-md">{validity.reason}</p>
+            <p className="font-display tracking-wider text-ow-muted uppercase text-sm">Pick a valid pair</p>
+            <p className="text-sm text-ow-faint mt-1 max-w-md">{validity.reason}</p>
           </div>
         ) : !hasData ? (
           <div className="h-[360px] flex flex-col items-center justify-center text-center">
-            <p className="font-display tracking-wider text-slate-300 uppercase text-sm">No data</p>
-            <p className="text-sm text-slate-500 mt-1">No matches fit these filters.</p>
+            <p className="font-display tracking-wider text-ow-muted uppercase text-sm">No data</p>
+            <p className="text-sm text-ow-faint mt-1">No matches fit these filters.</p>
           </div>
         ) : validity.shape === 'crosstab' && freeChart === 'heatmap' && ctShown ? (
           <FreeHeatmap
@@ -1421,7 +1418,7 @@ function FreeBuilder() {
               {renderChart(freeChartToChartType(freeChart), {
                 chartData: barData.data, seriesKeys: barData.seriesKeys, pieData: [],
                 valueFormat: cellFormat, seriesLabel: (s: string) => s,
-              })}
+              }, cc)}
             </ResponsiveContainer>
           </div>
         ) : validity.shape === 'single' && singleShown ? (
@@ -1433,6 +1430,7 @@ function FreeBuilder() {
                 singleShown.seriesKeys,
                 cellFormat,
                 (s: string) => (s === 'all' ? measureWord : s.toUpperCase()),
+                cc,
                 winFilterActive && passBuckets
                   ? (bucket: string) => !passBuckets.has(bucket)
                   : undefined,
@@ -1446,42 +1444,43 @@ function FreeBuilder() {
                 chartData: catNumShown.data, seriesKeys: catNumShown.seriesKeys, pieData: [],
                 valueFormat: catNumFormat,
                 seriesLabel: (s: string) => (s === 'all' ? (catNumAgg?.numVar.label ?? '') : s.toUpperCase()),
-              })}
+              }, cc)}
             </ResponsiveContainer>
           </div>
         ) : validity.shape === 'scatter' && yVar ? (
           <div className="h-[400px]">
             <ResponsiveContainer width="100%" height="100%">
-              {renderScatter(scatter, xVar.label, yVar.label, xVar.format, yVar.format)}
+              {renderScatter(scatter, xVar.label, yVar.label, xVar.format, yVar.format, cc)}
             </ResponsiveContainer>
           </div>
         ) : null}
 
         {validity.ok && validity.shape === 'crosstab' && (
-          <p className="text-[11px] text-slate-600 mt-3">
+          <p className="text-[11px] text-ow-faint mt-3">
             Cells under 5 games are low-confidence — use the &lt;5 control to drop or isolate them. A “·” means no games at that intersection.
           </p>
         )}
       </div>
 
       {/* Saved charts panel (Free Builder's own store) */}
-      <div className="bg-ow-panel rounded-xl border border-white/10 p-4">
+      <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
         <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
           <button
             onClick={() => setPanelOpen(o => !o)}
-            className="flex items-center gap-2 text-slate-200 hover:text-ow-orange transition-colors">
+            className="flex items-center gap-2 text-ow-fg hover:text-ow-orange transition-colors">
             <div className="h-1 w-10 bg-ow-orange rounded-full" />
             <span className="font-display tracking-[0.15em] uppercase text-xs">
               Saved free charts ({savedStats.length})
             </span>
-            <span className="text-slate-500 text-xs">{panelOpen ? '▾' : '▸'}</span>
+            <span className="text-ow-faint text-xs">{panelOpen ? '▾' : '▸'}</span>
           </button>
           <label className="flex items-center gap-2">
             <span className={labelCls}>Showing</span>
-            <select className={selectCls} value={scope} onChange={e => setScope(e.target.value as 'season' | 'all')}>
-              <option value="season">{season ? `This season (${season.name})` : 'This season'}</option>
-              <option value="all">All time</option>
-            </select>
+            <Select<'season' | 'all'> className={selectCls} value={scope} onChange={setScope}
+              options={[
+                { value: 'season', label: season ? `This season (${season.name})` : 'This season' },
+                { value: 'all', label: 'All time' },
+              ]} />
           </label>
         </div>
 
@@ -1493,7 +1492,7 @@ function FreeBuilder() {
 
         {panelOpen && (
           savedStats.length === 0 ? (
-            <p className="text-sm text-slate-500">
+            <p className="text-sm text-ow-faint">
               No saved free charts yet. Build a cut you like and hit ★ Save chart — revisits get counted here.
             </p>
           ) : (
@@ -1504,16 +1503,16 @@ function FreeBuilder() {
                   <button
                     key={s.config_key}
                     onClick={() => loadSaved(s)}
-                    className="w-full text-left bg-ow-dark rounded-lg px-3 py-2.5 border border-white/10
+                    className="w-full text-left bg-ow-dark rounded-lg px-3 py-2.5 border border-ow-line
                       hover:border-ow-orange/40 transition-colors flex items-center justify-between gap-3">
-                    <span className="font-display text-sm text-slate-100 truncate">{s.label}</span>
+                    <span className="font-display text-sm text-ow-fg truncate">{s.label}</span>
                     <span className="flex items-center gap-3 shrink-0 text-[11px] font-display tracking-wider">
                       <span className="text-ow-orange">{s.distinctSessions} session{s.distinctSessions === 1 ? '' : 's'}</span>
-                      <span className="text-slate-400">{s.totalViews} view{s.totalViews === 1 ? '' : 's'}</span>
+                      <span className="text-ow-muted">{s.totalViews} view{s.totalViews === 1 ? '' : 's'}</span>
                     </span>
                   </button>
                 ))}
-              <p className="text-[11px] text-slate-600 mt-1">
+              <p className="text-[11px] text-ow-faint mt-1">
                 Sorted by distinct sessions returned — the signal that a chart is worth promoting to a curated page.
               </p>
             </div>
@@ -1525,21 +1524,20 @@ function FreeBuilder() {
 }
 
 // Full variable list for both Free Builder axes, grouped, with readiness hints.
-function renderVarOptionsAll(_current: string) {
+// Flat array form for the custom <Select> (group folded into the label as a
+// prefix, since <Select> has no optgroups).
+function varOptionsAllSelect(): { value: string; label: string }[] {
   const groups = new Map<string, VarDef[]>()
   for (const v of VARIABLES) {
     if (!groups.has(v.group)) groups.set(v.group, [])
     groups.get(v.group)!.push(v)
   }
-  return Array.from(groups.entries()).map(([group, items]) => (
-    <optgroup key={group} label={group}>
-      {items.map(v => (
-        <option key={v.key} value={v.key}>
-          {v.label}{v.ready !== 'ready' ? ` (${READY_BADGE[v.ready].label.toLowerCase()})` : ''}
-        </option>
-      ))}
-    </optgroup>
-  ))
+  return Array.from(groups.entries()).flatMap(([group, items]) =>
+    items.map(v => ({
+      value: v.key,
+      label: `${group} — ${v.label}${v.ready !== 'ready' ? ` (${READY_BADGE[v.ready].label.toLowerCase()})` : ''}`,
+    })),
+  )
 }
 
 // ============================================================
@@ -1552,7 +1550,7 @@ export default function AnalyticsBuilderPage() {
     `px-4 py-2 rounded-lg text-xs font-display tracking-[0.12em] uppercase transition-colors border ${
       active
         ? 'bg-ow-orange text-ow-dark border-ow-orange font-bold'
-        : 'bg-ow-dark text-slate-300 border-white/20 hover:border-ow-orange/50'
+        : 'bg-ow-dark text-ow-muted border-ow-line hover:border-ow-orange/50'
     }`
 
   return (
@@ -1566,7 +1564,7 @@ export default function AnalyticsBuilderPage() {
       <div className="flex items-center gap-2">
         <button className={tabCls(tab === 'chart')} onClick={() => setTab('chart')}>Chart Builder</button>
         <button className={tabCls(tab === 'free')} onClick={() => setTab('free')}>Free Builder</button>
-        <span className="text-[11px] text-slate-500 ml-2">
+        <span className="text-[11px] text-ow-faint ml-2">
           {tab === 'chart' ? 'Variable × measure × chart type.' : 'Variable × variable — full control of both axes.'}
         </span>
       </div>

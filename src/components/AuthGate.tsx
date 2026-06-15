@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import type { Session } from '@supabase/supabase-js'
 import { supabase } from '@/lib/supabase'
+import ThemeInit from '@/components/ThemeInit'
 
 // AuthGate wraps the whole app.
 //   - While we check for an existing session: a quiet loading state.
@@ -33,7 +34,7 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
   if (checking) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-ow-dark">
-        <p className="font-display tracking-[0.3em] text-slate-500 text-sm uppercase animate-pulse">
+        <p className="font-display tracking-[0.3em] text-ow-faint text-sm uppercase animate-pulse">
           Loading
         </p>
       </div>
@@ -44,7 +45,14 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
     return <LoginScreen />
   }
 
-  return <>{children}</>
+  // Signed in: load + apply the stored theme preference once (ThemeInit also
+  // keeps it in sync with live OS light/dark changes while mode is 'system').
+  return (
+    <>
+      <ThemeInit />
+      {children}
+    </>
+  )
 }
 
 function LoginScreen() {
@@ -99,15 +107,15 @@ function LoginScreen() {
       <div className="relative w-full max-w-sm">
         <div className="h-1 w-16 bg-ow-orange mb-6 mx-auto rounded-full" />
 
-        <h1 className="font-display text-3xl tracking-[0.2em] text-center text-slate-100 uppercase">
+        <h1 className="font-display text-3xl tracking-[0.2em] text-center text-ow-fg uppercase">
           Overwatch
         </h1>
         <p className="font-display text-sm tracking-[0.4em] text-center text-ow-orange uppercase mt-1 mb-8">
           Ranked Tracker
         </p>
 
-        <div className="bg-ow-panel/80 backdrop-blur-sm border border-white/5 rounded-xl p-6 shadow-2xl">
-          <label className="block text-xs font-display tracking-wider text-slate-400 uppercase mb-2">
+        <div className="bg-ow-panel/80 backdrop-blur-sm border border-ow-line rounded-xl p-6 shadow-2xl">
+          <label className="block text-xs font-display tracking-wider text-ow-muted uppercase mb-2">
             Email address
           </label>
           <input
@@ -116,13 +124,13 @@ function LoginScreen() {
             onChange={(ev) => setEmail(ev.target.value)}
             placeholder="you@example.com"
             autoComplete="email"
-            className="w-full bg-ow-dark/80 border border-white/10 rounded-lg px-4 py-3
-                       text-slate-100 placeholder-slate-600 outline-none
+            className="w-full bg-ow-dark/80 border border-ow-line rounded-lg px-4 py-3
+                       text-ow-fg placeholder-ow-faint outline-none
                        focus:border-ow-orange/60 focus:ring-1 focus:ring-ow-orange/30
                        transition-colors"
           />
 
-          <label className="block text-xs font-display tracking-wider text-slate-400 uppercase mb-2 mt-4">
+          <label className="block text-xs font-display tracking-wider text-ow-muted uppercase mb-2 mt-4">
             Password
           </label>
           <input
@@ -132,8 +140,8 @@ function LoginScreen() {
             onKeyDown={(ev) => ev.key === 'Enter' && signIn()}
             placeholder="********"
             autoComplete="current-password"
-            className="w-full bg-ow-dark/80 border border-white/10 rounded-lg px-4 py-3
-                       text-slate-100 placeholder-slate-600 outline-none
+            className="w-full bg-ow-dark/80 border border-ow-line rounded-lg px-4 py-3
+                       text-ow-fg placeholder-ow-faint outline-none
                        focus:border-ow-orange/60 focus:ring-1 focus:ring-ow-orange/30
                        transition-colors"
           />

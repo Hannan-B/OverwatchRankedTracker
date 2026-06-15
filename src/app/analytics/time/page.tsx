@@ -1,12 +1,14 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   Cell, LabelList, LineChart, Line, Legend,
 } from 'recharts'
 import { supabase } from '@/lib/supabase'
 import { matchQuery } from '@/lib/alpha'
+import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
+import { defaultSeasonSelection } from '@/lib/season-util'
 import AnalyticsFilters, {
   DEFAULT_FILTERS,
   matchesFilters,
@@ -14,8 +16,10 @@ import AnalyticsFilters, {
   type FilterableMatch,
 } from '@/components/AnalyticsFilters'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
+import { useChartColors } from '@/components/useChartColors'
+import { type ChartColors } from '@/lib/chart-theme'
 import {
-  MIN_GAMES, SESSION_GAP_MINUTES,
+  SESSION_GAP_MINUTES,
   streaks, sessionOverview, overallWinRate,
   winRateByTimeBlock, winRateByGameLength,
   winRateByPositionInSession, winRateByTimeIntoSession,
@@ -55,52 +59,48 @@ import {
 //           every match is season_id=null and groups under one "All time" panel.
 // ============================================================
 
-const OW = {
-  orange: '#f99e1a', accent: '#ffcb6b', victory: '#3fb950', defeat: '#f85149',
-  draw: '#8b949e', grid: 'rgba(255,255,255,0.08)', axis: 'rgba(255,255,255,0.45)',
-}
+interface TimeMatchRow extends FilterableMatch, TimeMatch { season_id: number | null }
 
-interface TimeMatchRow extends FilterableMatch, TimeMatch {}
-
-const MATCH_COLS = 'id, result, role_played, match_format, game_mode, map, played_at, game_length_seconds, season_id'
+const MATCH_COLS = 'id, result, role_played, match_format, game_mode, map, played_at, game_length_seconds, season_id, team_leaver, enemy_leaver'
 const HERO_COLS = 'match_id, hero_name'
 const SEASON_COLS = 'id, name, start_date, end_date'
 
 // Win-rate colour for a bar (green strong, amber mid, red weak; grey when null).
-function wrColor(wr: number | null): string {
-  if (wr === null) return OW.draw
-  return wr >= 55 ? OW.victory : wr <= 45 ? OW.defeat : OW.accent
+function wrColor(wr: number | null, c: ChartColors): string {
+  if (wr === null) return c.draw
+  return wr >= 55 ? c.victory : wr <= 45 ? c.defeat : c.primary
 }
 
 // Heatmap cell background: green/amber/red by win rate (faint when no data).
-function heatColor(cell: HeatCell): string {
-  if (cell.winRate === null) return 'rgba(255,255,255,0.03)'
-  return cell.winRate >= 55 ? OW.victory : cell.winRate <= 45 ? OW.defeat : OW.accent
+function heatColor(cell: HeatCell, c: ChartColors): string {
+  if (cell.winRate === null) return 'rgba(127,127,127,0.10)'
+  return cell.winRate >= 55 ? c.victory : cell.winRate <= 45 ? c.defeat : c.primary
 }
 
 // Distinct hues for season bands / lines (cycled if more than this many).
-const SEASON_HUES = ['#f99e1a', '#58a6ff', '#3fb950', '#bc8cff', '#f85149', '#ffcb6b']
+const seasonHues = (c: ChartColors) => c.categorical
 
-const axisTick = { fill: OW.axis, fontSize: 11 }
-const tooltipStyle = {
-  contentStyle: { background: '#0f1419', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 8, fontSize: 12 },
-  labelStyle: { color: '#e6edf3' },
-}
+const axisTickOf = (c: ChartColors) => ({ fill: c.axisLabel, fontSize: 11 })
+const tooltipStyleOf = (c: ChartColors) => ({
+  contentStyle: { background: c.tooltipBg, border: `1px solid ${c.tooltipBorder}`, borderRadius: 8, fontSize: 12 },
+  labelStyle: { color: c.tooltipText },
+})
 
 // Horizontal win-rate bars (ordered, not sorted). `flagDecay` tints belowAverage
 // buckets red regardless of their own WR — the decay-point band.
 function WinRateBars({ data, label, flagDecay = false }: { data: CatRow[]; label: string; flagDecay?: boolean }) {
+  const cc = useChartColors()
   if (data.length === 0) return <Empty label={label} />
   const height = Math.max(160, data.length * 34 + 40)
   return (
     <div style={{ height }}>
       <ResponsiveContainer width="100%" height="100%">
         <BarChart data={data} layout="vertical" margin={{ top: 4, right: 96, bottom: 4, left: 8 }}>
-          <CartesianGrid stroke={OW.grid} horizontal={false} />
-          <XAxis type="number" domain={[0, 100]} tick={axisTick} stroke={OW.axis} unit="%" />
-          <YAxis type="category" dataKey="key" tick={axisTick} stroke={OW.axis} width={130} />
+          <CartesianGrid stroke={cc.grid} horizontal={false} />
+          <XAxis type="number" domain={[0, 100]} tick={axisTickOf(cc)} stroke={cc.axis} unit="%" />
+          <YAxis type="category" dataKey="key" tick={axisTickOf(cc)} stroke={cc.axis} width={130} />
           <Tooltip
-            {...tooltipStyle}
+            {...tooltipStyleOf(cc)}
             formatter={(_v, _n, p) => {
               const row = (p as { payload?: CatRow } | undefined)?.payload
               const wr = row?.winRate
@@ -109,7 +109,7 @@ function WinRateBars({ data, label, flagDecay = false }: { data: CatRow[]; label
             }} />
           <Bar dataKey={(d: CatRow) => d.winRate ?? 0} radius={[0, 4, 4, 0]} isAnimationActive={false}>
             {data.map((d, i) => (
-              <Cell key={i} fill={flagDecay && d.belowAverage ? OW.defeat : wrColor(d.winRate)} fillOpacity={d.lowConfidence ? 0.4 : 1} />
+              <Cell key={i} fill={flagDecay && d.belowAverage ? cc.defeat : wrColor(d.winRate, cc)} fillOpacity={d.lowConfidence ? 0.4 : 1} />
             ))}
             <LabelList dataKey="winRate" position="right" content={(props: unknown) => {
               const p = props as { x?: number; y?: number; width?: number; height?: number; index?: number }
@@ -118,7 +118,7 @@ function WinRateBars({ data, label, flagDecay = false }: { data: CatRow[]; label
               const mark = flagDecay && row.belowAverage ? ' ↓' : ''
               const txt = `${row.winRate == null ? '—' : row.winRate + '%'}  n=${row.games}${mark}`
               return (
-                <text x={p.x + p.width + 6} y={p.y + p.height / 2} dominantBaseline="central" fill="#e6edf3" fontSize={11} fontFamily="inherit">{txt}</text>
+                <text x={p.x + p.width + 6} y={p.y + p.height / 2} dominantBaseline="central" fill={cc.axisLabel} fontSize={11} fontFamily="inherit">{txt}</text>
               )
             }} />
           </Bar>
@@ -131,17 +131,17 @@ function WinRateBars({ data, label, flagDecay = false }: { data: CatRow[]; label
 function Empty({ label }: { label: string }) {
   return (
     <div className="h-[160px] flex items-center justify-center text-center">
-      <p className="text-sm text-slate-500">No data for {label} with these filters yet.</p>
+      <p className="text-sm text-ow-faint">No data for {label} with these filters yet.</p>
     </div>
   )
 }
 
 function Panel({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div className="bg-ow-panel rounded-xl border border-white/10 p-4">
+    <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
       <div className="flex items-baseline justify-between gap-2 mb-3">
-        <h2 className="font-display tracking-[0.12em] text-slate-100 uppercase text-sm">{title}</h2>
-        {hint && <span className="text-[11px] text-slate-500">{hint}</span>}
+        <h2 className="font-display tracking-[0.12em] text-ow-fg uppercase text-sm">{title}</h2>
+        {hint && <span className="text-[11px] text-ow-faint">{hint}</span>}
       </div>
       {children}
     </div>
@@ -149,11 +149,11 @@ function Panel({ title, hint, children }: { title: string; hint?: string; childr
 }
 
 function Stat({ value, label, tone = 'default' }: { value: string; label: string; tone?: 'default' | 'win' | 'loss' }) {
-  const color = tone === 'win' ? 'text-ow-victory' : tone === 'loss' ? 'text-ow-defeat' : 'text-slate-100'
+  const color = tone === 'win' ? 'text-ow-victory' : tone === 'loss' ? 'text-ow-defeat' : 'text-ow-fg'
   return (
-    <div className="bg-ow-panel rounded-xl border border-white/10 p-4 flex flex-col gap-1">
+    <div className="bg-ow-panel rounded-xl border border-ow-line p-4 flex flex-col gap-1">
       <span className={`font-display text-3xl tracking-wider ${color}`}>{value}</span>
-      <span className="text-[11px] text-slate-400 font-display tracking-wider uppercase">{label}</span>
+      <span className="text-[11px] text-ow-muted font-display tracking-wider uppercase">{label}</span>
     </div>
   )
 }
@@ -161,6 +161,7 @@ function Stat({ value, label, tone = 'default' }: { value: string; label: string
 // ---- Heatmap grid (HTML/CSS — recharts has no native heatmap).
 // Colour = win rate; the game count n is printed in-cell; sparse cells dimmed.
 function HeatGrid({ map, label }: { map: Heatmap; label: string }) {
+  const cc = useChartColors()
   if (map.rowLabels.length === 0 || map.colLabels.length === 0) return <Empty label={label} />
   const cellAt = (r: string, c: string) => map.cells.find(x => x.rowKey === r && x.colKey === c)
   return (
@@ -170,24 +171,24 @@ function HeatGrid({ map, label }: { map: Heatmap; label: string }) {
           <tr>
             <th className="w-20" />
             {map.colLabels.map(c => (
-              <th key={c} className="text-[10px] text-slate-400 font-display tracking-wider uppercase px-1 pb-1 align-bottom" style={{ minWidth: 54 }}>{c}</th>
+              <th key={c} className="text-[10px] text-ow-muted font-display tracking-wider uppercase px-1 pb-1 align-bottom" style={{ minWidth: 54 }}>{c}</th>
             ))}
           </tr>
         </thead>
         <tbody>
           {map.rowLabels.map(r => (
             <tr key={r}>
-              <td className="text-[10px] text-slate-400 font-display tracking-wider uppercase pr-2 text-right whitespace-nowrap">{r}</td>
+              <td className="text-[10px] text-ow-muted font-display tracking-wider uppercase pr-2 text-right whitespace-nowrap">{r}</td>
               {map.colLabels.map(c => {
                 const cl = cellAt(r, c)
                 const empty = !cl || cl.games === 0
                 const op = empty ? 1 : cl!.lowConfidence ? 0.4 : 1
                 return (
                   <td key={c} className="rounded-md text-center align-middle"
-                    style={{ background: empty ? 'rgba(255,255,255,0.03)' : heatColor(cl!), opacity: op, height: 40, minWidth: 54 }}
+                    style={{ background: empty ? 'rgba(255,255,255,0.03)' : heatColor(cl!, cc), opacity: op, height: 40, minWidth: 54 }}
                     title={cl ? `${r} · ${c}: ${cl.winRate == null ? '—' : cl.winRate + '%'} · ${cl.games} games` : ''}>
                     {empty ? (
-                      <span className="text-[10px] text-slate-600">·</span>
+                      <span className="text-[10px] text-ow-faint">·</span>
                     ) : (
                       <div className="leading-tight">
                         <div className="text-[11px] font-display text-[#0b0e13]">{cl!.winRate == null ? '—' : `${cl!.winRate}%`}</div>
@@ -206,16 +207,23 @@ function HeatGrid({ map, label }: { map: Heatmap; label: string }) {
 }
 
 export default function TimePage() {
+  const cc = useChartColors()
   const [filters, setFilters] = useState<AnalyticsFilterState>(DEFAULT_FILTERS)
   const [matches, setMatches] = useState<TimeMatchRow[]>([])
   const [heroRows, setHeroRows] = useState<{ match_id: number; hero_name: string }[]>([])
   const [seasons, setSeasons] = useState<SeasonRow[]>([])
   const [hiddenSeasons, setHiddenSeasons] = useState<Set<number | null>>(new Set())
   const [loading, setLoading] = useState(true)
+  // Re-runs the filter memo once the leaver preference has loaded (cache starts
+  // at "hide"); Time is a performance surface, so leaver games are excluded.
+  const [leaverReady, setLeaverReady] = useState(false)
+  // Seed the current-season default only once.
+  const seasonDefaulted = useRef(false)
 
   useEffect(() => {
     let cancelled = false
     setLoading(true)
+    loadLeaverPref().then(() => { if (!cancelled) setLeaverReady(true) })
     Promise.all([
       matchQuery(MATCH_COLS).order('played_at', { ascending: true }),
       supabase.from('hero_match_facts').select(HERO_COLS),
@@ -224,7 +232,12 @@ export default function TimePage() {
       if (cancelled) return
       setMatches((((mRes as unknown) as { data: TimeMatchRow[] | null }).data) || [])
       setHeroRows((((hRes as unknown) as { data: { match_id: number; hero_name: string }[] | null }).data) || [])
-      setSeasons((((sRes as unknown) as { data: SeasonRow[] | null }).data) || [])
+      const seasonRows = (((sRes as unknown) as { data: SeasonRow[] | null }).data) || []
+      setSeasons(seasonRows)
+      if (!seasonDefaulted.current) {
+        seasonDefaulted.current = true
+        setFilters(f => ({ ...f, seasons: defaultSeasonSelection(seasonRows) }))
+      }
       setLoading(false)
     })
     return () => { cancelled = true }
@@ -240,12 +253,14 @@ export default function TimePage() {
   }, [heroRows])
 
   const rows = useMemo(() => {
-    const base = matches.filter(m => matchesFilters(m, filters))
+    const excludeLeavers = !showLeaverGames()
+    const base = matches.filter(m => matchesFilters(m, filters, { excludeLeavers }))
     if (filters.hero === '') return base
     const ids = matchIdsByHero.get(filters.hero)
     if (!ids) return []
     return base.filter(m => ids.has(m.id))
-  }, [matches, filters, matchIdsByHero])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, filters, matchIdsByHero, leaverReady])
 
   // season id → name. With no seasons, the only group is null → "All time".
   // Once seasons exist, an unassigned (null) match is "Unassigned".
@@ -259,18 +274,18 @@ export default function TimePage() {
   const streakSummary = useMemo(() => streaks(rows), [rows])
   const overview = useMemo(() => sessionOverview(rows), [rows])
   const overall = useMemo(() => overallWinRate(rows), [rows])
-  const byTimeBlock = useMemo(() => winRateByTimeBlock(rows), [rows])
-  const byLength = useMemo(() => winRateByGameLength(rows), [rows])
-  const byPosition = useMemo(() => winRateByPositionInSession(rows), [rows])
-  const byElapsed = useMemo(() => winRateByTimeIntoSession(rows), [rows])
+  const byTimeBlock = useMemo(() => winRateByTimeBlock(rows, filters.minGames), [rows, filters.minGames])
+  const byLength = useMemo(() => winRateByGameLength(rows, filters.minGames), [rows, filters.minGames])
+  const byPosition = useMemo(() => winRateByPositionInSession(rows, filters.minGames), [rows, filters.minGames])
+  const byElapsed = useMemo(() => winRateByTimeIntoSession(rows, filters.minGames), [rows, filters.minGames])
   const decayHours = useMemo(() => decayByHoursPlayed(rows), [rows])
-  const decayDeep = useMemo(() => decayByGamesDeep(rows), [rows])
-  const monthSessions = useMemo(() => avgSessionPerMonth(rows), [rows])
-  const weekGroups = useMemo(() => winRateByWeekPerSeason(rows, seasonName), [rows, seasonName])
+  const decayDeep = useMemo(() => decayByGamesDeep(rows, filters.minGames), [rows, filters.minGames])
+  const monthSessions = useMemo(() => avgSessionPerMonth(rows, filters.minGames), [rows, filters.minGames])
+  const weekGroups = useMemo(() => winRateByWeekPerSeason(rows, seasonName, filters.minGames), [rows, seasonName, filters.minGames])
 
-  const heatDayTime = useMemo(() => heatmapDayByTimeOfDay(rows), [rows])
-  const heatWeekDay = useMemo(() => heatmapWeekByDay(rows), [rows])
-  const heatSession = useMemo(() => heatmapSessionShape(rows), [rows])
+  const heatDayTime = useMemo(() => heatmapDayByTimeOfDay(rows, filters.minGames), [rows, filters.minGames])
+  const heatWeekDay = useMemo(() => heatmapWeekByDay(rows, filters.minGames), [rows, filters.minGames])
+  const heatSession = useMemo(() => heatmapSessionShape(rows, filters.minGames), [rows, filters.minGames])
 
   const totalGames = rows.length
   const currentStreakText =
@@ -293,13 +308,13 @@ export default function TimePage() {
       <AnalyticsHeader title="Time" subtitle="Streaks, sessions, week trends, time of day, game length, and where your win rate decays." />
       <AnalyticsNav />
 
-      <AnalyticsFilters value={filters} onChange={setFilters} show={{ queue: true, mode: true, map: true, hero: true }} />
+      <AnalyticsFilters value={filters} onChange={setFilters} show={{ queue: true, mode: true, map: true, hero: true, season: true, minGames: true }} seasonOptions={seasons.map(s => ({ id: s.id, name: s.name }))} />
 
       {loading ? (
-        <div className="bg-ow-panel rounded-xl border border-white/10 p-10 text-center text-slate-400 font-display tracking-wider">LOADING…</div>
+        <div className="bg-ow-panel rounded-xl border border-ow-line p-10 text-center text-ow-muted font-display tracking-wider">LOADING…</div>
       ) : (
         <>
-          <p className="text-sm text-slate-400">
+          <p className="text-sm text-ow-muted">
             {totalGames} game{totalGames === 1 ? '' : 's'} in view · overall win rate {overall == null ? '—' : overall + '%'} ·
             a {SESSION_GAP_MINUTES}-min gap starts a new session · win rate excludes draws · sparse buckets dimmed
           </p>
@@ -328,10 +343,10 @@ export default function TimePage() {
                   <div className="flex flex-wrap gap-2">
                     {weekGroups.map((g, i) => {
                       const hidden = hiddenSeasons.has(g.seasonId)
-                      const hue = SEASON_HUES[i % SEASON_HUES.length]
+                      const hue = seasonHues(cc)[i % seasonHues(cc).length]
                       return (
                         <button key={String(g.seasonId)} onClick={() => toggleSeason(g.seasonId)}
-                          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-display tracking-wider uppercase border transition-colors ${hidden ? 'border-white/10 text-slate-500' : 'border-white/25 text-slate-200'}`}>
+                          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-display tracking-wider uppercase border transition-colors ${hidden ? 'border-ow-line text-ow-faint' : 'border-ow-line text-ow-fg'}`}>
                           <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: hidden ? 'transparent' : hue, border: `1px solid ${hue}` }} />
                           {g.seasonName}
                         </button>
@@ -343,20 +358,20 @@ export default function TimePage() {
                 {/* Small-multiples: one mini week-chart per visible season */}
                 <div className="grid gap-4 lg:grid-cols-2">
                   {visibleGroups.map((g) => {
-                    const hue = SEASON_HUES[weekGroups.indexOf(g) % SEASON_HUES.length]
+                    const hue = seasonHues(cc)[weekGroups.indexOf(g) % seasonHues(cc).length]
                     return (
-                      <div key={String(g.seasonId)} className="rounded-lg border border-white/10 p-3">
+                      <div key={String(g.seasonId)} className="rounded-lg border border-ow-line p-3">
                         <div className="flex items-baseline justify-between mb-2">
-                          <span className="text-xs font-display tracking-wider uppercase text-slate-200">{g.seasonName}</span>
-                          <span className="text-[11px] text-slate-500">{g.totalGames} games</span>
+                          <span className="text-xs font-display tracking-wider uppercase text-ow-fg">{g.seasonName}</span>
+                          <span className="text-[11px] text-ow-faint">{g.totalGames} games</span>
                         </div>
                         <div style={{ height: 200 }}>
                           <ResponsiveContainer width="100%" height="100%">
                             <LineChart data={g.weeks} margin={{ top: 6, right: 12, bottom: 4, left: -16 }}>
-                              <CartesianGrid stroke={OW.grid} />
-                              <XAxis dataKey="label" tick={axisTick} stroke={OW.axis} />
-                              <YAxis domain={[0, 100]} tick={axisTick} stroke={OW.axis} unit="%" />
-                              <Tooltip {...tooltipStyle}
+                              <CartesianGrid stroke={cc.grid} />
+                              <XAxis dataKey="label" tick={axisTickOf(cc)} stroke={cc.axis} />
+                              <YAxis domain={[0, 100]} tick={axisTickOf(cc)} stroke={cc.axis} unit="%" />
+                              <Tooltip {...tooltipStyleOf(cc)}
                                 formatter={(_v, _n, p) => {
                                   const row = (p as { payload?: typeof g.weeks[number] } | undefined)?.payload
                                   return [`${row?.winRate == null ? '—' : row.winRate + '%'} · ${row?.games ?? 0} games`, 'Win rate']
@@ -373,18 +388,18 @@ export default function TimePage() {
 
                 {/* Continuous overlay (shows its value with 2+ seasons) */}
                 {showSeasonToggles && (
-                  <div className="rounded-lg border border-white/10 p-3">
-                    <div className="text-xs font-display tracking-wider uppercase text-slate-200 mb-2">All seasons — overlaid by week number</div>
+                  <div className="rounded-lg border border-ow-line p-3">
+                    <div className="text-xs font-display tracking-wider uppercase text-ow-fg mb-2">All seasons — overlaid by week number</div>
                     <div style={{ height: 240 }}>
                       <ResponsiveContainer width="100%" height="100%">
                         <LineChart margin={{ top: 6, right: 12, bottom: 4, left: -16 }}>
-                          <CartesianGrid stroke={OW.grid} />
-                          <XAxis dataKey="label" type="category" allowDuplicatedCategory={false} tick={axisTick} stroke={OW.axis} />
-                          <YAxis domain={[0, 100]} tick={axisTick} stroke={OW.axis} unit="%" />
-                          <Tooltip {...tooltipStyle} />
+                          <CartesianGrid stroke={cc.grid} />
+                          <XAxis dataKey="label" type="category" allowDuplicatedCategory={false} tick={axisTickOf(cc)} stroke={cc.axis} />
+                          <YAxis domain={[0, 100]} tick={axisTickOf(cc)} stroke={cc.axis} unit="%" />
+                          <Tooltip {...tooltipStyleOf(cc)} />
                           <Legend wrapperStyle={{ fontSize: 11 }} />
                           {visibleGroups.map((g) => {
-                            const hue = SEASON_HUES[weekGroups.indexOf(g) % SEASON_HUES.length]
+                            const hue = seasonHues(cc)[weekGroups.indexOf(g) % seasonHues(cc).length]
                             return (
                               <Line key={String(g.seasonId)} data={g.weeks} name={g.seasonName} type="monotone"
                                 dataKey={(d: typeof g.weeks[number]) => d.winRate ?? null} stroke={hue}
@@ -394,7 +409,7 @@ export default function TimePage() {
                         </LineChart>
                       </ResponsiveContainer>
                     </div>
-                    <p className="text-[11px] text-slate-500 mt-1">Each line is a season, plotted by week number so seasons overlay for comparison.</p>
+                    <p className="text-[11px] text-ow-faint mt-1">Each line is a season, plotted by week number so seasons overlay for comparison.</p>
                   </div>
                 )}
               </div>
@@ -407,18 +422,18 @@ export default function TimePage() {
               <div style={{ height: Math.max(220, monthSessions.length * 30 + 60) }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={monthSessions} margin={{ top: 8, right: 16, bottom: 4, left: -8 }}>
-                    <CartesianGrid stroke={OW.grid} vertical={false} />
-                    <XAxis dataKey="label" tick={axisTick} stroke={OW.axis} />
-                    <YAxis yAxisId="min" tick={axisTick} stroke={OW.axis} unit="m" />
-                    <YAxis yAxisId="games" orientation="right" tick={axisTick} stroke={OW.axis} />
-                    <Tooltip {...tooltipStyle}
+                    <CartesianGrid stroke={cc.grid} vertical={false} />
+                    <XAxis dataKey="label" tick={axisTickOf(cc)} stroke={cc.axis} />
+                    <YAxis yAxisId="min" tick={axisTickOf(cc)} stroke={cc.axis} unit="m" />
+                    <YAxis yAxisId="games" orientation="right" tick={axisTickOf(cc)} stroke={cc.axis} />
+                    <Tooltip {...tooltipStyleOf(cc)}
                       formatter={(v, n) => {
                         if (n === 'Avg minutes') return [formatDuration(Number(v)), 'Avg session length']
                         return [`${v}`, 'Avg games / session']
                       }} />
                     <Legend wrapperStyle={{ fontSize: 11 }} />
-                    <Bar yAxisId="min" dataKey={(d: typeof monthSessions[number]) => d.avgMinutes ?? 0} name="Avg minutes" fill={OW.orange} radius={[4, 4, 0, 0]} isAnimationActive={false} />
-                    <Bar yAxisId="games" dataKey={(d: typeof monthSessions[number]) => d.avgGames ?? 0} name="Avg games" fill={OW.accent} radius={[4, 4, 0, 0]} isAnimationActive={false} />
+                    <Bar yAxisId="min" dataKey={(d: typeof monthSessions[number]) => d.avgMinutes ?? 0} name="Avg minutes" fill={cc.primary} radius={[4, 4, 0, 0]} isAnimationActive={false} />
+                    <Bar yAxisId="games" dataKey={(d: typeof monthSessions[number]) => d.avgGames ?? 0} name="Avg games" fill={cc.categorical[3]} radius={[4, 4, 0, 0]} isAnimationActive={false} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -455,9 +470,9 @@ export default function TimePage() {
             <HeatGrid map={heatSession} label="session shape" />
           </Panel>
 
-          <p className="text-xs text-slate-500">
+          <p className="text-xs text-ow-faint">
             The decay point is the first stretch where your win rate drops below your overall average ({overall == null ? '—' : overall + '%'}),
-            counting only buckets with at least {MIN_GAMES} games. Heatmap cells with under {MIN_GAMES} games are dimmed as a low-confidence cue.
+            counting only buckets with at least {filters.minGames} games. Heatmap cells with under {filters.minGames} games are dimmed as a low-confidence cue.
             {seasons.length === 0 && ' Season grouping activates once you add seasons and matches carry a season — for now everything is grouped under “All time”.'}
           </p>
         </>

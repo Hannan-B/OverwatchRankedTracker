@@ -27,9 +27,31 @@ export const viewport: Viewport = {
   viewportFit: 'cover',
 }
 
+// No-FOUC theme bootstrap. Runs before first paint and sets data-theme from the
+// OS preference (the 'system' default), so there's no flash of the wrong theme.
+// The stored user_settings.theme_mode is reconciled shortly after via
+// loadThemePref() (lib/theme.ts) — a no-op unless the user forced light/dark
+// against their OS. Kept tiny and dependency-free on purpose.
+const THEME_BOOTSTRAP = `
+(function () {
+  try {
+    var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  } catch (e) {
+    document.documentElement.setAttribute('data-theme', 'dark');
+  }
+})();
+`
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
+    // suppressHydrationWarning: the bootstrap script sets data-theme on <html>
+    // before React hydrates, so the attribute legitimately differs from the
+    // server-rendered markup. This silences the expected mismatch warning.
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOTSTRAP }} />
+      </head>
       <body>
         {/* Register the service worker so the app is installable on phones. */}
         <script
@@ -50,30 +72,30 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           {/* Desktop top nav only. The phone is upload-only by design, so there is
               NO mobile bottom nav — the upload flow is full-screen on a phone. */}
           <nav className="hidden md:flex items-center justify-between px-6 py-3
-                          bg-ow-panel/80 backdrop-blur-sm border-b border-white/5 sticky top-0 z-50">
+                          bg-ow-panel/80 backdrop-blur-sm border-b border-ow-line sticky top-0 z-50">
             <Link href="/" className="font-display text-xl text-ow-orange tracking-widest">
               OW TRACKER
             </Link>
             <div className="flex items-center gap-6">
-              <Link href="/" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              <Link href="/" className="text-sm text-ow-muted hover:text-ow-orange transition-colors font-display tracking-wider">
                 HOME
               </Link>
-              <Link href="/upload" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              <Link href="/upload" className="text-sm text-ow-muted hover:text-ow-orange transition-colors font-display tracking-wider">
                 UPLOAD
               </Link>
-              <Link href="/process" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              <Link href="/process" className="text-sm text-ow-muted hover:text-ow-orange transition-colors font-display tracking-wider">
                 PROCESS
               </Link>
-              <Link href="/matches" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              <Link href="/matches" className="text-sm text-ow-muted hover:text-ow-orange transition-colors font-display tracking-wider">
                 MATCH HISTORY
               </Link>
-              <Link href="/analytics" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              <Link href="/analytics" className="text-sm text-ow-muted hover:text-ow-orange transition-colors font-display tracking-wider">
                 ANALYTICS
               </Link>
-              <Link href="/issue-log" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              <Link href="/issue-log" className="text-sm text-ow-muted hover:text-ow-orange transition-colors font-display tracking-wider">
                 ISSUE LOG
               </Link>
-              <Link href="/settings" className="text-sm text-slate-300 hover:text-ow-orange transition-colors font-display tracking-wider">
+              <Link href="/settings" className="text-sm text-ow-muted hover:text-ow-orange transition-colors font-display tracking-wider">
                 SETTINGS
               </Link>
               <SignOutButton />

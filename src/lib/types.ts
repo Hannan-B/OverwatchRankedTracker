@@ -7,7 +7,6 @@ export type RoleType = 'tank' | 'dps' | 'support'
 export type StartingSide = 'attack' | 'defense'
 export type MatchFeel = 'stomped_them' | 'close_game' | 'got_stomped'
 export type PerformanceFeel = 'carried' | 'did_my_job' | 'struggled'
-export type NotableEvent = 'leaver' | 'smurf' | 'thrower' | 'great_teamwork'
 export type ImageType = 'summary' | 'teams' | 'personal' | 'scoreboard_closeup'
 
 export interface Season {
@@ -41,9 +40,9 @@ export interface Match {
   deaths_per_10_min: number | null
   match_feel: MatchFeel | null
   performance_feel: PerformanceFeel | null
-  notable_events: NotableEvent[] | null
   fun_rating: number | null
   personal_thoughts: string | null
+  is_alpha: boolean
   created_at: string
   updated_at: string
 }
@@ -167,7 +166,6 @@ export interface MatchFormData {
   total_deaths: number | null
   match_feel: MatchFeel | null
   performance_feel: PerformanceFeel | null
-  notable_events: NotableEvent[]
   fun_rating: number | null
   personal_thoughts: string
   heroes: HeroFormData[]

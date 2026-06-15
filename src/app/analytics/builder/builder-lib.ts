@@ -163,8 +163,11 @@ export interface MatchRow {
   total_eliminations: number | null
   total_assists: number | null
   total_deaths: number | null
-  ally_team_comp: string[] | null
-  enemy_team_comp: string[] | null
+  // DB columns are nullable `text` (a single string), not arrays — #6 reconcile.
+  // Typed to accept BOTH a string (the live shape) and a string[] (a possible
+  // future shape) so neither breaks; bucketsFor handles both. Always null today.
+  ally_team_comp: string | string[] | null
+  enemy_team_comp: string | string[] | null
 }
 
 export interface HeroRow {
@@ -287,7 +290,9 @@ export function bucketsFor(
   }
   const raw = row[v.column]
   if (v.key === 'ally_team_comp' || v.key === 'enemy_team_comp') {
-    if (Array.isArray(raw) && raw.length) return [raw.join(' · ')]
+    // DB shape is `text` (a single comp string); tolerate a future array too.
+    if (Array.isArray(raw)) return raw.length ? [raw.join(' · ')] : ['—']
+    if (typeof raw === 'string' && raw.trim() !== '') return [raw]
     return ['—']
   }
   if (raw === null || raw === undefined || raw === '') return ['—']

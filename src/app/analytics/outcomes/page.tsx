@@ -1,19 +1,24 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   Cell, PieChart, Pie, Legend, LabelList,
 } from 'recharts'
 import { supabase } from '@/lib/supabase'
 import { matchQuery } from '@/lib/alpha'
+import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
+import { defaultSeasonSelection } from '@/lib/season-util'
 import AnalyticsFilters, {
   DEFAULT_FILTERS,
   matchesFilters,
   type AnalyticsFilterState,
   type FilterableMatch,
+  type SeasonOption,
 } from '@/components/AnalyticsFilters'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
+import { useChartColors } from '@/components/useChartColors'
+import { type ChartColors } from '@/lib/chart-theme'
 
 // ============================================================
 // OUTCOMES (/analytics/outcomes) — the densest curated page.
@@ -33,20 +38,16 @@ import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 //     Queue carries the 5v5/6v6 split, so format is filtered there.
 // ============================================================
 
-const OW = {
-  orange: '#f99e1a', accent: '#ffcb6b', victory: '#3fb950', defeat: '#f85149',
-  draw: '#8b949e', grid: 'rgba(255,255,255,0.08)', axis: 'rgba(255,255,255,0.45)',
-}
-const MIN_GAMES = 5
 
 interface OutcomeMatch extends FilterableMatch {
   id: number
   result: 'victory' | 'defeat' | 'draw' | null
   starting_side: 'attack' | 'defense' | null
   played_at: string | null
+  season_id: number | null
 }
 
-const MATCH_COLS = 'id, result, role_played, match_format, game_mode, map, starting_side, played_at'
+const MATCH_COLS = 'id, result, role_played, match_format, game_mode, map, starting_side, played_at, season_id, team_leaver, enemy_leaver'
 // Hero-grain rows, only to resolve "which matches did I play hero X in" for the
 // Hero filter (matches has no hero column). Alpha excluded via match_id.
 const HERO_COLS = 'match_id, hero_name'
@@ -66,14 +67,15 @@ function winRate(t: Tally): number | null {
 function games(t: Tally): number { return t.wins + t.losses + t.draws }
 
 // Win-rate colour for a bar (green strong, amber mid, red weak; grey when null).
-function wrColor(wr: number | null): string {
-  if (wr === null) return OW.draw
-  return wr >= 55 ? OW.victory : wr <= 45 ? OW.defeat : OW.accent
+function wrColor(wr: number | null, c: ChartColors): string {
+  if (wr === null) return c.draw
+  return wr >= 55 ? c.victory : wr <= 45 ? c.defeat : c.primary
 }
 
-// Generic "win rate by category" aggregation → sorted rows.
+// Generic "win rate by category" aggregation → sorted rows. `minGames` is the
+// confidence floor from the shared filter (buckets under it are flagged dim).
 interface CatRow { key: string; winRate: number | null; games: number; lowConfidence: boolean }
-function byCategory(rows: OutcomeMatch[], keyOf: (m: OutcomeMatch) => string | null): CatRow[] {
+function byCategory(rows: OutcomeMatch[], keyOf: (m: OutcomeMatch) => string | null, minGames: number): CatRow[] {
   const m = new Map<string, Tally>()
   for (const r of rows) {
     const k = keyOf(r)
@@ -82,29 +84,30 @@ function byCategory(rows: OutcomeMatch[], keyOf: (m: OutcomeMatch) => string | n
     add(m.get(k)!, r.result)
   }
   return Array.from(m.entries())
-    .map(([key, t]) => ({ key, winRate: winRate(t), games: games(t), lowConfidence: games(t) < MIN_GAMES }))
+    .map(([key, t]) => ({ key, winRate: winRate(t), games: games(t), lowConfidence: games(t) < minGames }))
     .sort((a, b) => (b.winRate ?? -1) - (a.winRate ?? -1) || b.games - a.games)
 }
 
-const axisTick = { fill: OW.axis, fontSize: 11 }
-const tooltipStyle = {
-  contentStyle: { background: '#0f1419', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 8, fontSize: 12 },
-  labelStyle: { color: '#e6edf3' },
-}
+const axisTickOf = (c: ChartColors) => ({ fill: c.axisLabel, fontSize: 11 })
+const tooltipStyleOf = (c: ChartColors) => ({
+  contentStyle: { background: c.tooltipBg, border: `1px solid ${c.tooltipBorder}`, borderRadius: 8, fontSize: 12 },
+  labelStyle: { color: c.tooltipText },
+})
 
 // Horizontal sorted win-rate bar chart.
 function WinRateBars({ data, label }: { data: CatRow[]; label: string }) {
+  const c = useChartColors()
   if (data.length === 0) return <Empty label={label} />
   const height = Math.max(160, data.length * 34 + 40)
   return (
     <div style={{ height }}>
       <ResponsiveContainer width="100%" height="100%">
         <BarChart data={data} layout="vertical" margin={{ top: 4, right: 80, bottom: 4, left: 8 }}>
-          <CartesianGrid stroke={OW.grid} horizontal={false} />
-          <XAxis type="number" domain={[0, 100]} tick={axisTick} stroke={OW.axis} unit="%" />
-          <YAxis type="category" dataKey="key" tick={axisTick} stroke={OW.axis} width={110} />
+          <CartesianGrid stroke={c.grid} horizontal={false} />
+          <XAxis type="number" domain={[0, 100]} tick={axisTickOf(c)} stroke={c.axis} unit="%" />
+          <YAxis type="category" dataKey="key" tick={axisTickOf(c)} stroke={c.axis} width={110} />
           <Tooltip
-            {...tooltipStyle}
+            {...tooltipStyleOf(c)}
             formatter={(_v, _n, p) => {
               const row = (p as { payload?: CatRow } | undefined)?.payload
               const wr = row?.winRate
@@ -112,7 +115,7 @@ function WinRateBars({ data, label }: { data: CatRow[]; label: string }) {
             }} />
           <Bar dataKey={(d: CatRow) => d.winRate ?? 0} radius={[0, 4, 4, 0]} isAnimationActive={false}>
             {data.map((d, i) => (
-              <Cell key={i} fill={wrColor(d.winRate)} fillOpacity={d.lowConfidence ? 0.4 : 1} />
+              <Cell key={i} fill={wrColor(d.winRate, c)} fillOpacity={d.lowConfidence ? 0.4 : 1} />
             ))}
             <LabelList dataKey="winRate" position="right" content={(props: unknown) => {
               const p = props as { x?: number; y?: number; width?: number; height?: number; index?: number }
@@ -121,7 +124,7 @@ function WinRateBars({ data, label }: { data: CatRow[]; label: string }) {
               const txt = `${row.winRate == null ? '—' : row.winRate + '%'}  n=${row.games}`
               return (
                 <text x={p.x + p.width + 6} y={p.y + p.height / 2} dominantBaseline="central"
-                  fill="#e6edf3" fontSize={11} fontFamily="inherit">
+                  fill={c.axisLabel} fontSize={11} fontFamily="inherit">
                   {txt}
                 </text>
               )
@@ -136,17 +139,17 @@ function WinRateBars({ data, label }: { data: CatRow[]; label: string }) {
 function Empty({ label }: { label: string }) {
   return (
     <div className="h-[160px] flex items-center justify-center text-center">
-      <p className="text-sm text-slate-500">No data for {label} with these filters yet.</p>
+      <p className="text-sm text-ow-faint">No data for {label} with these filters yet.</p>
     </div>
   )
 }
 
 function Panel({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div className="bg-ow-panel rounded-xl border border-white/10 p-4">
+    <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
       <div className="flex items-baseline justify-between gap-2 mb-3">
-        <h2 className="font-display tracking-[0.12em] text-slate-100 uppercase text-sm">{title}</h2>
-        {hint && <span className="text-[11px] text-slate-500">{hint}</span>}
+        <h2 className="font-display tracking-[0.12em] text-ow-fg uppercase text-sm">{title}</h2>
+        {hint && <span className="text-[11px] text-ow-faint">{hint}</span>}
       </div>
       {children}
     </div>
@@ -154,21 +157,37 @@ function Panel({ title, hint, children }: { title: string; hint?: string; childr
 }
 
 export default function OutcomesPage() {
+  const c = useChartColors()
   const [filters, setFilters] = useState<AnalyticsFilterState>(DEFAULT_FILTERS)
   const [matches, setMatches] = useState<OutcomeMatch[]>([])
   const [heroRows, setHeroRows] = useState<{ match_id: number; hero_name: string }[]>([])
+  const [seasonOptions, setSeasonOptions] = useState<SeasonOption[]>([])
   const [loading, setLoading] = useState(true)
+  // Re-runs the filter memo once the leaver preference has loaded (cache starts
+  // at "hide"); Outcomes is a performance surface, so leaver games are excluded.
+  const [leaverReady, setLeaverReady] = useState(false)
+  // Ensures the current-season default is only seeded once (not re-applied if the
+  // user later clears it back to All Time).
+  const seasonDefaulted = useRef(false)
 
   useEffect(() => {
     let cancelled = false
     setLoading(true)
+    loadLeaverPref().then(() => { if (!cancelled) setLeaverReady(true) })
     Promise.all([
       matchQuery(MATCH_COLS).order('played_at', { ascending: false }),
       supabase.from('hero_match_facts').select(HERO_COLS),
-    ]).then(([mRes, hRes]) => {
+      supabase.from('seasons').select('id, name, start_date, end_date').order('start_date', { ascending: false }),
+    ]).then(([mRes, hRes, sRes]) => {
       if (cancelled) return
       setMatches((((mRes as unknown) as { data: OutcomeMatch[] | null }).data) || [])
       setHeroRows((((hRes as unknown) as { data: { match_id: number; hero_name: string }[] | null }).data) || [])
+      const seasonRows = (((sRes as unknown) as { data: { id: number; name: string; start_date: string; end_date: string }[] | null }).data) || []
+      setSeasonOptions(seasonRows.map(s => ({ id: s.id, name: s.name })))
+      if (!seasonDefaulted.current) {
+        seasonDefaulted.current = true
+        setFilters(f => ({ ...f, seasons: defaultSeasonSelection(seasonRows) }))
+      }
       setLoading(false)
     })
     return () => { cancelled = true }
@@ -188,19 +207,21 @@ export default function OutcomesPage() {
   // Apply shared Queue/Mode/Map filters, then the Hero filter (a match counts if
   // the selected hero was played in it at all — the honest reading for outcomes).
   const rows = useMemo(() => {
-    const base = matches.filter(m => matchesFilters(m, filters))
+    const excludeLeavers = !showLeaverGames()
+    const base = matches.filter(m => matchesFilters(m, filters, { excludeLeavers }))
     if (filters.hero === '') return base
     const ids = matchIdsByHero.get(filters.hero)
     if (!ids) return []
     return base.filter(m => ids.has(m.id))
-  }, [matches, filters, matchIdsByHero])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, filters, matchIdsByHero, leaverReady])
 
   // Queue narrowed to a specific format → the 5v5/6v6 chart is redundant.
   const queueIsFormatSpecific = filters.queue !== 'all'
 
-  const byMode = useMemo(() => byCategory(rows, m => m.game_mode), [rows])
-  const byMap = useMemo(() => byCategory(rows, m => m.map), [rows])
-  const byRole = useMemo(() => byCategory(rows.filter(m => m.match_format === '5v5'), m => m.role_played), [rows])
+  const byMode = useMemo(() => byCategory(rows, m => m.game_mode, filters.minGames), [rows, filters.minGames])
+  const byMap = useMemo(() => byCategory(rows, m => m.map, filters.minGames), [rows, filters.minGames])
+  const byRole = useMemo(() => byCategory(rows.filter(m => m.match_format === '5v5'), m => m.role_played, filters.minGames), [rows, filters.minGames])
 
   // 5v5 vs 6v6 — two-way split (ignores the Queue format filter so it always
   // shows both; Mode/Map still apply).
@@ -211,19 +232,19 @@ export default function OutcomesPage() {
       else if (r.match_format === '6v6') add(f6, r.result)
     }
     return [
-      { key: '5v5', winRate: winRate(f5), games: games(f5), lowConfidence: games(f5) < MIN_GAMES },
-      { key: '6v6', winRate: winRate(f6), games: games(f6), lowConfidence: games(f6) < MIN_GAMES },
+      { key: '5v5', winRate: winRate(f5), games: games(f5), lowConfidence: games(f5) < filters.minGames },
+      { key: '6v6', winRate: winRate(f6), games: games(f6), lowConfidence: games(f6) < filters.minGames },
     ] as CatRow[]
-  }, [rows])
+  }, [rows, filters.minGames])
 
   // Result mix — counts of victory / defeat / draw.
   const resultMix = useMemo(() => {
     const t = emptyTally()
     for (const r of rows) add(t, r.result)
     return [
-      { name: 'Victory', value: t.wins, color: OW.victory },
-      { name: 'Defeat', value: t.losses, color: OW.defeat },
-      { name: 'Draw', value: t.draws, color: OW.draw },
+      { name: 'Victory', value: t.wins, color: c.victory },
+      { name: 'Defeat', value: t.losses, color: c.defeat },
+      { name: 'Draw', value: t.draws, color: c.draw },
     ].filter(d => d.value > 0)
   }, [rows])
 
@@ -260,9 +281,9 @@ export default function OutcomesPage() {
     }
     return DOW.map((day, i) => ({
       key: day, winRate: winRate(tallies[i]), games: games(tallies[i]),
-      lowConfidence: games(tallies[i]) < MIN_GAMES,
+      lowConfidence: games(tallies[i]) < filters.minGames,
     })) as CatRow[]
-  }, [rows])
+  }, [rows, filters.minGames])
 
   const totalGames = rows.length
 
@@ -274,15 +295,15 @@ export default function OutcomesPage() {
       />
       <AnalyticsNav />
 
-      <AnalyticsFilters value={filters} onChange={setFilters} show={{ queue: true, mode: true, map: true, hero: true }} />
+      <AnalyticsFilters value={filters} onChange={setFilters} show={{ queue: true, mode: true, map: true, hero: true, season: true, minGames: true }} seasonOptions={seasonOptions} />
 
       {loading ? (
-        <div className="bg-ow-panel rounded-xl border border-white/10 p-10 text-center text-slate-400 font-display tracking-wider">
+        <div className="bg-ow-panel rounded-xl border border-ow-line p-10 text-center text-ow-muted font-display tracking-wider">
           LOADING…
         </div>
       ) : (
         <>
-          <p className="text-sm text-slate-400">{totalGames} game{totalGames === 1 ? '' : 's'} in view · win rate excludes draws · bars under {MIN_GAMES} games dimmed</p>
+          <p className="text-sm text-ow-muted">{totalGames} game{totalGames === 1 ? '' : 's'} in view · win rate excludes draws · bars under {filters.minGames} games dimmed</p>
 
           <div className="grid gap-4 lg:grid-cols-2 items-start">
             <Panel title="Win rate by game mode" hint="best → worst">
@@ -308,7 +329,7 @@ export default function OutcomesPage() {
                         paddingAngle={2} isAnimationActive={false}>
                         {resultMix.map((d, i) => <Cell key={i} fill={d.color} />)}
                       </Pie>
-                      <Tooltip {...tooltipStyle} formatter={(v, n) => [`${v} games`, String(n)]} />
+                      <Tooltip {...tooltipStyleOf(c)} formatter={(v, n) => [`${v} games`, String(n)]} />
                       <Legend wrapperStyle={{ fontSize: 12 }} />
                     </PieChart>
                   </ResponsiveContainer>
@@ -326,11 +347,11 @@ export default function OutcomesPage() {
               <div style={{ height: Math.max(180, sideByMap.length * 40 + 40) }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={sideByMap} layout="vertical" margin={{ top: 4, right: 40, bottom: 4, left: 8 }}>
-                    <CartesianGrid stroke={OW.grid} horizontal={false} />
-                    <XAxis type="number" domain={[0, 100]} tick={axisTick} stroke={OW.axis} unit="%" />
-                    <YAxis type="category" dataKey="map" tick={axisTick} stroke={OW.axis} width={110} />
+                    <CartesianGrid stroke={c.grid} horizontal={false} />
+                    <XAxis type="number" domain={[0, 100]} tick={axisTickOf(c)} stroke={c.axis} unit="%" />
+                    <YAxis type="category" dataKey="map" tick={axisTickOf(c)} stroke={c.axis} width={110} />
                     <Tooltip
-                      {...tooltipStyle}
+                      {...tooltipStyleOf(c)}
                       formatter={(v, n, p) => {
                         const row = (p as { payload?: { attackGames: number; defenseGames: number } } | undefined)?.payload
                         const side = String(n)
@@ -338,8 +359,8 @@ export default function OutcomesPage() {
                         return [`${v == null ? '—' : v + '%'} · ${g ?? 0} games`, side]
                       }} />
                     <Legend wrapperStyle={{ fontSize: 12 }} />
-                    <Bar dataKey={(d: { attack: number | null }) => d.attack ?? 0} name="Attack" fill={OW.orange} radius={[0, 4, 4, 0]} isAnimationActive={false} />
-                    <Bar dataKey={(d: { defense: number | null }) => d.defense ?? 0} name="Defense" fill={OW.accent} radius={[0, 4, 4, 0]} isAnimationActive={false} />
+                    <Bar dataKey={(d: { attack: number | null }) => d.attack ?? 0} name="Attack" fill={c.primary} radius={[0, 4, 4, 0]} isAnimationActive={false} />
+                    <Bar dataKey={(d: { defense: number | null }) => d.defense ?? 0} name="Defense" fill={c.categorical[3]} radius={[0, 4, 4, 0]} isAnimationActive={false} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>

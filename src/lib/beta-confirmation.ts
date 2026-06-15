@@ -30,8 +30,10 @@ import type { SummaryOcrResult } from './ocr-extractor'
 
 export type SignalKind =
   | 'unrecognized'          // tier 1: UNKNOWN label / no catalog entry / unknown map-mode
+  | 'date_ocr_fail'         // tier 1: match date missing / implausible / far from neighbours
+  | 'map_detect_fail'       // tier 1: phone map-detect missed AND/OR laptop OCR map null/unreadable
   | 'vote_split'            // tier 2: scoreboard digit, multi-threshold disagreed
-  | 'avg_crosscheck_fail'   // tier 2: breakdown value != avg * playtime/10min
+  | 'avg_crosscheck_fail'   // tier 3: breakdown value != avg * playtime/10min (demoted, step 2)
   | 'low_hero_conf'         // tier 3: portrait match below confidence gate
   | 'phase_disagreement'    // tier 3: Phase-1 != Pass-1 hero ID
   | 'low_user_margin'       // tier 3: username best-vs-runner-up margin narrow
@@ -43,12 +45,29 @@ export type FieldKind =
   | 'hero_id'
   | 'summary'
   | 'username'
+  | 'date'
+  | 'map'
+  | 'side'
 
 // Lower tier number = higher priority (filled first).
 export const SIGNAL_TIER: Record<SignalKind, 1 | 2 | 3 | 4> = {
   unrecognized: 1,
+  // Tier 1 (step 3): a wrong match date silently corrupts BOTH season assignment
+  // and session boundaries, so a suspicious date must outrank stat checks and
+  // reliably claim a question slot when it fires (it fires rarely by design).
+  date_ocr_fail: 1,
+  // Tier 1 (step 10): a missing/unreadable map means the phone never asked the
+  // attack/defend question AND mode-derived logic (starting_side) is lost. Like
+  // the date, it must claim a slot when it fires (it fires rarely). The answer
+  // is a dropdown pick of known maps, with a conditional attack/defend follow-up.
+  map_detect_fail: 1,
   vote_split: 2,
-  avg_crosscheck_fail: 2,
+  // Demoted 2→3 (step 2): the avg cross-check is built on the game's per-10min
+  // average, which is rounded at source AND unstable at low playtime, so it is a
+  // noisy signal. Keep it BELOW the hero-id / username checks so those higher-
+  // value tier-3 checks fill the question cap first; the avg-check only takes a
+  // slot if room remains.
+  avg_crosscheck_fail: 3,
   low_hero_conf: 3,
   phase_disagreement: 3,
   low_user_margin: 3,
@@ -82,6 +101,13 @@ export interface ConfirmationCandidate {
   margin?: number
   /** Free-form reason for logs/tooltip. */
   note?: string
+  /** When present, the card offers a dropdown of these values instead of a free-
+   *  text "FIX IT" box (step 10: map pick from the known-maps list). */
+  options?: string[]
+  /** Step 10: when true, a corrected value that needs a starting side (escort /
+   *  hybrid map) prompts an inline attack/defend follow-up before the card
+   *  resolves. The chosen side rides back on ConfirmationResult.sideValue. */
+  requiresSideFollowUp?: boolean
 }
 
 // ── Config ───────────────────────────────────────────────────
@@ -91,10 +117,14 @@ export interface BetaConfirmConfig {
   targetQuestions: number       // soft target used by the sampled filler
   /** 1-in-N matches gets a sampled summary question when slots remain. */
   summarySampleEveryN: number
-  /** avg cross-check tolerance band, fractional (0.15 = ±15%). */
+  /** avg cross-check tolerance band, fractional (0.40 = ±40%). Wide on purpose:
+   *  the per-10min average is rounded at source, so only GROSS discrepancies
+   *  (dropped digit, value wildly off) should fire — not rounding wobble. */
   avgTolerance: number
-  /** breakdown stats with playtime below this (seconds) skip the avg check —
-   *  tiny denominators make the ratio meaningless. */
+  /** breakdown stats with playtime below this (seconds) skip the avg check.
+   *  Set to 150s (2.5min): the per-10min average is an extrapolation, and at
+   *  low playtime it is mathematically unstable (a hero played <1–2min has a
+   *  meaningless per-10min figure), which was the main false-positive source. */
   avgMinPlaytimeSeconds: number
 }
 
@@ -102,9 +132,28 @@ export const DEFAULT_CONFIG: BetaConfirmConfig = {
   maxQuestions: 3,
   targetQuestions: 2,
   summarySampleEveryN: 4,
-  avgTolerance: 0.15,
-  avgMinPlaytimeSeconds: 60,
+  // step 2: widened 0.15→0.40 (rounding noise) and raised floor 60→150s
+  // (2.5min — skips the wobbliest low-playtime zone where per-10min is most
+  // unstable, while still running the check on most real games; the wide ±40%
+  // band absorbs the remaining rounding noise above the floor).
+  avgTolerance: 0.40,
+  avgMinPlaytimeSeconds: 150,
 }
+
+// ── Date check constants (step 3) ────────────────────────────
+// A wrong match date silently lands a match in the wrong season AND breaks
+// session boundaries (NEXT-STEPS #3/#4), so a suspicious date is surfaced for
+// confirmation. Three triggers: missing, implausible, far-from-neighbours.
+
+/** Earliest plausible match date: Overwatch 1 launch (2016-05-24). A 2-digit
+ *  year misread that lands before this is impossible → flag. */
+const DATE_FLOOR = new Date(2016, 4, 24, 0, 0, 0, 0) // month 4 = May (0-indexed)
+/** Allow up to 1 day in the future to tolerate clock skew / timezone edges. */
+const FUTURE_TOLERANCE_MS = 24 * 60 * 60 * 1000
+/** Neighbour gap: a parsed date more than this from the nearest recent match
+ *  is an outlier worth checking (user plays ~daily, so a week is generous). */
+const NEIGHBOUR_GAP_DAYS = 7
+const NEIGHBOUR_GAP_MS = NEIGHBOUR_GAP_DAYS * 24 * 60 * 60 * 1000
 
 // ── Inputs the builder reads ─────────────────────────────────
 //
@@ -132,6 +181,11 @@ export interface ConfirmInputs {
   /** Reference lists for unrecognized map/mode detection. */
   knownMaps?: string[]
   knownModes?: string[]
+  /** Step 10: the phone's map auto-detect returned null at upload (so the
+   *  attack/defend question was skipped). Set from metadata.map_detect_missed.
+   *  Combined with a null/unrecognized laptop OCR map, this raises the map
+   *  dropdown question. */
+  mapDetectMissed?: boolean
   /** Source screenshot URLs for highlight display. */
   scoreboardImageUrl?: string
   summaryImageUrl?: string
@@ -145,6 +199,11 @@ export interface ConfirmInputs {
   /** Monotonic counter of matches logged this season — drives summary sampling.
    *  When omitted, sampling falls back to a hash of matchId. */
   matchSequence?: number
+  /** Recent matches' played_at (step 3), for the date neighbour check. Most-
+   *  recent-first or any order — only the nearest gap is used. When omitted or
+   *  empty, the far-from-neighbours trigger is skipped (missing/implausible
+   *  still fire). Fetched on the process page, alpha-rule respected. */
+  recentMatchDates?: Date[]
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -275,6 +334,81 @@ function unrecognizedCandidates(inp: ConfirmInputs): ConfirmationCandidate[] {
   }
 
   return out
+}
+
+function dateCandidate(inp: ConfirmInputs): ConfirmationCandidate[] {
+  // The date is OCR'd from the summary screen and parsed in ocr-extractor.ts.
+  // summary.matchTimestamp is null when the read failed entirely; matchDateText
+  // holds the raw OCR text (for display + logging).
+  const ts = inp.summary?.matchTimestamp ?? null
+  const rawText = inp.summary?.matchDateText ?? null
+  const region: HighlightRegion | null =
+    inp.summaryImageUrl ? { imageUrl: inp.summaryImageUrl } : null
+
+  const make = (reason: string, extracted: string): ConfirmationCandidate => ({
+    id: `date_check:${inp.matchId}`,
+    field: 'date',
+    fieldDetail: 'Match date',
+    signal: 'date_ocr_fail',
+    tier: 1,
+    region,
+    extractedValue: extracted,
+    note: reason,
+  })
+
+  // Trigger 1 — MISSING: the date couldn't be read at all (fell back to process
+  // time at save). Always surface it; this is the most consequential case.
+  if (ts === null) {
+    return [make(
+      'Date could not be read from the summary — it will fall back to the ' +
+      'processing time, which may put the match in the wrong season/session. ' +
+      'Please set the correct date.',
+      rawText && rawText.trim() ? rawText.trim() : '(no date read)',
+    )]
+  }
+
+  const display = rawText && rawText.trim() ? rawText.trim() : ts.toLocaleString()
+
+  // Trigger 2 — IMPLAUSIBLE: before Overwatch existed, or in the future
+  // (beyond a 1-day clock-skew tolerance). A parsed-but-impossible date.
+  const now = Date.now()
+  if (ts.getTime() < DATE_FLOOR.getTime()) {
+    return [make(
+      `Date reads as ${display}, which is before Overwatch existed — likely a ` +
+      `misread year. Please check.`,
+      display,
+    )]
+  }
+  if (ts.getTime() > now + FUTURE_TOLERANCE_MS) {
+    return [make(
+      `Date reads as ${display}, which is in the future — likely a misread. ` +
+      `Please check.`,
+      display,
+    )]
+  }
+
+  // Trigger 3 — FAR FROM NEIGHBOURS: more than NEIGHBOUR_GAP_DAYS from the
+  // nearest recent match. Catches a plausible-but-wrong read (right format,
+  // wrong digits) that the bounds checks miss. Skipped when no neighbours.
+  const neighbours = inp.recentMatchDates ?? []
+  if (neighbours.length > 0) {
+    let nearestMs = Infinity
+    for (const n of neighbours) {
+      const gap = Math.abs(ts.getTime() - n.getTime())
+      if (gap < nearestMs) nearestMs = gap
+    }
+    if (nearestMs > NEIGHBOUR_GAP_MS) {
+      const days = Math.round(nearestMs / (24 * 60 * 60 * 1000))
+      return [make(
+        `Date reads as ${display}, but that's ${days} days from your nearest ` +
+        `recent match — unusual for near-daily play, so possibly a misread. ` +
+        `Please check.`,
+        display,
+      )]
+    }
+  }
+
+  return []
 }
 
 function scoreboardVoteSplitCandidates(inp: ConfirmInputs): ConfirmationCandidate[] {
@@ -481,6 +615,49 @@ function withinTierSort(a: ConfirmationCandidate, b: ConfirmationCandidate): num
 }
 
 /**
+ * Step 10 — map detection miss. Fires when EITHER the phone's upload-time map
+ * auto-detect missed (inp.mapDetectMissed) OR the laptop's own summary OCR map
+ * is null / empty / not in the known list. In every such case the saved match
+ * would otherwise carry a null map (and therefore a null starting_side), so we
+ * raise ONE tier-1 question whose answer is a dropdown pick of known maps. The
+ * card shows an attack/defend follow-up when the chosen map needs a side (the
+ * escort/hybrid decision is made on the review page, which owns the map→mode
+ * lookup). De-duped against unrecognizedCandidates: when the OCR produced a
+ * non-empty-but-unrecognized map string, THIS takes over (a pickable dropdown
+ * is strictly more useful than a confirm/correct card), so the caller drops the
+ * plain unknown_map candidate when a map_detect_fail is present.
+ */
+function mapDetectCandidate(inp: ConfirmInputs): ConfirmationCandidate[] {
+  const ocrMap = inp.summary?.mapName?.trim() ?? ''
+  const known = ocrMap !== '' && (inp.knownMaps ?? []).some(
+    k => k.trim().toLowerCase() === ocrMap.toLowerCase(),
+  )
+  const missed = inp.mapDetectMissed === true
+  // Nothing to do when the laptop OCR map is present AND recognized AND the
+  // phone didn't report a miss — the map is trustworthy.
+  if (known && !missed) return []
+
+  const reason = missed
+    ? (ocrMap === '' ? 'Phone could not detect the map and OCR read none either.'
+                     : `Phone could not detect the map; OCR read "${ocrMap}".`)
+    : (ocrMap === '' ? 'No map could be read from the summary.'
+                     : `Map "${ocrMap}" is not in the known list — pick the correct map.`)
+
+  return [{
+    id: 'map_detect',
+    field: 'map',
+    fieldDetail: 'Which map was this?',
+    signal: 'map_detect_fail',
+    tier: 1,
+    region: inp.summaryImageUrl ? { imageUrl: inp.summaryImageUrl } : null,
+    extractedValue: ocrMap === '' ? '(none)' : ocrMap,
+    note: reason,
+    options: inp.knownMaps ?? [],
+    requiresSideFollowUp: true,
+  }]
+}
+
+/**
  * Build the full candidate set, rank by tier, and return what to ask.
  *
  * Rule (per the 6f beta design):
@@ -493,8 +670,18 @@ export function buildConfirmationQuestions(
   inp: ConfirmInputs,
   cfg: BetaConfirmConfig = DEFAULT_CONFIG,
 ): ConfirmationCandidate[] {
+  const mapDetect = mapDetectCandidate(inp)
+  // When the map dropdown question is raised, suppress the plain unknown_map
+  // confirm/correct candidate (the dropdown supersedes it — same field, better
+  // interaction). Other unrecognized candidates (mode, breakdown stats) stay.
+  const unrecognized = mapDetect.length > 0
+    ? unrecognizedCandidates(inp).filter(c => !c.id.startsWith('unknown_map:'))
+    : unrecognizedCandidates(inp)
+
   const priority: ConfirmationCandidate[] = [
-    ...unrecognizedCandidates(inp),
+    ...mapDetect,
+    ...unrecognized,
+    ...dateCandidate(inp),
     ...scoreboardVoteSplitCandidates(inp),
     ...avgCrossCheckCandidates(inp, cfg),
     ...heroIdCandidates(inp),
