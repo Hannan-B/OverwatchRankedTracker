@@ -210,18 +210,42 @@ export async function ocrSummaryPage(img: HTMLImageElement): Promise<SummaryOcrR
       scoreMatch = normalizedScore.match(/(\d)\s*VS\s*(\d)/)
       if (scoreMatch) result.raw.scoreNormalized = normalizedScore
     }
+    // Banner read above is authoritative when present. Independently of that,
+    // derive a result from the score so the two can be cross-checked: a flipped
+    // win/loss silently corrupts win-rate everywhere, so any disagreement (or an
+    // unreadable banner) must be surfaced for confirmation rather than guessed.
+    const bannerResult = result.result   // null when the VICTORY/DEFEAT banner OCR failed
+    let scoreDerivedResult: 'victory' | 'defeat' | 'draw' | null = null
     if (scoreMatch) {
       result.score = `${scoreMatch[1]}-${scoreMatch[2]}`
+      const a = parseInt(scoreMatch[1])
+      const b = parseInt(scoreMatch[2])
+      scoreDerivedResult = a > b ? 'victory' : a < b ? 'defeat' : 'draw'
 
-      // Score-based result fallback (if keyword detection failed)
-      if (result.result === null) {
-        const a = parseInt(scoreMatch[1])
-        const b = parseInt(scoreMatch[2])
-        result.result = a > b ? 'victory' : a < b ? 'defeat' : 'draw'
+      // When the banner couldn't be read, fall back to the score for the stored
+      // value (as before) — but the conflict flag below still forces a question.
+      if (bannerResult === null) {
+        result.result = scoreDerivedResult
         result.raw.resultSource = 'score-derived'
+      } else {
+        result.raw.resultSource = 'banner'
       }
     }
+
+    // Cross-check outcome, recorded for beta-confirmation.ts to consume.
+    // Conflict = banner unreadable, OR banner and score-derived disagree.
+    // NOTE: the score does NOT always map to win/loss the way `a>b` assumes
+    // (some hybrid/escort scorelines aren't simple point counts), which is
+    // exactly why a disagreement escalates to the human instead of overriding.
+    result.raw.bannerResult = bannerResult ?? ''
+    result.raw.scoreDerivedResult = scoreDerivedResult ?? ''
+    const resultConflict =
+      bannerResult === null
+        ? (scoreDerivedResult !== null)              // unreadable banner but we have a score → ask
+        : (scoreDerivedResult !== null && scoreDerivedResult !== bannerResult)  // both read, disagree → ask
+    result.raw.resultConflict = resultConflict ? 'true' : 'false'
     console.log(`[ocr-extractor] Score: "${scoreText}" → ${result.score}`)
+    console.log(`[ocr-extractor] Result: banner=${bannerResult ?? '(none)'} score-derived=${scoreDerivedResult ?? '(none)'} conflict=${resultConflict}`)
 
     // =========================================================
     // GAME MODE — Tesseract + keyword match

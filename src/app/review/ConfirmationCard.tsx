@@ -28,6 +28,7 @@ export interface ConfirmationResult {
 const SIGNAL_LABEL: Record<string, string> = {
   unrecognized: 'Unrecognized',
   map_detect_fail: 'Map not detected',
+  result_conflict: 'Result unclear',
   vote_split: 'Uncertain read',
   avg_crosscheck_fail: 'Doesn\u2019t add up',
   low_hero_conf: 'Low confidence',
@@ -251,20 +252,24 @@ export function ConfirmationCard({
           </div>
         </div>
       ) : isPicker ? (
-        // Step 10 — map dropdown. No "CORRECT" path: the map is unknown, so the
-        // user must pick. Choosing a side-needing map diverts to the side step.
+        // Dropdown picker. Two flavours:
+        //  - map (requiresSideFollowUp): the map is unknown so the user must
+        //    pick, and a side-needing map diverts to the attack/defend step —
+        //    so the button says NEXT (more may follow).
+        //  - plain pick (e.g. result Victory/Defeat/Draw): resolves immediately,
+        //    pre-filled with the best guess, so the button says SAVE.
         <div className="flex gap-2">
           <Select<string>
             value={fixValue}
             onChange={setFixValue}
-            placeholder={'Select map\u2026'}
+            placeholder={candidate.requiresSideFollowUp ? 'Select map\u2026' : 'Select\u2026'}
             className="flex-1"
             options={candidate.options!.map(opt => ({ value: opt, label: opt }))}
           />
           <button onClick={submitFix} disabled={fixValue.trim() === ''}
             className="bg-ow-orange hover:bg-ow-accent disabled:opacity-40 disabled:cursor-not-allowed
                        text-ow-dark font-display font-bold px-4 rounded text-sm tracking-wider transition-colors">
-            NEXT
+            {candidate.requiresSideFollowUp ? 'NEXT' : 'SAVE'}
           </button>
         </div>
       ) : editing ? (

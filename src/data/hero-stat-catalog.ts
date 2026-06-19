@@ -204,7 +204,7 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
   },
 
   // ============================================================
-  // DPS (23 heroes)
+  // DPS (24 heroes)
   // ============================================================
   {
     hero: 'Anran',
@@ -377,6 +377,19 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
       { name: 'CRITICAL HIT ACCURACY' },
       { name: 'SOLO KILLS', hasAvgPer10: true },
       { name: 'SELF HEALING', hasAvgPer10: true },
+    ],
+  },
+  {
+    hero: 'Shion',
+    tileCount: 7,
+    stats: [
+      { name: 'WEAPON ACCURACY' },
+      { name: 'CRITICAL HIT ACCURACY' },
+      { name: 'JOYRIDE DAMAGE DONE', hasAvgPer10: true },
+      { name: 'SATSURIKU SPREE KILLS', hasAvgPer10: true },
+      { name: 'EXECUTION KILLS', hasAvgPer10: true },
+      { name: 'FINAL BLOWS', hasAvgPer10: true },
+      { name: 'SOLO KILLS', hasAvgPer10: true },
     ],
   },
   {

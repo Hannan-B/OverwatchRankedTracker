@@ -22,7 +22,7 @@ export interface GameMap {
 export type GameMode = 'escort' | 'control' | 'hybrid' | 'push' | 'flashpoint'
 
 // ============================================================
-// HEROES (51)
+// HEROES (52)
 // ============================================================
 
 export const HEROES: Hero[] = [
@@ -51,10 +51,11 @@ export const HEROES: Hero[] = [
   { name: 'Sierra', role: 'dps', subRole: 'sharpshooter' },
   { name: 'Sojourn', role: 'dps', subRole: 'sharpshooter' },
   { name: 'Widowmaker', role: 'dps', subRole: 'sharpshooter' },
-  // DPS — Flanker (6)
+  // DPS — Flanker (7)
   { name: 'Anran', role: 'dps', subRole: 'flanker' },
   { name: 'Genji', role: 'dps', subRole: 'flanker' },
   { name: 'Reaper', role: 'dps', subRole: 'flanker' },
+  { name: 'Shion', role: 'dps', subRole: 'flanker' },
   { name: 'Tracer', role: 'dps', subRole: 'flanker' },
   { name: 'Vendetta', role: 'dps', subRole: 'flanker' },
   { name: 'Venture', role: 'dps', subRole: 'flanker' },
@@ -92,7 +93,7 @@ export const HEROES: Hero[] = [
 ]
 
 // ============================================================
-// MAPS (29)
+// MAPS (30)
 // ============================================================
 
 export const MAPS: GameMap[] = [
@@ -113,12 +114,13 @@ export const MAPS: GameMap[] = [
   { name: 'Nepal', mode: 'control', location: 'Nepal' },
   { name: 'Oasis', mode: 'control', location: 'Iraq' },
   { name: 'Samoa', mode: 'control', location: 'Samoa' },
-  // Hybrid (7)
+  // Hybrid (8)
   { name: 'Blizzard World', mode: 'hybrid', location: 'USA' },
   { name: 'Eichenwalde', mode: 'hybrid', location: 'Germany' },
   { name: 'Hollywood', mode: 'hybrid', location: 'USA' },
   { name: "King's Row", mode: 'hybrid', location: 'England' },
   { name: 'Midtown', mode: 'hybrid', location: 'USA' },
+  { name: 'Neon Junction', mode: 'hybrid', location: 'Japan' },
   { name: 'Numbani', mode: 'hybrid', location: 'Nigeria' },
   { name: 'Paraíso', mode: 'hybrid', location: 'Brazil' },
   // Push (4)

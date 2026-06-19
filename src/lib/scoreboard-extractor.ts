@@ -50,13 +50,13 @@ const HERO_ROLE_MAP: Record<string, RoleType> = {
   'Junker Queen': 'tank', 'Mauga': 'tank', 'Orisa': 'tank', 'Ramattra': 'tank',
   'Reinhardt': 'tank', 'Roadhog': 'tank', 'Sigma': 'tank', 'Winston': 'tank',
   'Wrecking Ball': 'tank', 'Zarya': 'tank',
-  // DPS (23)
+  // DPS (24)
   'Anran': 'dps', 'Ashe': 'dps', 'Bastion': 'dps', 'Cassidy': 'dps',
   'Echo': 'dps', 'Emre': 'dps', 'Freja': 'dps', 'Genji': 'dps',
   'Hanzo': 'dps', 'Junkrat': 'dps', 'Mei': 'dps', 'Pharah': 'dps',
-  'Reaper': 'dps', 'Sierra': 'dps', 'Sojourn': 'dps', 'Soldier: 76': 'dps',
-  'Sombra': 'dps', 'Symmetra': 'dps', 'Torbjörn': 'dps', 'Tracer': 'dps',
-  'Vendetta': 'dps', 'Venture': 'dps', 'Widowmaker': 'dps',
+  'Reaper': 'dps', 'Shion': 'dps', 'Sierra': 'dps', 'Sojourn': 'dps',
+  'Soldier: 76': 'dps', 'Sombra': 'dps', 'Symmetra': 'dps', 'Torbjörn': 'dps',
+  'Tracer': 'dps', 'Vendetta': 'dps', 'Venture': 'dps', 'Widowmaker': 'dps',
   // Support (14)
   'Ana': 'support', 'Baptiste': 'support', 'Brigitte': 'support',
   'Illari': 'support', 'Jetpack Cat': 'support', 'Juno': 'support',

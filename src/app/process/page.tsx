@@ -31,7 +31,7 @@ import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
 import { getGameModeForMap, needsStartingSide, MAPS } from '@/data/reference'
 import type { RoleType, MatchFeel, PerformanceFeel, StartingSide } from '@/lib/types'
 import { buildConfirmationQuestions, type ConfirmInputs, type ConfirmationCandidate } from '@/lib/beta-confirmation'
-import { logConfirmationOutcome, logMatchSummary, logProcessingError, logDateOcrFailure, logMapDetectMiss } from '@/lib/beta-issue-log'
+import { logConfirmationOutcome, logMatchSummary, logProcessingError, logDateOcrFailure, logMapDetectMiss, logResultConflict } from '@/lib/beta-issue-log'
 import { ConfirmationPanel, type ConfirmationResult } from '@/app/review/ConfirmationCard'
 
 interface PendingBatch {
@@ -667,6 +667,36 @@ export default function ProcessPage() {
         })
       } catch (err) {
         console.warn('[beta] map-detect-miss logging failed (continuing to save):', err)
+      }
+    }
+
+    // Result cross-check answer — apply it back BEFORE saving, same as the map.
+    // The result is the stored win/loss (matches.result, CHECK victory/defeat/
+    // draw) and feeds win-rate everywhere, so a corrected answer MUST reach
+    // saveMatch. The card returns the option label ('Victory'/'Defeat'/'Draw');
+    // the column + the rest of the app use lowercase, so normalise on write-back.
+    // We WRITE BACK only when the user actually changed the value (a confirmed
+    // banner is already correct), but LOG every time the question fired — even an
+    // unchanged confirm — so the signal's precision can be measured later.
+    const resultAnswer = results.find(r => r.candidate.field === 'result')
+    if (resultAnswer) {
+      const raw = resultAnswer.correctedValue
+      const picked = raw ? raw.trim().toLowerCase() : null
+      if (picked === 'victory' || picked === 'defeat' || picked === 'draw') {
+        result.result = picked
+      }
+      try {
+        await logResultConflict({
+          matchId: batch.batchId,
+          bannerResult: result.ocrRaw?.bannerResult || null,
+          scoreDerivedResult: result.ocrRaw?.scoreDerivedResult || null,
+          // null correctedValue (unchanged confirm) is recorded as such — the
+          // banner read stood; logResultConflict still logs the fired event.
+          correctedValue: picked,
+          format,
+        })
+      } catch (err) {
+        console.warn('[beta] result-conflict logging failed (continuing to save):', err)
       }
     }
 

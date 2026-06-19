@@ -32,6 +32,7 @@ export type SignalKind =
   | 'unrecognized'          // tier 1: UNKNOWN label / no catalog entry / unknown map-mode
   | 'date_ocr_fail'         // tier 1: match date missing / implausible / far from neighbours
   | 'map_detect_fail'       // tier 1: phone map-detect missed AND/OR laptop OCR map null/unreadable
+  | 'result_conflict'       // tier 1: VICTORY/DEFEAT banner unreadable OR disagrees with the score
   | 'vote_split'            // tier 2: scoreboard digit, multi-threshold disagreed
   | 'avg_crosscheck_fail'   // tier 3: breakdown value != avg * playtime/10min (demoted, step 2)
   | 'low_hero_conf'         // tier 3: portrait match below confidence gate
@@ -47,6 +48,7 @@ export type FieldKind =
   | 'username'
   | 'date'
   | 'map'
+  | 'result'
   | 'side'
 
 // Lower tier number = higher priority (filled first).
@@ -61,6 +63,12 @@ export const SIGNAL_TIER: Record<SignalKind, 1 | 2 | 3 | 4> = {
   // the date, it must claim a slot when it fires (it fires rarely). The answer
   // is a dropdown pick of known maps, with a conditional attack/defend follow-up.
   map_detect_fail: 1,
+  // Tier 1: the win/loss result is a core headline fact that feeds win-rate
+  // across hero / map / role / season analytics, so a flipped result silently
+  // corrupts many surfaces at once. It fires rarely (only when the banner is
+  // unreadable or disagrees with the score), so like date/map it can claim a
+  // slot whenever it appears. The answer is a Victory/Defeat/Draw pick.
+  result_conflict: 1,
   vote_split: 2,
   // Demoted 2→3 (step 2): the avg cross-check is built on the game's per-10min
   // average, which is rounded at source AND unstable at low playtime, so it is a
@@ -658,6 +666,49 @@ function mapDetectCandidate(inp: ConfirmInputs): ConfirmationCandidate[] {
 }
 
 /**
+ * Match result cross-check. The summary banner (VICTORY/DEFEAT/DRAW) is the
+ * authoritative result when it reads cleanly; ocr-extractor independently
+ * derives a result from the score line and records both, plus a conflict flag,
+ * on summary.raw. This fires ONE tier-1 question when the flag is set — i.e.
+ * the banner was unreadable, OR the banner and score-derived result disagree
+ * (e.g. a real "VICTORY" banner over a 0-2 score, which the score alone would
+ * read as a defeat). The answer is a Victory/Defeat/Draw pick; the default the
+ * card pre-selects is the banner when it was readable, else the score-derived
+ * value. Like the date/map checks it fires rarely, so it claims a slot when it
+ * appears. A flipped result silently corrupts win-rate across every analytics
+ * surface, which is why this is tier 1 and not a softer check.
+ */
+const RESULT_OPTIONS = ['Victory', 'Defeat', 'Draw'] as const
+function titleCaseResult(r: string): string {
+  return r ? r.charAt(0).toUpperCase() + r.slice(1).toLowerCase() : ''
+}
+function resultConflictCandidate(inp: ConfirmInputs): ConfirmationCandidate[] {
+  const raw = inp.summary?.raw
+  if (!raw || raw.resultConflict !== 'true') return []
+
+  const banner = raw.bannerResult ?? ''        // '' when the banner OCR failed
+  const scoreDerived = raw.scoreDerivedResult ?? ''
+  // Pre-selected default: banner when readable, else the score-derived value.
+  const def = banner !== '' ? banner : scoreDerived
+  const note = banner === ''
+    ? 'The Victory/Defeat banner could not be read — confirm the result.'
+    : `Banner read "${titleCaseResult(banner)}" but the score (${inp.summary?.score ?? '?'}) ` +
+      `looks like a ${titleCaseResult(scoreDerived)} — confirm which is correct.`
+
+  return [{
+    id: `result_check:${inp.matchId}`,
+    field: 'result',
+    fieldDetail: 'Was this a win, loss, or draw?',
+    signal: 'result_conflict',
+    tier: 1,
+    region: inp.summaryImageUrl ? { imageUrl: inp.summaryImageUrl } : null,
+    extractedValue: titleCaseResult(def) || '(unknown)',
+    note,
+    options: [...RESULT_OPTIONS],
+  }]
+}
+
+/**
  * Build the full candidate set, rank by tier, and return what to ask.
  *
  * Rule (per the 6f beta design):
@@ -680,6 +731,7 @@ export function buildConfirmationQuestions(
 
   const priority: ConfirmationCandidate[] = [
     ...mapDetect,
+    ...resultConflictCandidate(inp),
     ...unrecognized,
     ...dateCandidate(inp),
     ...scoreboardVoteSplitCandidates(inp),

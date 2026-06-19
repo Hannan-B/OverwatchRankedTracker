@@ -164,6 +164,46 @@ export async function logMapDetectMiss(args: {
   })
 }
 
+/** Log a match-result conflict (result cross-check). Fires when the summary's
+ *  VICTORY/DEFEAT banner could not be read, OR the banner disagrees with the
+ *  result derived from the score line, so the reviewer was asked to confirm the
+ *  win/loss/draw. `bannerResult` / `scoreDerivedResult` record what each source
+ *  said (either may be empty); `correctedValue` is the reviewer's pick (null when
+ *  they accepted the pre-filled banner value unchanged). Logged under the
+ *  `result` field / `result_conflict` signal so it surfaces in the signal-
+ *  precision + error-rate tables, exactly like the date and map paths. The event
+ *  is `corrected` ONLY when the reviewer actually changed the result; an
+ *  unchanged confirm logs `confirmed_correct` so the precision math counts it as
+ *  a true negative, not a real error. A flipped result silently corrupts win-rate
+ *  across hero / map / role / season analytics, hence worth tracking every time. */
+export async function logResultConflict(args: {
+  matchId: string
+  bannerResult?: string | null
+  scoreDerivedResult?: string | null
+  correctedValue?: string | null
+  format?: '5v5' | '6v6' | null
+}): Promise<{ error: unknown }> {
+  const banner = args.bannerResult && args.bannerResult !== '' ? args.bannerResult : 'unreadable'
+  const detail = `result_${banner}_vs_score_${args.scoreDerivedResult || 'none'}`
+  // A correction only happened if the pick differs from what the banner read.
+  // When the banner was unreadable, any pick is effectively a correction (there
+  // was no trustworthy read to confirm).
+  const bannerReadable = !!(args.bannerResult && args.bannerResult !== '')
+  const changed =
+    args.correctedValue != null &&
+    (!bannerReadable || args.correctedValue.toLowerCase() !== args.bannerResult!.toLowerCase())
+  return logIssueEvent({
+    match_id: args.matchId,
+    event: changed ? 'corrected' : 'confirmed_correct',
+    field: 'result',
+    field_detail: detail,
+    signal: 'result_conflict',
+    read_value: args.bannerResult ?? null,
+    corrected_value: changed ? args.correctedValue ?? null : null,
+    format: args.format ?? null,
+  })
+}
+
 /** Log a batch that failed to process. The error message is stored in
  *  `read_value` (no new column needed); `field_detail` carries a short reason.
  *  Files for this batch are intentionally LEFT in pending/ for retry, so the

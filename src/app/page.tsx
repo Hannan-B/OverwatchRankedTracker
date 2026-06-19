@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
+import { matchQuery } from '@/lib/alpha'
 import { formatBritishDate } from '@/lib/date-format'
 import Link from 'next/link'
 import { AnalyticsMenu } from '@/components/AnalyticsNav'
@@ -334,11 +335,14 @@ export default function HomePage() {
 
     // All matches (aggregates computed client-side, filtered by scope).
     // game_mode added for the #14 queue x mode / map tables.
-    const { data: matchData } = await supabase
-      .from('matches')
-      .select('id, result, role_played, match_format, season_id, played_at, map, game_mode, team_leaver, enemy_leaver')
+    // Routed through matchQuery so alpha (localhost test) matches are excluded
+    // on the live site — same single-source-of-truth rule every other surface
+    // uses. On localhost the dev switch still controls visibility.
+    const { data: matchData } = await matchQuery(
+      'id, result, role_played, match_format, season_id, played_at, map, game_mode, team_leaver, enemy_leaver',
+    )
       .order('played_at', { ascending: false })
-    setAllMatches((matchData as MatchRow[]) || [])
+    setAllMatches((matchData as unknown as MatchRow[]) || [])
 
     // Per-hero rows for the #14 most-played / time / map tables. Joined to
     // matches client-side by match_id. Season/leaver scoping is applied on the
@@ -394,8 +398,8 @@ export default function HomePage() {
     ? null
     : seasons.find(s => Number(s.id) === curSeasonId) ?? null
   // Current-season matches, then apply the leaver rule (matches the rest of the
-  // performance surfaces). Alpha is handled the same way the rest of this page
-  // handles it (Home reads matches raw; left unchanged to preserve behaviour).
+  // performance surfaces). Alpha is already excluded upstream: allMatches is
+  // fetched via matchQuery, so live never includes alpha here.
   const overviewMatches = curSeasonId == null
     ? []
     : allMatches.filter(m =>
