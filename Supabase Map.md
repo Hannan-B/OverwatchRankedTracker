@@ -22,8 +22,8 @@ as you play — the analytics views group your match data dynamically. There are
 | New thing | Needs a database change? | What |
 |---|---|---|
 | **New map** | ❌ **No** | `map_analytics` and every map surface group dynamically from your matches. Just play on it; it appears. |
-| **New hero** | ✅ **Yes — one view** | `hero_role_ref` hardcodes the 51 heroes→role list. Add the hero here or Matchups won't know its role. |
-| **New STAT name** (a stat no existing hero has) | ✅ **Yes — one view** | `hero_stats_normalised` hardcodes ~119 stat-name fold rules. Add the new stat or its value won't normalise in the DB. |
+| **New hero** | ✅ **Yes — one view** | `hero_role_ref` hardcodes the 52 heroes→role list. Add the hero here or Matchups won't know its role. |
+| **New STAT name** (a stat no existing hero has) | ✅ **Yes — one view** | `hero_stats_normalised` hardcodes ~121 stat-name fold rules. Add the new stat or its value won't normalise in the DB. |
 
 Everything else (win rates, play time, E/A/D, damage shares, breakdown aggregates,
 season splits, role splits, map splits) is **dynamic** — no DB edit needed.
@@ -50,6 +50,14 @@ season splits, role splits, map splits) is **dynamic** — no DB edit needed.
   Pages read views, then do light filtering/averaging in JavaScript.
 - You never hand-edit table rows for a new hero/map — heroes and maps live in the
   app's *code* (`reference.ts`), and match data arrives through processing.
+
+> **One documented exception to "never raw tables for analytics":** the **Home** page
+> reads the `matches` table directly (not a view) for its all-time/season aggregates. It
+> does so through `matchQuery()` (`src/lib/alpha.ts`), which adds `.eq('is_alpha', false)`
+> off-localhost — so the alpha rule is still applied, the same way the plain views apply
+> it. (Reading `matches` raw *without* `matchQuery` is exactly what let alpha test data
+> leak onto the live Home page before v1.0.0; the fix was to route the query through
+> `matchQuery`.)
 
 ---
 
@@ -123,6 +131,12 @@ retention is a future design decision, not built. Leave alone.
 > are plain unconstrained `text` — there is **no** CHECK on them, so logging
 > `field:'map'` / `signal:'map_detect_fail'` cannot 400 on a constraint. That caveat
 > can be closed.
+> **(v1.0.0) Live confirmation:** the result cross-check now logs
+> `field:'result'` / `signal:'result_conflict'` (via `logResultConflict`) — a brand-new
+> field+signal pair added with **no** schema change, exactly because these columns are
+> unconstrained text. It reuses an existing `event` value (`corrected` when the result
+> changed, else `confirmed_correct`), since `event` *is* CHECK-constrained to the 6 types
+> above — so no new event type was introduced.
 
 ### `builder_saved_charts` / `builder_chart_views` / `builder2_saved_charts` / `builder2_chart_views`
 Saved-chart persistence for the two builders (the generic builder and the dual-axis
@@ -141,14 +155,14 @@ the `_with_alpha` twin **keeps** them (localhost only).
 
 ## ⭐ The two hardcoded views (update for new content)
 
-### ⭐ `hero_role_ref` — HARDCODED 51-hero → role list
+### ⭐ `hero_role_ref` — HARDCODED 52-hero → role list
 A standalone lookup built from an inlined `VALUES` table:
-`('D.Va','tank'), ('Doomfist','tank'), … ('Wuyang','support')` — all 51 heroes.
+`('D.Va','tank'), ('Doomfist','tank'), … ('Wuyang','support')` — all 52 heroes.
 **Read by `matchup_rows`** (and through it, the whole Matchups feature) to attach a
 role to each scoreboard hero. **A new hero MUST be added here**, or Matchups treats it
 as having an unknown role. → New Season Runbook, hero step.
 
-### ⭐ `hero_stats_normalised` — HARDCODED stat-name folding (~119 rules)
+### ⭐ `hero_stats_normalised` — HARDCODED stat-name folding (~121 rules)
 Reads raw `hero_stats` and, via a big `CASE`, folds each stat's singular/plural OCR
 variants to one canonical name (e.g. `'FINAL BLOW'`/`'FINAL BLOWS'` → `FINAL BLOWS`).
 This **mirrors `STAT_NORMALISE` in `src/data/stat-meta.ts`** — the code file's comment

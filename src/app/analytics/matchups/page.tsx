@@ -62,9 +62,9 @@ function toMatchupFilters(
   secThreshold: number,
 ): MatchupFilters {
   return {
-    queue: (f.queue ?? 'all') as MatchupFilters['queue'],
-    mode: (f.mode ?? 'all') as MatchupFilters['mode'],
-    map: (f.map ?? 'all') as MatchupFilters['map'],
+    queue: (f.queue || 'all') as MatchupFilters['queue'],
+    mode: (f.mode || 'all') as MatchupFilters['mode'],
+    map: (f.map || 'all') as MatchupFilters['map'],
     attribution,
     pctThreshold,
     secThreshold,

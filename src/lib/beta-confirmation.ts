@@ -25,6 +25,12 @@ import type {
 import type { SbCellConfidence } from './scoreboard-extractor'
 import type { BreakdownOcrResult } from './breakdown-ocr'
 import type { SummaryOcrResult } from './ocr-extractor'
+// Stat-format metadata: the avg/10 cross-check only makes sense for COUNTABLE
+// stats. Percentages (e.g. WEAPON ACCURACY) and durations (OBJ CONTEST TIME)
+// have no "× playtime/10min" relationship, so they must be excluded — otherwise
+// they false-flag on any game that isn't exactly 10 minutes (root cause of the
+// avg_crosscheck_fail flood, all of which were confirmed_correct).
+import { statFormat, normaliseStat } from '@/data/stat-meta'
 
 // ── Signal + field taxonomy ──────────────────────────────────
 
@@ -446,12 +452,25 @@ function avgCrossCheckCandidates(inp: ConfirmInputs, cfg: BetaConfirmConfig): Co
     for (const st of bd.stats) {
       if (st.statName.startsWith('UNKNOWN')) continue   // handled by tier 1
       if (st.avgPer10Min === null) continue
+
+      // Only countable ('number') stats have a meaningful avg/10 relationship.
+      // Percentages (accuracy, uptime %) and durations (OBJ CONTEST TIME) don't
+      // scale with playtime, so `value ≈ avg × playtime/10min` never holds for
+      // them — they were the entire source of the avg_crosscheck_fail flood.
+      // numericValue also mangles these (e.g. "01:51" → 151, "40%" → 40), so
+      // comparing them is doubly meaningless. Skip anything that isn't a number.
+      if (statFormat(normaliseStat(st.statName)) !== 'number') continue
+
       const value = numericValue(st.statValue)
       const avg = numericValue(st.avgPer10Min)
       if (value === null || avg === null || avg === 0) continue
 
       const expected = avg * (playtime / 600)
       if (expected === 0) continue
+      // Near-zero counts (0, 1) can't be cross-checked meaningfully — rounding on
+      // either the value or the OCR'd avg/10 blows past any tolerance. Require a
+      // small floor on both sides so the check only runs where it's informative.
+      if (value < 2 && expected < 2) continue
       const deviation = Math.abs(value - expected) / Math.max(expected, 1)
       if (deviation > cfg.avgTolerance) {
         out.push({

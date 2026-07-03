@@ -152,7 +152,11 @@ function LeaverLine({ rows }: { rows: MatchRow[] }) {
 }
 
 // ---- one career-profile win-rate card ----
-function WinRateCard({ title, rows }: { title: string; rows: MatchRow[] }) {
+// `rows` drives the win rate + record and respects the leaver toggle.
+// `leaverRows` feeds the always-on leaver line; it should be the UNFILTERED set
+// for this category so leaver counts show even when leaver games are hidden from
+// the win rate. Defaults to `rows` when not supplied.
+function WinRateCard({ title, rows, leaverRows }: { title: string; rows: MatchRow[]; leaverRows?: MatchRow[] }) {
   const { pct, w, l, total } = winRate(rows)
   const tone = total === 0 ? 'text-ow-faint'
     : pct >= 50 ? 'text-ow-victory' : 'text-ow-defeat'
@@ -167,7 +171,7 @@ function WinRateCard({ title, rows }: { title: string; rows: MatchRow[] }) {
       <p className="relative text-xs text-ow-faint mt-1">
         {total === 0 ? 'No games' : `${w}W – ${l}L · ${total} games`}
       </p>
-      <LeaverLine rows={rows} />
+      <LeaverLine rows={leaverRows ?? rows} />
     </div>
   )
 }
@@ -373,16 +377,34 @@ export default function HomePage() {
     ? allMatches
     : allMatches.filter(m => m.season_id != null && seasonSel.includes(m.season_id))
 
-  // Four category sets
-  const tank5 = scoped.filter(m => m.match_format === '5v5' && m.role_played === 'tank')
-  const dps5 = scoped.filter(m => m.match_format === '5v5' && m.role_played === 'dps')
-  const sup5 = scoped.filter(m => m.match_format === '5v5' && m.role_played === 'support')
-  const six = scoped.filter(m => m.match_format === '6v6')
+  // `scoped` stays UNFILTERED — the dedicated leaver displays (per-card leaver
+  // line + the big Leaver Games box) read from it so they always show leaver
+  // counts regardless of the Settings toggle.
+  //
+  // `scopedVisible` applies the Settings "show leaver games" rule and feeds the
+  // GENERAL surfaces (win-rate cards, games-played totals, last-5, recent-form
+  // pips). Mirrors the overviewVisible rule used by the #14 block below.
+  const scopedVisible = showLeaverGames()
+    ? scoped
+    : scoped.filter(m => m.team_leaver !== true && m.enemy_leaver !== true)
 
-  const last5 = winRate(scoped.slice(0, 5))
-  const last10 = scoped.slice(0, 10)
+  // Four category sets — VISIBLE (toggle-respecting) for win rate + totals.
+  const tank5 = scopedVisible.filter(m => m.match_format === '5v5' && m.role_played === 'tank')
+  const dps5 = scopedVisible.filter(m => m.match_format === '5v5' && m.role_played === 'dps')
+  const sup5 = scopedVisible.filter(m => m.match_format === '5v5' && m.role_played === 'support')
+  const six = scopedVisible.filter(m => m.match_format === '6v6')
 
-  // Grand-total leaver split for the current scope (always shown).
+  // Same four category sets but UNFILTERED — for the per-card leaver line, which
+  // must always report leaver counts even when the toggle hides leaver games.
+  const tank5All = scoped.filter(m => m.match_format === '5v5' && m.role_played === 'tank')
+  const dps5All = scoped.filter(m => m.match_format === '5v5' && m.role_played === 'dps')
+  const sup5All = scoped.filter(m => m.match_format === '5v5' && m.role_played === 'support')
+  const sixAll = scoped.filter(m => m.match_format === '6v6')
+
+  const last5 = winRate(scopedVisible.slice(0, 5))
+  const last10 = scopedVisible.slice(0, 10)
+
+  // Grand-total leaver split for the current scope (ALWAYS from unfiltered scoped).
   const leaversAll = leaverSplit(scoped)
 
   // Label for the current selection: "All Time", one season's name, or "N seasons".
@@ -460,10 +482,10 @@ export default function HomePage() {
 
           {/* Four win-rate cards */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-            <WinRateCard title="Tank · 5v5" rows={tank5} />
-            <WinRateCard title="DPS · 5v5" rows={dps5} />
-            <WinRateCard title="Support · 5v5" rows={sup5} />
-            <WinRateCard title="6v6" rows={six} />
+            <WinRateCard title="Tank · 5v5" rows={tank5} leaverRows={tank5All} />
+            <WinRateCard title="DPS · 5v5" rows={dps5} leaverRows={dps5All} />
+            <WinRateCard title="Support · 5v5" rows={sup5} leaverRows={sup5All} />
+            <WinRateCard title="6v6" rows={six} leaverRows={sixAll} />
           </div>
 
           {/* Identity stats + last-5 box */}
@@ -472,7 +494,7 @@ export default function HomePage() {
             <div className="lg:col-span-2 bg-ow-panel rounded-xl p-5 border border-ow-line">
               <p className="text-[11px] text-ow-muted font-display tracking-[0.15em] uppercase mb-3">Games Played</p>
               <div className="flex items-baseline gap-2 mb-4">
-                <span className="text-4xl font-display font-bold text-ow-fg">{scoped.length}</span>
+                <span className="text-4xl font-display font-bold text-ow-fg">{scopedVisible.length}</span>
                 <span className="text-sm text-ow-faint">total</span>
               </div>
               <div className="grid grid-cols-4 gap-2">
