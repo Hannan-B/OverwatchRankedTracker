@@ -28,11 +28,14 @@ import { supabase } from '@/lib/supabase'
 import { matchQuery } from '@/lib/alpha'
 import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus } from '@/lib/image-processor'
 import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
-import { getGameModeForMap, needsStartingSide, MAPS } from '@/data/reference'
+import { getGameModeForMap, needsStartingSide, MAPS, HEROES } from '@/data/reference'
 import type { RoleType, MatchFeel, PerformanceFeel, StartingSide } from '@/lib/types'
-import { buildConfirmationQuestions, type ConfirmInputs, type ConfirmationCandidate } from '@/lib/beta-confirmation'
-import { logConfirmationOutcome, logMatchSummary, logProcessingError, logDateOcrFailure, logMapDetectMiss, logResultConflict } from '@/lib/beta-issue-log'
-import { ConfirmationPanel, type ConfirmationResult } from '@/app/review/ConfirmationCard'
+import { logHeroAudit, logMatchSummary, logProcessingError } from '@/lib/beta-issue-log'
+// Beta confirmation is SUNSET (v1.0.2). The confidence-gated question flow
+// could measure how often a flag was right but never how many errors went
+// unflagged — 60 of 71 wrong heroes were never questioned. It is replaced by
+// a per-slot audit of every scoreboard row.
+import { HeroAuditPanel, type HeroAuditResult } from '@/app/review/HeroAuditPanel'
 
 interface PendingBatch {
   batchId: string
@@ -70,7 +73,6 @@ interface PendingBatch {
 interface ReviewItem {
   batch: PendingBatch
   result: ProcessedMatch
-  questions: ConfirmationCandidate[]
   matchSeq: number
   // username confirmation state for THIS match
   userResolved: boolean
@@ -355,69 +357,9 @@ export default function ProcessPage() {
   function processAllBatches() { startProcessing(batches) }
 
   // Build the 6f confirmation questions for a finished result (pure-ish; no save).
-  function buildQuestions(batch: PendingBatch, result: ProcessedMatch, seq: number, recentMatchDates: Date[] = []): ConfirmationCandidate[] {
-    const sb = result.scoreboard
-
-    const lowConfHeroSlots = (sb?.heroes ?? [])
-      .filter(h => h.heroName && h.confidence < 0.6)
-      .map(h => h.slot)
-
-    const breakdowns = result.heroBreakdowns.map(b => ({
-      heroName: b.heroName,
-      percentPlayed: b.percentPlayed,
-      playTimeSeconds: b.playTimeSeconds,
-      stats: b.stats,
-      expectedStatCount: b.expectedStatCount,
-      foundStatCount: b.foundStatCount,
-      raw: '',
-    }))
-
-    const inputs: ConfirmInputs = {
-      matchId: batch.batchId,
-      format: (result.matchFormat || batch.metadata.match_format || '5v5') as '5v5' | '6v6',
-      scoreboardCells: sb?.cellConfidence,
-      scoreboardStats: sb?.stats,
-      userAnalysis: sb?.ocrAnalysis,
-      breakdowns,
-      summary: {
-        mapName: result.mapName,
-        result: result.result,
-        score: result.score,
-        gameLengthText: result.gameLengthSeconds
-          ? `${Math.floor(result.gameLengthSeconds / 60)}:${String(result.gameLengthSeconds % 60).padStart(2, '0')}`
-          : null,
-        gameLengthSeconds: result.gameLengthSeconds,
-        matchTimestamp: result.matchTimestamp,
-        matchDateText: result.matchDateText,
-        eliminations: result.eliminations,
-        assists: result.assists,
-        deaths: result.deaths,
-        heroNames: result.heroes.map(h => h.name),
-        raw: result.ocrRaw,
-      },
-      lowConfHeroSlots,
-      knownMaps: MAP_NAMES,
-      knownModes: MODE_NAMES,
-      // Step 10: the phone reported its map auto-detect missed at upload. The
-      // laptop's own OCR map (summary.mapName above) is the first recovery
-      // attempt; mapDetectCandidate only raises the dropdown when that is also
-      // null/unrecognized, so this flag widens the trigger to "phone missed AND
-      // OCR didn't recover" without changing behaviour when OCR succeeded.
-      mapDetectMissed: batch.metadata.map_detect_missed === true,
-      scoreboardImageUrl: sb?.imageUrl,
-      summaryImageUrl: result.summaryImageUrl,
-      breakdownImageUrlByHero: Object.fromEntries(
-        result.heroBreakdowns.map(b => [b.heroName, b.imageUrl])
-      ),
-      grid: sb?.detection?.grid ?? undefined,
-      imageNaturalWidth: 3840,
-      imageNaturalHeight: 2160,
-      matchSequence: seq,
-      recentMatchDates,
-    }
-
-    return buildConfirmationQuestions(inputs)
-  }
+  // buildQuestions() removed with beta confirmation (v1.0.2). The hero audit
+  // needs no pre-built candidate list — it derives its rows from the
+  // scoreboard result at render time.
 
   async function runProcessingLoop(which: PendingBatch[]) {
     const collected: ReviewItem[] = []
@@ -474,13 +416,11 @@ export default function ProcessPage() {
         const result = isLeaverGame ? { ...rawResult, scoreboard: null } : rawResult
 
         seq += 1
-        const questions = buildQuestions(batch, result, seq, recentMatchDates)
         const userResolved = !(result.scoreboard?.ocrAnalysis && !result.scoreboard.ocrAnalysis.resolved)
 
         collected.push({
           batch,
           result,
-          questions,
           matchSeq: seq,
           userResolved,
           saved: false,
@@ -607,97 +547,88 @@ export default function ProcessPage() {
   const handleSkipConfirm = useCallback(() => setReviewStep('beta'), [])
 
   // 6f completion → log outcomes, then SAVE this match immediately.
-  async function onBetaComplete(results: ConfirmationResult[]) {
+  // ── Hero audit complete ──────────────────────────────────
+  // Replaces onBetaComplete (v1.0.2). Two jobs, in this order:
+  //   1. WRITE the confirmed heroes into the in-memory result, so saveMatch
+  //      stores what the user said rather than what the matcher guessed.
+  //      Until this existed, hero_id was the one confirmation field logged but
+  //      never written back — 11 corrections were made during the beta, all 11
+  //      matched ground truth, and all 11 were discarded on save.
+  //   2. LOG every slot, confirmed and corrected alike. The confirmed ones are
+  //      the negative examples; without them no error rate is computable.
+  async function onAuditComplete(audit: HeroAuditResult) {
     const item = reviewItems[reviewIndex]
     if (!item) return
     const { batch, result } = item
     const format = (result.matchFormat || batch.metadata.match_format || '5v5') as '5v5' | '6v6'
-    const autoPassFields = result.scoreboard?.cellConfidence?.length ?? 0
 
     setReviewStep('saving')
     setReviewError(null)
 
-    try {
-      for (const r of results) {
-        await logConfirmationOutcome({
-          matchId: batch.batchId,
-          format,
-          field: r.candidate.field,
-          fieldDetail: r.candidate.fieldDetail,
-          signal: r.candidate.signal,
-          readValue: r.candidate.extractedValue,
-          confidence: r.candidate.confidence,
-          outcome: r.outcome,
-          correctedValue: r.correctedValue,
-        })
+    // ---- 1. write-back ----
+    // heroName lives on FOUR arrays inside ScoreboardResult. saveMatch reads
+    // hero_name/role from `stats` and is_user from `players`, but the others
+    // feed downstream checks, so all four move together — a partial update
+    // would leave the result internally inconsistent.
+    if (result.scoreboard) {
+      const sb = result.scoreboard
+      for (const row of audit.rows) {
+        if (!row.confirmedHero || row.confirmedHero === row.readHero) continue
+        const hero = HEROES.find(h => h.name === row.confirmedHero)
+        if (!hero) {
+          console.warn(`[audit] skipped unknown hero "${row.confirmedHero}" at slot ${row.slot}`)
+          continue
+        }
+        // Role is RE-DERIVED, never carried: a wrong hero drags a wrong role
+        // with it, so correcting one without the other relocates the error.
+        for (const st of sb.stats) if (st.slot === row.slot) { st.heroName = hero.name; st.role = hero.role }
+        for (const h of sb.heroes) if (h.slot === row.slot) { h.heroName = hero.name }
+        for (const r of sb.roles) if (r.slot === row.slot) { r.heroName = hero.name; r.role = hero.role; r.source = 'hero_lookup' }
+        for (const pl of sb.players) if (pl.slot === row.slot) { pl.heroName = hero.name }
+        // The match-level role follows the user's row; finalRole in saveMatch
+        // reads correctedRole first, so a stale value would contradict the
+        // scoreboard we just corrected.
+        if (row.isUser) result.correctedRole = hero.role
+        console.log(`[audit] slot ${row.slot}: ${row.readHero} -> ${hero.name} (${hero.role})`)
       }
+    }
+
+    // ---- 2. logging ----
+    // Best-effort: a logging failure must never block the save.
+    try {
+      await logHeroAudit({
+        matchId: batch.batchId,
+        format,
+        reviewSeconds: audit.reviewSeconds,
+        rows: audit.rows.map(r => ({
+          slot: r.slot,
+          team: r.team,
+          role: r.role,
+          isUser: r.isUser,
+          readHero: r.readHero,
+          confirmedHero: r.confirmedHero,
+          corrected: r.verdict === 'corrected',
+          bulk: r.bulk,
+          score: r.score,
+          margin: r.margin,
+          runnerUp: r.runnerUp,
+          orbApplied: r.orbApplied,
+        })),
+      })
+      // autoPassFields is 0 in the audit era, deliberately. "Auto-pass" meant a
+      // field the user was never shown; now every slot is shown, so nothing
+      // auto-passes. Leaving it as (rows - corrected) would DOUBLE-COUNT against
+      // the confirmed_correct rows already written per slot, and the issue-log
+      // page's error rate would read as roughly half its true value.
+      // questionsAsked is every slot presented, which is the denominator.
       await logMatchSummary({
         matchId: batch.batchId,
         format,
-        questionsAsked: results.length,
-        autoPassFields: Math.max(0, autoPassFields - results.length),
+        questionsAsked: audit.rows.length,
+        autoPassFields: 0,
       })
     } catch (err) {
-      console.warn('[beta] logging failed (continuing to save):', err)
-    }
-
-    // Step 10 — apply a map-detect answer back into the data BEFORE saving.
-    // Unlike other confirmation fields (which are logged but not written back),
-    // the map drives starting_side + game_mode, so a corrected map MUST reach
-    // saveMatch. We mutate the in-memory result (map) and the batch metadata
-    // (side); both are consumed by this save and then discarded. saveMatch needs
-    // no change — it re-derives gameMode/startingSide from result.mapName.
-    const mapAnswer = results.find(r => r.candidate.field === 'map')
-    if (mapAnswer && mapAnswer.correctedValue) {
-      result.mapName = mapAnswer.correctedValue
-      // Side rides on the result only when the chosen map needs one; otherwise
-      // clear any stale phone value so a control/push map can't carry a side.
-      batch.metadata.starting_side =
-        needsStartingSide(mapAnswer.correctedValue)
-          ? (mapAnswer.sideValue ?? null)
-          : null
-      try {
-        await logMapDetectMiss({
-          matchId: batch.batchId,
-          phoneMissed: batch.metadata.map_detect_missed === true,
-          ocrValue: mapAnswer.candidate.extractedValue === '(none)' ? null : mapAnswer.candidate.extractedValue,
-          correctedValue: mapAnswer.correctedValue,
-          side: mapAnswer.sideValue ?? null,
-          format,
-        })
-      } catch (err) {
-        console.warn('[beta] map-detect-miss logging failed (continuing to save):', err)
-      }
-    }
-
-    // Result cross-check answer — apply it back BEFORE saving, same as the map.
-    // The result is the stored win/loss (matches.result, CHECK victory/defeat/
-    // draw) and feeds win-rate everywhere, so a corrected answer MUST reach
-    // saveMatch. The card returns the option label ('Victory'/'Defeat'/'Draw');
-    // the column + the rest of the app use lowercase, so normalise on write-back.
-    // We WRITE BACK only when the user actually changed the value (a confirmed
-    // banner is already correct), but LOG every time the question fired — even an
-    // unchanged confirm — so the signal's precision can be measured later.
-    const resultAnswer = results.find(r => r.candidate.field === 'result')
-    if (resultAnswer) {
-      const raw = resultAnswer.correctedValue
-      const picked = raw ? raw.trim().toLowerCase() : null
-      if (picked === 'victory' || picked === 'defeat' || picked === 'draw') {
-        result.result = picked
-      }
-      try {
-        await logResultConflict({
-          matchId: batch.batchId,
-          bannerResult: result.ocrRaw?.bannerResult || null,
-          scoreDerivedResult: result.ocrRaw?.scoreDerivedResult || null,
-          // null correctedValue (unchanged confirm) is recorded as such — the
-          // banner read stood; logResultConflict still logs the fired event.
-          correctedValue: picked,
-          format,
-        })
-      } catch (err) {
-        console.warn('[beta] result-conflict logging failed (continuing to save):', err)
-      }
+      console.warn('[audit] logging failed (continuing to save):', err)
     }
 
     try {
@@ -748,13 +679,8 @@ export default function ProcessPage() {
       // rather than silently swallowed. 'unparseable' if some text was read but
       // didn't parse; 'missing' if nothing was read at all. Best-effort (fire-
       // and-forget): a logging failure must never block the save.
-      const fmt = (processed.matchFormat || meta.match_format || '5v5') as '5v5' | '6v6'
-      void logDateOcrFailure({
-        matchId: batch.batchId,
-        reason: processed.matchDateText && processed.matchDateText.trim() ? 'unparseable' : 'missing',
-        rawText: processed.matchDateText,
-        format: fmt,
-      })
+      // logDateOcrFailure removed with beta confirmation (v1.0.2): the issue
+      // log now records hero identification only.
     }
     const playedAtISO = playedAtDate.toISOString()
 
@@ -972,23 +898,6 @@ export default function ProcessPage() {
     const analysis = sb?.ocrAnalysis
     const positionInQueue = `Match ${reviewIndex + 1} of ${reviewItems.length}`
 
-    // inject the freshly-signed image URLs into the questions for THIS match so
-    // the confirmation cards never reference an expired link.
-    const liveQuestions: ConfirmationCandidate[] = item.questions.map(q => {
-      if (!q.region) return q
-      // pick the right re-signed URL by field type
-      let url = q.region.imageUrl
-      if (q.field === 'summary' || q.field === 'map') url = liveImages.summary ?? url
-      else if (q.field === 'breakdown_stat' || q.field === 'hero_id') {
-        // breakdown questions name the hero in fieldDetail; fall back to summary
-        const heroHit = Object.keys(liveImages.byHero).find(h => q.fieldDetail.includes(h))
-        url = (heroHit && liveImages.byHero[heroHit]) ?? liveImages.scoreboard ?? url
-      } else {
-        url = liveImages.scoreboard ?? url
-      }
-      return { ...q, region: { ...q.region, imageUrl: url } }
-    })
-
     return (
       <div className="max-w-2xl mx-auto space-y-6">
         <div className="flex items-start justify-between gap-4">
@@ -1105,19 +1014,38 @@ export default function ProcessPage() {
           </div>
         )}
 
-        {/* sub-step: 6f beta quick check */}
+        {/* sub-step: hero audit (replaces 6f beta quick check) */}
         {reviewStep === 'beta' && (
           <div className="space-y-4">
             <div>
-              <h2 className="font-display text-xl text-ow-orange tracking-wider">Quick check</h2>
-              <p className="text-sm text-ow-muted mt-1">Confirm what was read before saving this match.</p>
+              <h2 className="font-display text-xl text-ow-orange tracking-wider">Check the heroes</h2>
+              <p className="text-sm text-ow-muted mt-1">
+                Confirm every row against the scoreboard before saving.
+              </p>
             </div>
-            <ConfirmationPanel candidates={liveQuestions} onComplete={onBetaComplete} sideNeededFor={needsStartingSide} />
-            {liveQuestions.length === 0 && (
-              <button onClick={() => onBetaComplete([])}
-                className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold py-3 rounded-lg tracking-wider transition-colors text-sm">
-                SAVE MATCH
-              </button>
+            {sb ? (
+              <HeroAuditPanel
+                heroes={sb.heroes}
+                stats={sb.stats}
+                heroesPlayed={item.result.heroes.map(h => h.name)}
+                knownHeroes={HEROES.map(h => ({ name: h.name, role: h.role }))}
+                scoreboardImageUrl={liveImages.scoreboard}
+                onComplete={onAuditComplete}
+              />
+            ) : (
+              // Leaver games legitimately have no scoreboard, so there is
+              // nothing to audit — save straight through.
+              <>
+                <div className="bg-ow-panel border border-ow-line rounded-lg p-4 text-sm text-ow-muted">
+                  No scoreboard for this match (leaver game) — nothing to check.
+                </div>
+                <button
+                  onClick={() => onAuditComplete({ rows: [], correctedSlots: [], bulkConfirmedSlots: [], reviewSeconds: 0 })}
+                  className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
+                             py-3 rounded-lg tracking-wider transition-colors text-sm">
+                  SAVE MATCH
+                </button>
+              </>
             )}
           </div>
         )}

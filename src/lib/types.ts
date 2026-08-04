@@ -233,6 +233,25 @@ export interface ScoreboardHeroIdentification {
   heroName: string | null
   confidence: number
   portraitDataUrl: string | null // cropped portrait thumbnail
+  // ── Match diagnostics (v1.0.2) ──
+  // The matcher computes all of these and, until now, printed them to the
+  // console and discarded them — the /testing report could only recover them
+  // by regexing its own log output. They are carried here so the per-slot
+  // hero audit can store them alongside the user's verdict, turning a season
+  // of logged matches into a labelled dataset.
+  /** best-vs-runner-up score gap. The only confidence measure that survives
+   *  the two scoring scales (Pass 1 no-ORB vs Pass 2 with-ORB). */
+  margin?: number
+  /** second-placed hero, i.e. what it would have said instead. */
+  runnerUp?: string | null
+  /** true when Pass 2 (ORB) produced this result — also marks which scale
+   *  `confidence` is on, since the two are not comparable. */
+  orbApplied?: boolean
+  /** 1-based crop variant that won, of the multi-crop net. */
+  cropIndex?: number
+  /** Phase-1 cleanest-crop pick and its score, for the crop-selection check. */
+  phase1Hero?: string | null
+  phase1Score?: number
 }
 
 /** Step 3 — Which player is the user? */
