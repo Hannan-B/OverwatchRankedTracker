@@ -26,6 +26,21 @@ interface HeroBankEntry {
 const heroBank = new Map<string, HeroBankEntry>()
 let bankLoaded = false
 
+// ── ORB failure accounting ──────────────────────────────────
+// A degraded run must be visible. combinedScore() falls back to
+// structural+colour when ORB throws; this counts how often that
+// happened so the caller can refuse to report the run as an ORB run.
+let orbFailuresThisRun = 0
+const ORB_FAILURE_LOG_LIMIT = 10
+
+export function resetOrbFailureCount(): void {
+  orbFailuresThisRun = 0
+}
+
+export function getOrbFailureCount(): number {
+  return orbFailuresThisRun
+}
+
 // Map display names to safe filenames
 const HERO_FILENAME_MAP: Record<string, string> = {
   'Soldier: 76': 'Soldier_76',
@@ -36,6 +51,57 @@ const HERO_FILENAME_MAP: Record<string, string> = {
 function heroFilename(name: string): string {
   return HERO_FILENAME_MAP[name] || name
 }
+
+// ------------------------------------------------------------
+// AUTO-CORRECT LEAD THRESHOLD (v1.0.2)
+// ------------------------------------------------------------
+// How much better an OUT-OF-ROLE hero must score before it is allowed to
+// override the role-filtered match.
+//
+// Why this exists: matchAgainstCandidates() over allEntries searches a
+// SUPERSET of the role-filtered candidates, so fullResult.score is always
+// >= filteredResult.score by construction. The old code overrode on any
+// disagreement at all, which meant a ~15-candidate role-filtered match
+// (the most reliable comparison in the pipeline) could be discarded because
+// a 52-candidate search scored a hair higher. Measured against the 29-match
+// ground truth: 18 of 27 scoreboard errors came through that override, and
+// in ALL 18 the override landed on the wrong role — i.e. the role filter had
+// been right every time.
+//
+// Set deliberately low for the first measured run. Both scores are logged
+// below so the true separation can be calibrated from real data rather than
+// guessed at; tune this after reviewing an AUTO-CORRECT DECISION log.
+//
+// ── CALIBRATED 3 Aug 2026 (run 5): 0.05 -> 0.10 ──────────────
+// 87 AUTO-CORRECT DECISIONs across the 27-match ground-truth set (55 OVERRIDE,
+// 32 KEEP FILTERED). Restricting to the only slots the override actually
+// decides — Pass-1-final slots, i.e. those Pass 2 does not overwrite:
+//
+//   correct overrides (6):  lead 0.2534 – 0.3570
+//   WRONG   overrides (2):  lead 0.0760, 0.0771   <- both remaining errors
+//
+// An empty gap of 0.18 separates them, so any threshold in 0.08–0.20 changes
+// exactly the same two slots. 0.10 sits in the middle of the measured gap.
+//
+// The other 11 low-lead overrides sit on slots that go to Pass 2, and Pass 2
+// overwrites Pass 1's hero unconditionally, so blocking them changes nothing.
+// Nor can it change WHETHER they reach Pass 2: an override only fires when
+// fullResult.score > filteredResult.score, so reverting always LOWERS the
+// score, and all 11 are already below ORB_THRESHOLD. None of the 26
+// Pass-2-internal overrides fall in the affected band.
+//
+// Net effect on the ground-truth set: 2 slots can change, and both are
+// currently wrong. Both revert to ~0.286, dropping below ORB_THRESHOLD and
+// entering Pass 2, where ORB decides — T5 slot 10 reverts to the correct hero
+// (Pass 2 need only not break it), T4 slot 9 reverts to Echo and needs an
+// active ORB rescue. Outcome for those two is not guaranteed; there is no
+// prior data, as neither slot has ever entered Pass 2 in any run.
+//
+// NOTE: do NOT raise ORB_THRESHOLD to catch these instead. Both errors sit at
+// score 0.363, but a 0.35 -> 0.40 change pulls 56 slots into Pass 2 of which
+// 54 are currently correct. Risking 54 to fix 2 is the shape of mistake that
+// produced runs 2 and 4.
+const AUTO_CORRECT_MIN_LEAD = 0.10
 
 // Build a quick lookup: hero name -> role
 const HERO_ROLE_MAP = new Map<string, RoleType>()
@@ -216,7 +282,20 @@ async function combinedScore(
     try {
       orb = await orbMatchScore(portraitData, bankEntry.pixelData)
     } catch (e) {
-      console.warn('ORB match failed, using structural+color only')
+      // Do NOT discard `e`. The previous version logged a bare message with no
+      // detail, which hid a worker heap exhaustion for four full test runs:
+      // ~40% of a run scored on structural+colour while reporting the ORB scale.
+      // Failures are rate-limited because a sick worker produces thousands.
+      orbFailuresThisRun++
+      if (orbFailuresThisRun <= ORB_FAILURE_LOG_LIMIT) {
+        console.error(
+          `[ORB] match failed (${orbFailuresThisRun}) — falling back to structural+colour. ` +
+          `Cause: ${e instanceof Error ? e.message : String(e)}`
+        )
+        if (orbFailuresThisRun === ORB_FAILURE_LOG_LIMIT) {
+          console.error('[ORB] further failures suppressed — see the run summary for the total')
+        }
+      }
     }
   }
 
@@ -357,7 +436,27 @@ export async function matchHero(
     return filteredResult
   }
 
-  // Full match confirms wrong role — auto-correct
+  // Step 5 (v1.0.2): the full match names an out-of-role hero — but that alone is
+  // NOT evidence. allEntries is a superset of filteredEntries, so fullResult.score
+  // is always >= filteredResult.score; "it scored higher" is guaranteed, not
+  // informative. Only override when it scores MEANINGFULLY higher.
+  const lead = fullResult.score - filteredResult.score
+
+  console.log(
+    `AUTO-CORRECT DECISION: filtered="${filteredResult.heroName}" (${roleFilter}) ` +
+    `score=${filteredResult.score.toFixed(4)} vs full="${fullResult.heroName}" (${fullRole}) ` +
+    `score=${fullResult.score.toFixed(4)} | lead=${lead.toFixed(4)} ` +
+    `threshold=${AUTO_CORRECT_MIN_LEAD} -> ${lead >= AUTO_CORRECT_MIN_LEAD ? 'OVERRIDE' : 'KEEP FILTERED'}`
+  )
+
+  if (lead < AUTO_CORRECT_MIN_LEAD) {
+    // Not enough separation to justify discarding the role-filtered match.
+    // Keep the more constrained (and empirically more reliable) result.
+    console.log(`Lead below threshold — keeping role-filtered result "${filteredResult.heroName}"`)
+    return filteredResult
+  }
+
+  // Full match confirms wrong role by a clear margin — auto-correct
   console.log(`AUTO-CORRECT: Selected role was "${roleFilter}" but matched hero "${fullResult.heroName}" is "${fullRole}"`)
   return {
     ...fullResult,

@@ -798,6 +798,26 @@ export async function identifyHeroes(
   // This replaces the previous "full matchHero × every crop" approach
   // (4 full pipelines per slot → 1 full pipeline + 4 cheap scores per slot).
 
+  // ORB_THRESHOLD — Pass 1 score below which a slot is sent to the Pass 2 ORB net.
+  //
+  // v1.0.2 EXPERIMENT (reverted): lowered to 0.20, measured against the 29-match
+  // ground truth, and REVERTED. Keep at 0.35.
+  //
+  // The hypothesis was that Pass 2 was harmful, because Pass 2 slots were wrong
+  // 12.1% of the time against 3.0% for Pass 1-only slots. That comparison was
+  // invalid: Pass 2 only ever receives the slots Pass 1 was least sure about, so
+  // its higher error rate is a selection effect, not a defect.
+  //
+  // Measured directly: dropping the gate to 0.20 pulled 155 slots out of Pass 2.
+  // On those slots Pass 2 had been RESCUING 23 and HARMING 4 — net -19 correct
+  // heroes, taking the set from 27 errors to 37. Run time fell 5886s -> 2046s,
+  // which is not worth 19 wrong heroes.
+  //
+  // Direction for later: Pass 2 EARNS its cost on hard slots, so if anything the
+  // gate should rise, not fall. Do not re-tune it until the two scoring scales
+  // are unified — Pass 1 scores on 0.6*structural + 0.4*colour while Pass 2
+  // returns 0.5*orb + 0.3*structural + 0.2*colour, so this threshold currently
+  // compares a value against a scale its replacement does not share.
   const ORB_THRESHOLD = 0.35
   const results: ScoreboardHeroIdentification[] = []
   const lowConfidenceIndices: number[] = []
@@ -831,6 +851,15 @@ export async function identifyHeroes(
         heroName: match.heroName,
         confidence: match.score,
         portraitDataUrl: p.portraitDataUrl,
+        // Diagnostics carried rather than only logged — the hero audit stores
+        // these next to the user's verdict so accuracy can be analysed by
+        // margin / scale / crop after a season instead of by reading logs.
+        margin: match.margin,
+        runnerUp: match.runnerUp,
+        orbApplied: false,          // Pass 2 overwrites this below when it runs
+        cropIndex: sel.bestVariant + 1,
+        phase1Hero: sel.phase1Hero,
+        phase1Score: sel.phase1Score,
       })
 
       // Low-confidence gate uses the role-filtered matchHero score — the
@@ -880,8 +909,28 @@ export async function identifyHeroes(
             `${orbMatch.correctedRole ? `, ROLE CORRECTED → ${orbMatch.correctedRole}` : ''})`
           )
 
+          // NOTE (v1.0.2): a "same-scale guard" was tried here and REVERTED.
+          // It re-scored Pass 1's hero and Pass 2's hero on the no-ORB basis
+          // (0.6*structural + 0.4*colour) and kept Pass 1 unless ORB won.
+          // Measured against the 29-match ground truth: it fired 33 times and
+          // was WRONG all 33 — every slot it "corrected" had been right, taking
+          // the set from 16 errors to 49.
+          //
+          // The lesson is the opposite of the intuition: on the slots Pass 2
+          // exists to handle, the no-ORB score is a POOR predictor of
+          // correctness. Pass 1's hero often scores higher on that basis and is
+          // still wrong. ORB earns its override. Do not gate it on structural
+          // or colour agreement.
           results[i].heroName = orbMatch.heroName
           results[i].confidence = orbMatch.score
+          // Pass 2 scores on a DIFFERENT scale from Pass 1 (0.5*orb +
+          // 0.3*structural + 0.2*colour vs 0.6*structural + 0.4*colour), so
+          // orbApplied is not a curiosity — it says which scale `confidence`
+          // and `margin` are on, and the two must never be pooled.
+          results[i].margin = orbMatch.margin
+          results[i].runnerUp = orbMatch.runnerUp
+          results[i].orbApplied = true
+          results[i].cropIndex = orbMatch.bestVariant + 1
         } catch (err) {
           console.warn(`  [P2] ORB failed for slot ${p.slot}, keeping Pass 1 result:`, err)
         }
