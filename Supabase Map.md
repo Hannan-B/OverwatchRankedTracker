@@ -68,7 +68,15 @@ There are **12 tables**. All have Row-Level Security **ON** with a permissive
 saved charts aren't sensitive). Below, ⚙️ marks columns written by the processing
 pipeline.
 
-### `matches` — one row per game *(the spine of everything)*
+### `matches`
+> **(v1.0.2) REPAIRED 3 Aug 2026.** `role_played` was stuck on `'dps'`, firing
+> `role_mismatch` on 25 of 29 6v6 matches and making every role-split analytic read a
+> constant; it was repopulated from `roles_played` for single-role matches.
+> ⚠️ `role_played` is an ENUM (`role_type`) while `scoreboard_players.role` is `text` —
+> comparing them directly raises `operator does not exist: role_type = text`. Cast BOTH
+> sides to `::text`. Introspect types before writing DDL; this document is for
+> orientation, not schema truth.
+ — one row per game *(the spine of everything)*
 The central record of each match. Key columns (live-verified):
 - **Identity/result:** `id`, `played_at` (the OCR'd match timestamp — drives seasons,
   sessions, streaks), `season_id` → `seasons.id`, `map`, `game_mode`, `result`
@@ -100,7 +108,18 @@ One row per stat tile on a hero's breakdown screen. `id`,
 per-10 — not trusted). The raw `stat_name` here is what `hero_stats_normalised`
 folds to canonical form.
 
-### `scoreboard_players` — the 10/12-player scoreboard
+### `scoreboard_players`
+> **(v1.0.2) REPAIRED 3 Aug 2026.** `hero_name` and `role` were corrected from ground
+> truth on all 324 slots across the 27 6v6 beta matches with a scoreboard (71 were wrong
+> — 21.9%). Numeric stat columns were NOT touched: all 1,944 cells were verified correct.
+> Everything downstream (`matchup_pairs`, `matchup_single_agg`, `matchup_team_sets`,
+> `match_team_damage`, `user_scoreboard_row`) is a VIEW, so the fix propagated
+> automatically. `matches` was NOT re-processed — feel and star ratings are subjective
+> and unrecoverable.
+> Mapping used: `match_id = 263 + test_number`, valid ONLY with `not m.is_alpha` — the
+> table holds 38 6v6 matches, 9 of them alpha (19 May – 1 Jun), which sort first and
+> shift every index by nine.
+ — the 10/12-player scoreboard
 One row per player slot in a match (NOT for leaver games — those write zero rows).
 `id`, `match_id`, `slot` (1–12, CHECK), `team` (ally/enemy, CHECK), `hero_name`,
 `role` (tank/dps/support or null, CHECK), `is_user`, `user_match_method`
@@ -125,7 +144,8 @@ retention is a future design decision, not built. Leave alone.
 ### `beta_issue_log` — append-only diagnostics (6f)
 `id`, `created_at`, `match_id`, `event`, `field`, `field_detail`, `signal`,
 `read_value`, `corrected_value`, `confidence`, `format`, `questions_asked`,
-`auto_pass_fields`. The `event` column has a CHECK allowing
+`auto_pass_fields`, **`slot`, `margin`, `runner_up`, `orb_applied` (v1.0.2)**.
+The `event` column has a CHECK allowing
 `confirmed_correct`/`corrected`/`region_mismatch`/`unrecognized`/`match_summary`/`processing_error`.
 > ✅ **Resolves the handover's "#10 CHECK-constraint caveat":** `field` and `signal`
 > are plain unconstrained `text` — there is **no** CHECK on them, so logging
@@ -137,6 +157,31 @@ retention is a future design decision, not built. Leave alone.
 > unconstrained text. It reuses an existing `event` value (`corrected` when the result
 > changed, else `confirmed_correct`), since `event` *is* CHECK-constrained to the 6 types
 > above — so no new event type was introduced.
+>
+> **(v1.0.2) Hero audit — four new nullable columns.** Beta confirmation is sunset and
+> replaced by a per-slot hero audit, which writes **one row per scoreboard slot** rather
+> than one per question. That is a different GRAIN, and the existing columns had nowhere
+> to put it, so `slot int`, `margin numeric`, `runner_up text` and `orb_applied boolean`
+> were added — all nullable, so every existing row and writer is unaffected. `event` is
+> NOT changed: the audit reuses `confirmed_correct` / `corrected`.
+>
+> `orb_applied` is the one that matters. The matcher scores on TWO different formulas —
+> Pass 1 is `0.6*structural + 0.4*colour`, Pass 2 is `0.5*orb + 0.3*structural +
+> 0.2*colour` — so a `confidence` of 0.36 means different things depending on which ran.
+> Without the flag a season of scores is an unpoolable mixture, and that is precisely
+> what made an OpenCV worker heap leak invisible for four full test runs. Never pool
+> `confidence` or `margin` across the two scales.
+>
+> ⚠️ `corrected_value` is now written on EVERY audit row, not just corrections — a
+> confirmed row's value is the TRUTH LABEL. Omitting it would discard the negative
+> examples that make an error rate computable. At ~400 matches a season this yields
+> ~4,800 labelled slots (the manual ground-truth exercise produced 324).
+>
+> ⚠️ `signal` for audit rows is `hero_audit`; `field` is `hero_id`. Retired signals
+> (`avg_crosscheck_fail`, `map_detect_fail`, `result_conflict`, `date_ocr_fail`,
+> `vote_split`, `low_hero_conf`, `phase_disagreement`, `low_user_margin`,
+> `sampled_summary`, `unrecognized`) are still present in HISTORICAL rows and should be
+> excluded when analysing current accuracy.
 
 ### `builder_saved_charts` / `builder_chart_views` / `builder2_saved_charts` / `builder2_chart_views`
 Saved-chart persistence for the two builders (the generic builder and the dual-axis
