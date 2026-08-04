@@ -19,7 +19,30 @@
 // ============================================================
 
 import { supabase } from './supabase'
-import type { SignalKind, FieldKind } from './beta-confirmation'
+// Types are declared LOCALLY rather than imported from beta-confirmation.
+// That module is sunset (v1.0.2) — the confidence-gated question flow was
+// replaced by the per-slot hero audit — so the issue log must not depend on
+// it. Both columns are unconstrained `text` in Postgres, so widening this
+// union never needs a migration.
+export type SignalKind =
+  | 'hero_audit'          // per-slot verdict from the hero audit (the live signal)
+  | 'duplicate_hero'      // coherence: same hero twice on ONE team
+  | 'user_hero_absent'    // coherence: user's row hero not among heroes played
+  // ── Retired with beta confirmation. Kept so historical rows still type. ──
+  | 'unrecognized' | 'date_ocr_fail' | 'map_detect_fail' | 'result_conflict'
+  | 'vote_split' | 'avg_crosscheck_fail' | 'low_hero_conf' | 'phase_disagreement'
+  | 'low_user_margin' | 'sampled_summary'
+
+export type FieldKind =
+  | 'hero_id'
+  // ── Retired with beta confirmation. Kept for historical rows. ──
+  | 'scoreboard' | 'breakdown_stat' | 'summary' | 'username'
+  | 'date' | 'map' | 'result' | 'side'
+
+/** Signals still written by the live pipeline. Everything else is history. */
+export const LIVE_SIGNALS: ReadonlySet<string> = new Set<SignalKind>([
+  'hero_audit', 'duplicate_hero', 'user_hero_absent',
+])
 
 export type IssueEvent =
   | 'confirmed_correct'
@@ -46,6 +69,13 @@ export interface IssueLogRow {
   // Present for match_summary:
   questions_asked?: number | null
   auto_pass_fields?: number | null
+  // Present for hero-audit rows (one per scoreboard slot):
+  slot?: number | null
+  margin?: number | null
+  runner_up?: string | null
+  /** Which scoring scale `confidence` and `margin` are on. Pass 1 and Pass 2
+   *  use different formulas, so pooling them is a category error. */
+  orb_applied?: boolean | null
 }
 
 // ── Writers ──────────────────────────────────────────────────
@@ -89,6 +119,71 @@ export async function logConfirmationOutcome(args: {
     confidence: args.confidence ?? null,
     format: args.format,
   })
+}
+
+/** Log a full hero audit — ONE ROW PER SCOREBOARD SLOT.
+ *  ------------------------------------------------------------
+ *  This is the point of the v1.0.2 rework. The old flow logged only the slots
+ *  a confidence gate chose to ask about, which could measure how often a flag
+ *  was right but never how many errors went unflagged. Of the 71 wrong heroes
+ *  in the beta database, 60 were never questioned at all.
+ *
+ *  Every slot now carries a human verdict, so `confirmed_hero` is a TRUTH
+ *  LABEL and score / margin / orb_applied are features measurable against it.
+ *  At ~400 matches a season that is ~4,800 labelled slots, against the 324 the
+ *  manual ground-truth exercise produced.
+ *
+ *  Rows are inserted in one batch: 12 sequential inserts per match would be
+ *  12 round-trips, and a partial failure would leave a half-audited match that
+ *  looks complete. */
+export async function logHeroAudit(args: {
+  matchId: string
+  format: '5v5' | '6v6'
+  rows: Array<{
+    slot: number
+    team: 'ally' | 'enemy'
+    role: string | null
+    isUser: boolean
+    readHero: string | null
+    confirmedHero: string | null
+    corrected: boolean
+    /** Accepted via the bulk button rather than individually — recorded so
+     *  bulk labels can be weighted down later if they prove unreliable. */
+    bulk: boolean
+    score: number
+    margin: number | null
+    runnerUp: string | null
+    orbApplied: boolean
+  }>
+  reviewSeconds: number
+}): Promise<{ error: unknown }> {
+  const payload: IssueLogRow[] = args.rows.map(r => ({
+    match_id: args.matchId,
+    event: r.corrected ? 'corrected' : 'confirmed_correct',
+    field: 'hero_id',
+    // field_detail carries the position and how the verdict was given, so a
+    // row is interpretable without joining anything.
+    field_detail:
+      `slot ${r.slot} · ${r.team} ${r.role ?? '?'}` +
+      `${r.isUser ? ' · user' : ''}${r.bulk ? ' · bulk' : ''}` +
+      ` · ${args.reviewSeconds}s review`,
+    signal: 'hero_audit',
+    read_value: r.readHero,
+    // Written on EVERY row, not just corrections. A confirmed row's value is
+    // the truth label — omitting it would discard the negative examples, which
+    // are what make an error rate computable.
+    corrected_value: r.confirmedHero,
+    confidence: r.score,
+    format: args.format,
+    slot: r.slot,
+    margin: r.margin,
+    runner_up: r.runnerUp,
+    orb_applied: r.orbApplied,
+  }))
+
+  const { error } = await supabase.from('beta_issue_log').insert(payload)
+  if (error) console.warn('[beta-log] hero audit insert failed', error)
+  return { error }
 }
 
 /** Log a per-match rollup (always one per processed match). */

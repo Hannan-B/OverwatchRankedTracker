@@ -1,11 +1,30 @@
 'use client'
 
 // ============================================================
-// Step 6f — Issue Log page (menu tab)
+// Issue Log page (menu tab)
+// ------------------------------------------------------------
 // Reads beta_issue_log, shows season confidence metrics, lists corrections,
 // the new-content ledger, and processing failures (v16). Downloads the .md
 // report. Bottom "danger zone": Start New Season — archives (report + raw rows)
 // then clears the log rows only (never match data), two-step confirmed.
+//
+// (v1.0.2) REWORKED FOR THE HERO AUDIT.
+// Beta confirmation is sunset. The log now records ONE ROW PER SCOREBOARD SLOT
+// (signal 'hero_audit'), confirmed and corrected alike, rather than one row per
+// question a confidence gate chose to ask. That changes what the numbers mean:
+//
+//   · "Confirmed correct" is now ~10-12 per match, not per question. It is the
+//     denominator, and it is the reason a real error RATE is computable at all.
+//   · Signal precision is near-meaningless now — there is effectively one live
+//     signal. It is kept for HISTORICAL rows and labelled as such.
+//   · The useful cuts are the new ones below: error rate by scoring scale, by
+//     margin band, and the confusion pairs.
+//
+// ⚠️ Pass 1 and Pass 2 score on DIFFERENT formulas (0.6*structural+0.4*colour
+// vs 0.5*orb+0.3*structural+0.2*colour), so `confidence` and `margin` are NOT
+// comparable across them. Every cut below that touches those columns splits by
+// orb_applied. Pooling them is what made an OpenCV heap leak invisible for four
+// full test runs.
 // ============================================================
 
 import { useEffect, useState } from 'react'
@@ -130,6 +149,57 @@ export default function IssueLogPage() {
   const overallErrorRate = fieldsProcessed > 0 ? s.totalCorrected / fieldsProcessed : 0
   const corrections = rows.filter(r => r.event === 'corrected')
 
+  // ── Hero-audit cuts (v1.0.2) ───────────────────────────────
+  // Computed here rather than in aggregate() because they are specific to the
+  // per-slot grain and would be meaningless against historical rows.
+  const auditRows = rows.filter(r => r.signal === 'hero_audit')
+  const auditErrors = auditRows.filter(r => r.event === 'corrected')
+  const auditErrorRate = auditRows.length > 0 ? auditErrors.length / auditRows.length : 0
+
+  // Split by scoring scale — never pooled.
+  const byScale = (['pass2', 'pass1'] as const).map(kind => {
+    const want = kind === 'pass2'
+    const set = auditRows.filter(r => !!r.orb_applied === want)
+    const err = set.filter(r => r.event === 'corrected').length
+    return {
+      kind,
+      label: want ? 'Pass 2 (with ORB)' : 'Pass 1 (no ORB)',
+      total: set.length,
+      errors: err,
+      rate: set.length > 0 ? err / set.length : 0,
+    }
+  })
+
+  // Error rate by margin band, split by scale. This is the cut that would let a
+  // future confidence gate be calibrated from data instead of guessed at.
+  const BANDS: Array<[string, number, number]> = [
+    ['< 0.03', 0, 0.03], ['0.03 – 0.06', 0.03, 0.06],
+    ['0.06 – 0.10', 0.06, 0.10], ['0.10 – 0.20', 0.10, 0.20], ['≥ 0.20', 0.20, Infinity],
+  ]
+  const marginBands = BANDS.map(([label, lo, hi]) => {
+    const set = auditRows.filter(r => typeof r.margin === 'number' && r.margin! >= lo && r.margin! < hi)
+    const err = set.filter(r => r.event === 'corrected').length
+    return { label, total: set.length, errors: err, rate: set.length > 0 ? err / set.length : 0 }
+  }).filter(b => b.total > 0)
+
+  // What gets mistaken for what. The beta's worst offenders were Anran (78%)
+  // and Emre (75%); this is how that gets spotted without ground truth.
+  const confusionMap = new Map<string, number>()
+  for (const r of auditErrors) {
+    if (!r.read_value || !r.corrected_value) continue
+    const key = `${r.corrected_value} → ${r.read_value}`
+    confusionMap.set(key, (confusionMap.get(key) ?? 0) + 1)
+  }
+  const confusions = [...confusionMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)
+
+  // Bulk-confirmed rows are labels given without looking at that row
+  // individually. If their error rate is materially LOWER than individually
+  // confirmed rows, they are being rubber-stamped and should be discounted.
+  const bulkRows = auditRows.filter(r => (r.field_detail ?? '').includes('· bulk'))
+  const bulkShare = auditRows.length > 0 ? bulkRows.length / auditRows.length : 0
+
+  const historicalSignals = Object.entries(s.precisionBySignal).filter(([sig]) => sig !== 'hero_audit')
+
   return (
     <div className="max-w-2xl mx-auto space-y-6">
       <div className="flex items-start justify-between gap-4">
@@ -156,31 +226,120 @@ export default function IssueLogPage() {
 
       <div className="grid grid-cols-2 gap-3">
         <StatTile label="Matches" value={String(s.matchesProcessed)}
-          hint={s.matchesProcessed > 0 ? `${(s.totalQuestionsAsked / s.matchesProcessed).toFixed(2)} questions/match` : undefined} />
-        <StatTile label="Overall error rate" value={pct(overallErrorRate)}
-          hint={`${s.totalCorrected} corrected / ${fieldsProcessed} fields`} />
-        <StatTile label="Confirmed correct" value={String(s.totalConfirmedCorrect)} hint="true negatives (the denominator)" />
-        <StatTile label="Corrected" value={String(s.totalCorrected)} hint="real errors caught" />
+          hint={s.matchesProcessed > 0 ? `${(s.totalQuestionsAsked / s.matchesProcessed).toFixed(1)} slots audited/match` : undefined} />
+        <StatTile label="Hero error rate" value={pct(auditErrorRate)}
+          hint={`${auditErrors.length} wrong / ${auditRows.length} slots audited`} />
+        <StatTile label="Slots confirmed" value={String(auditRows.length - auditErrors.length)}
+          hint="true negatives — the denominator" />
+        <StatTile label="Slots corrected" value={String(auditErrors.length)} hint="real errors caught" />
       </div>
 
-      <section>
-        <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2 uppercase">Signal precision</h2>
-        <p className="text-xs text-ow-faint mb-3">
-          How often each flag was a real error. Low precision → relax that threshold; it&apos;s over-firing.
-        </p>
-        <div className="bg-ow-panel rounded-lg border border-ow-line divide-y divide-ow-line/60">
-          {Object.keys(s.precisionBySignal).length === 0 ? (
-            <p className="p-4 text-sm text-ow-faint">No signals logged yet.</p>
-          ) : Object.entries(s.precisionBySignal).sort().map(([sig, e]) => (
-            <div key={sig} className="flex items-center justify-between p-3">
-              <span className="text-sm text-ow-muted font-mono">{sig}</span>
-              <span className="text-xs text-ow-faint">
-                {e.corrected}/{e.corrected + e.confirmed} → <span className="text-ow-fg font-bold">{pct(e.precision)}</span>
-              </span>
-            </div>
-          ))}
+      {auditRows.length === 0 && (
+        <div className="bg-ow-panel border border-ow-line rounded-lg p-4 text-sm text-ow-muted">
+          No hero-audit rows yet. The cuts below populate once matches are saved through
+          the audit panel; the sections after them cover historical beta-confirmation rows.
         </div>
-      </section>
+      )}
+
+      {auditRows.length > 0 && (
+        <section>
+          <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2 uppercase">Error rate by scoring scale</h2>
+          <p className="text-xs text-ow-faint mb-3">
+            Pass 1 and Pass 2 use different formulas, so their scores are never pooled.
+            A sudden collapse in the Pass 2 share means ORB has stopped running.
+          </p>
+          <div className="bg-ow-panel rounded-lg border border-ow-line divide-y divide-ow-line/60">
+            {byScale.map(b => (
+              <div key={b.kind} className="flex items-center justify-between p-3">
+                <span className="text-sm text-ow-muted">{b.label}</span>
+                <span className="text-xs text-ow-faint">
+                  {b.errors}/{b.total} → <span className="text-ow-fg font-bold">{pct(b.rate)}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {marginBands.length > 0 && (
+        <section>
+          <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2 uppercase">Error rate by margin</h2>
+          <p className="text-xs text-ow-faint mb-3">
+            Best-vs-runner-up gap. The only confidence measure comparable across both
+            scales — and the cut that lets a future gate be calibrated from data rather
+            than guessed at.
+          </p>
+          <div className="bg-ow-panel rounded-lg border border-ow-line divide-y divide-ow-line/60">
+            {marginBands.map(b => (
+              <div key={b.label} className="flex items-center justify-between p-3">
+                <span className="text-sm text-ow-muted font-mono">{b.label}</span>
+                <span className="text-xs text-ow-faint">
+                  {b.errors}/{b.total} → <span className="text-ow-fg font-bold">{pct(b.rate)}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {confusions.length > 0 && (
+        <section>
+          <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2 uppercase">
+            Confusion pairs ({confusions.length})
+          </h2>
+          <p className="text-xs text-ow-faint mb-3">
+            True hero → what the matcher said. A pair that recurs is a portrait problem,
+            not bad luck — the beta&apos;s worst were Anran (78% missed) and Emre (75%).
+          </p>
+          <div className="bg-ow-panel rounded-lg border border-ow-line divide-y divide-ow-line/60">
+            {confusions.map(([pair, n]) => (
+              <div key={pair} className="flex items-center justify-between p-3 gap-3">
+                <span className="text-sm text-ow-muted truncate">{pair}</span>
+                <span className="text-xs text-ow-fg font-bold tabular-nums">{n}</span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {bulkRows.length > 0 && (
+        <section>
+          <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2 uppercase">Bulk-confirmed slots</h2>
+          <div className="bg-ow-panel rounded-lg border border-ow-line p-4">
+            <p className="text-sm text-ow-fg">
+              {bulkRows.length} of {auditRows.length} slots ({pct(bulkShare)}) were accepted via
+              &ldquo;confirm remaining&rdquo; rather than individually.
+            </p>
+            <p className="text-xs text-ow-faint mt-1">
+              A high share is not wrong in itself — most rows are correct. But if these show a
+              much LOWER error rate than individually-confirmed ones, they are being
+              rubber-stamped and should be discounted rather than trusted as labels.
+            </p>
+          </div>
+        </section>
+      )}
+
+      {historicalSignals.length > 0 && (
+        <section>
+          <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2 uppercase">
+            Signal precision (historical)
+          </h2>
+          <p className="text-xs text-ow-faint mb-3">
+            Beta-confirmation rows from before v1.0.2. Retained for reference only — those
+            checks are retired, and the hero audit does not use a confidence gate.
+          </p>
+          <div className="bg-ow-panel rounded-lg border border-ow-line divide-y divide-ow-line/60">
+            {historicalSignals.sort().map(([sig, e]) => (
+              <div key={sig} className="flex items-center justify-between p-3">
+                <span className="text-sm text-ow-muted font-mono">{sig}</span>
+                <span className="text-xs text-ow-faint">
+                  {e.corrected}/{e.corrected + e.confirmed} → <span className="text-ow-fg font-bold">{pct(e.precision)}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       <section>
         <h2 className="text-sm font-display tracking-wider text-ow-muted mb-2 uppercase">
