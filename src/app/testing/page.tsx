@@ -134,10 +134,21 @@ interface BreakdownPortraitConfidence {
   assigned: boolean
 }
 
+/** Per-match ORB worker health, parsed from the Pass-2 summary line. */
+interface OrbHealth {
+  ok: number
+  failed: number
+  fallbacks: number
+  restarts: number
+  disabled: boolean
+}
+
 interface ParsedConfidence {
   scoreboard: ScoreboardPortraitConfidence[]
   summary: SummaryPortraitConfidence[]
   breakdown: BreakdownPortraitConfidence[]
+  /** null when the match produced no Pass-2 block at all. */
+  orbHealth: OrbHealth | null
 }
 
 // --- Scoreboard Pass 1 ---
@@ -151,6 +162,11 @@ const P2_RE =
   /\[P2\]\s+Slot\s+(\d+):\s+.+?\s+\([\d.]+%\)\s*(?:→|->)\s*(.+?)\s+\(([\d.]+)%,\s*margin:\s*([\d.]+),\s*runner-up:\s*(.+?),\s*crop:\s*(\d+\/\d+)/
 
 const ROLE_CORRECTED_RE = /ROLE CORRECTED\s*(?:→|->)\s*(\w+)/
+
+// --- ORB worker health (emitted once per match after Pass 2) ---
+//   Step 2 Pass 2 complete: ORB HEALTH ok=1204 failed=0 fallbacks=0 restarts=0 disabled=false
+const ORB_HEALTH_RE =
+  /ORB HEALTH\s+ok=(\d+)\s+failed=(\d+)\s+fallbacks=(\d+)\s+restarts=(\d+)\s+disabled=(true|false)/
 
 // --- Summary portrait ---
 //   Summary slot 0 @(355,720): Reinhardt (score 0.4821, ring px=1632)
@@ -171,6 +187,7 @@ function parseConfidence(lines: CapturedLine[]): ParsedConfidence {
   const summary: SummaryPortraitConfidence[] = []
   const breakdownBest = new Map<string, BreakdownPortraitConfidence>()
   const assignedHeroes = new Set<string>()
+  let orbHealth: OrbHealth | null = null
 
   for (const { text } of lines) {
     // Scoreboard Pass 1
@@ -220,6 +237,19 @@ function parseConfidence(lines: CapturedLine[]): ParsedConfidence {
         orbApplied: true,
       }
       scoreboard.set(slot, merged)
+      continue
+    }
+
+    // ORB worker health
+    const oh = text.match(ORB_HEALTH_RE)
+    if (oh) {
+      orbHealth = {
+        ok: parseInt(oh[1], 10),
+        failed: parseInt(oh[2], 10),
+        fallbacks: parseInt(oh[3], 10),
+        restarts: parseInt(oh[4], 10),
+        disabled: oh[5] === 'true',
+      }
       continue
     }
 
@@ -280,6 +310,7 @@ function parseConfidence(lines: CapturedLine[]): ParsedConfidence {
     breakdown: Array.from(breakdownBest.values()).sort(
       (a, b) => b.score - a.score,
     ),
+    orbHealth,
   }
 }
 
@@ -568,6 +599,42 @@ function generateReport(
   md += `| Scoreboard portraits | ${allSb.length} |\n`
   md += `| — fragile (low score/margin) | ${fragileSb} |\n`
   md += `| — Phase-1 ≠ Pass-1 crop pick | ${disagreeSb} |\n\n`
+
+  // ---- ORB health roll-up ----
+  // A run where ORB died partway through is two different algorithms reported
+  // as one. That must be the first thing visible in the report, not something
+  // reconstructed from the raw console log weeks later.
+  const healths = results
+    .map((r) => r.confidence.orbHealth)
+    .filter((h): h is OrbHealth => h != null)
+  // ok / failed / restarts are SESSION-CUMULATIVE counters from opencv-loader:
+  // each match reports the running total, so summing them across matches
+  // multiplies the figure. Take the last match's value instead.
+  // fallbacks IS per-match (reset by resetOrbFailureCount) and must be summed.
+  const orbFallbacks = healths.reduce((s, h) => s + h.fallbacks, 0)
+  const last = healths.length > 0 ? healths[healths.length - 1] : null
+  const orbRestarts = last?.restarts ?? 0
+  const orbFailedCalls = last?.failed ?? 0
+  const orbOkCalls = last?.ok ?? 0
+  const orbDisabled = healths.some((h) => h.disabled)
+  const degradedMatches = results.filter(
+    (r) => (r.confidence.orbHealth?.fallbacks ?? 0) > 0 || r.confidence.orbHealth?.disabled === true,
+  ).length
+  md += `| ORB calls (ok / failed) | ${orbOkCalls} / ${orbFailedCalls} |\n`
+  md += `| ORB fallbacks (structural+colour only) | ${orbFallbacks} |\n`
+  md += `| ORB worker restarts | ${orbRestarts} |\n`
+  md += `| Matches with degraded ORB | ${degradedMatches}/${results.length} |\n\n`
+
+  if (orbFallbacks > 0 || orbDisabled || orbRestarts > 0) {
+    md += `> 🛑 **THIS RUN IS NOT A SINGLE CONFIGURATION.** ${orbFallbacks} portrait\n`
+    md += `> comparison(s) across ${degradedMatches} match(es) fell back to structural+colour\n`
+    md += `> because ORB was unavailable, while the Score column still reports the ORB scale.\n`
+    md += `> Degraded scores are roughly HALF the healthy ones and are not comparable.\n`
+    md += `> Fix the worker and re-run before drawing any conclusion from this report.\n\n`
+  } else if (healths.length > 0) {
+    md += `> ✅ ORB healthy across all matches (${orbOkCalls} successful calls, 0 fallbacks).\n\n`
+  }
+
   md += `> ⚠️ 6b watch-item: any "Phase-1 ≠ Pass-1" row is a slot where the cleanest-crop\n`
   md += `> pick disagreed with the final identification — review before trusting the swap.\n\n`
   md += `---\n\n`
