@@ -43,3 +43,9 @@ New Season Runbook.md
 # Local-only personal docs — never committed (even though the repo is private).
 FILE-MAP.md
 New Season Runbook.md
+
+# Internal investigation docs — local only, uploaded per session like FILE-MAP.md
+KNOWN-FAILURE-MODES.md
+MAP-RESULT-DETECTION.md
+docs/KNOWN-FAILURE-MODES.md
+docs/MAP-RESULT-DETECTION.md
