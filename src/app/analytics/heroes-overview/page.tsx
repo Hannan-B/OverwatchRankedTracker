@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import AnalyticsFilters, {
   DEFAULT_FILTERS,
+  heroOptionsForQueue,
   type AnalyticsFilterState,
   type SeasonOption,
 } from '@/components/AnalyticsFilters'
@@ -10,7 +11,7 @@ import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 import { supabase } from '@/lib/supabase'
 import Select from '@/components/Select'
 import { matchQuery } from '@/lib/alpha'
-import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
+import { loadExclusionPrefs, isExcludedGame, EXCLUSION_COLS, type ExcludableRow } from '@/lib/leaver'
 import { defaultSeasonSelection } from '@/lib/season-util'
 import {
   buildLineups, soloBaselines, aggregateCombos, liftFromBase, pairingMatrix,
@@ -54,7 +55,9 @@ interface RawHeroRow {
   starting_side: 'attack' | 'defense' | null
   result: 'victory' | 'defeat' | 'draw'
 }
-interface RawMatchRow { id: number; team_leaver?: boolean | null; enemy_leaver?: boolean | null; season_id?: number | null }
+// ExcludableRow supplies the six columns the excluded-games policy reads; the
+// leaver booleans alone can't tell a permanent leaver from a returned one.
+interface RawMatchRow extends ExcludableRow { id: number; season_id?: number | null }
 
 const selectCls =
   'bg-ow-dark border border-ow-line rounded-xl px-3 py-2 text-sm text-ow-fg ' +
@@ -109,18 +112,22 @@ export default function AnalyticsHeroesOverviewPage() {
     let cancelled = false
     setLoading(true)
     Promise.all([
-      matchQuery('id, team_leaver, enemy_leaver, season_id').order('played_at', { ascending: false }),
+      matchQuery('id, season_id, ' + EXCLUSION_COLS).order('played_at', { ascending: false }),
       supabase.from('hero_match_facts').select(HERO_COLS),
       supabase.from('seasons').select('id, name, start_date, end_date').order('start_date', { ascending: false }),
     ]).then(async ([mRes, hRes, sRes]) => {
       if (cancelled) return
       const m = (((mRes as unknown) as { data: RawMatchRow[] | null }).data) || []
       const h = (((hRes as unknown) as { data: RawHeroRow[] | null }).data) || []
-      await loadLeaverPref()
+      // Awaited BEFORE isExcludedGame: the predicate reads a synchronous cache
+      // that starts fully hidden, so calling it first would drop every flagged
+      // game regardless of the switches.
+      await loadExclusionPrefs()
       // visibleIds gates playRows (→ lineups/combos/lift/matrix). Pairings is a
-      // performance surface, so leaver games are excluded unless the switch is on.
-      const showLeavers = showLeaverGames()
-      const kept = m.filter(r => showLeavers || (r.team_leaver !== true && r.enemy_leaver !== true))
+      // performance surface, so the excluded-games policy applies here too.
+      // NOTE seasonByMatch below is built from the UNFILTERED set on purpose —
+      // it is a lookup, not a visibility decision.
+      const kept = m.filter(r => !isExcludedGame(r))
       setVisibleIds(new Set(kept.map(r => r.id)))
       setSeasonByMatch(new Map(m.map(r => [r.id, r.season_id ?? null])))
       const seasonRows = (((sRes as unknown) as { data: { id: number; name: string; start_date: string; end_date: string }[] | null }).data) || []
@@ -139,11 +146,53 @@ export default function AnalyticsHeroesOverviewPage() {
   // format; a 5v5 role can't be enforced on hero grain (no role column), so the
   // role part of Queue is ignored here — same limitation as the builder's hero
   // grain. Mode + Map apply directly.
+  //
+  // (v1.1.0 Phase 2) Modes and maps are now passed through as arrays. This used
+  // to translate between two spellings of "no filter" — '' and 'all' — which is
+  // the pattern that emptied the Matchups page in v1.0.1. Both sides now use an
+  // empty array and there is nothing left to convert.
   const comboFilters: ComboFilters = useMemo(() => ({
     format: filters.queue === '6v6' ? '6v6' : (filters.queue === 'all' ? 'all' : '5v5'),
-    mode: filters.mode === 'all' ? 'all' : filters.mode,
-    map: filters.map === '' ? 'all' : filters.map,
+    modes: filters.modes,
+    maps: filters.maps,
   }), [filters])
+
+  // ---- (v1.1.0 Phase 5) QUEUE GATE + ROLE ROSTER ----
+  //
+  // Two linked changes, both driven by `filters.queue`:
+  //
+  // 1. NOTHING RENDERS UNTIL A QUEUE IS CHOSEN. Pooling 5v5 and 6v6 skews every
+  //    number toward 6v6, which simply has more ally pairings per game.
+  //    ⚠️ THIS REVERSES A PRIOR DECISION. `FILE-MAP` recorded "#5 RESOLVED (v37):
+  //    do NOT force a queue — All Queues is allowed". That decision did not
+  //    survive contact with live data and is SUPERSEDED (PATCH-SPEC §10.0). The
+  //    map entry is updated to match; do not restore "All Queues" here.
+  //
+  // 2. A 5v5 ROLE QUEUE RESTRICTS THE WHOLE HERO UNIVERSE, not just the grid
+  //    axes. `ComboFilters.format` collapses tank/dps/support to '5v5' and drops
+  //    the role, so without this the page would show a tanks-only grid sitting
+  //    above a combos table full of DPS pairs — the page contradicting itself.
+  //
+  //    This works because 5v5 LOCKS you to your queued role: every hero played in
+  //    a tank-queue game is a tank, so "only tank heroes" and "only tank games"
+  //    select the same games. There is no partially-counted match.
+  //
+  //    6v6 is open queue, so it is deliberately unrestricted — the full roster is
+  //    genuinely available in one game.
+  //
+  //    ⚠️ This SHRINKS the numbers on screen under a role queue: a 5v5 game where
+  //    you played DPS no longer contributes to the Tank view at all. That is the
+  //    correction, not a regression.
+  //
+  // The roster rule is IMPORTED from AnalyticsFilters, which already owns it for
+  // the Hero dropdown. null = no restriction.
+  const queueChosen = filters.queue !== 'all'
+  const queueRoster: Set<string> | null = useMemo(() => {
+    const q = filters.queue
+    return (q === 'tank' || q === 'dps' || q === 'support')
+      ? new Set(heroOptionsForQueue(q))
+      : null
+  }, [filters.queue])
 
   // Alpha-excluded + leaver-excluded (via visibleIds) hero rows, then the season
   // filter applied reactively → typed HeroPlayRow. seasons=[] means All Time.
@@ -155,7 +204,11 @@ export default function AnalyticsHeroesOverviewPage() {
       return sid != null && seasonSel.includes(sid)
     }
     return heroRows
-      .filter(r => visibleIds.has(r.match_id) && seasonOk(r.match_id))
+      .filter(r =>
+        visibleIds.has(r.match_id) &&
+        seasonOk(r.match_id) &&
+        // Role-queue restriction — see the block comment above.
+        (queueRoster === null || queueRoster.has(r.hero_name)))
       .map(r => ({
         match_id: r.match_id,
         hero_name: r.hero_name,
@@ -166,7 +219,7 @@ export default function AnalyticsHeroesOverviewPage() {
         map: r.map,
         starting_side: r.starting_side,
       }))
-  }, [heroRows, visibleIds, seasonByMatch, filters.seasons])
+  }, [heroRows, visibleIds, seasonByMatch, filters.seasons, queueRoster])
 
   const lineups: MatchLineup[] = useMemo(
     () => buildLineups(playRows, comboFilters, threshold),
@@ -178,6 +231,21 @@ export default function AnalyticsHeroesOverviewPage() {
     [lineups, solo, mode, minSize]
   )
   const heroesPlayed = useMemo(() => playedHeroes(lineups), [lineups])
+
+  // (v1.1.0 Phase 5) Drop hero picks that the new queue no longer offers.
+  // Without this a DPS hero chosen under All Queues would survive a switch to
+  // Tank and sit in the grid as an all-zero row. This mirrors `changeQueue` in
+  // AnalyticsFilters, which prunes the Hero dropdown the same way — survivors are
+  // kept, so narrowing drops only what genuinely no longer exists.
+  //
+  // Clearing matrixSel to empty is safe: the default-selection effect below
+  // refills it with the top heroes of the NEW queue.
+  useEffect(() => {
+    if (queueRoster === null) return // All Queues / 6v6 — nothing to prune
+    const offered = queueRoster
+    setMatrixSel(sel => sel.filter(h => offered.has(h)))
+    setBase(b => b.filter(h => offered.has(h)))
+  }, [queueRoster])
 
   // Default the matrix selection to the top ~6 most-played heroes once data loads.
   useEffect(() => {
@@ -238,6 +306,24 @@ export default function AnalyticsHeroesOverviewPage() {
           cell is your win rate when you played both heroes in the same game.
         </p>
 
+        {/* (v1.1.0 Phase 5) QUEUE GATE — nothing below renders until a queue is
+            chosen. The controls are hidden too: a threshold slider and an "in view"
+            game count are meaningless with no queue, and showing them would invite
+            fiddling with settings that cannot change anything yet. */}
+        {!queueChosen ? (
+          <div className="bg-ow-panel rounded-xl border border-ow-orange/20 p-10 text-center">
+            <p className="font-display tracking-wider text-ow-muted uppercase text-sm">Choose a queue</p>
+            <p className="text-sm text-ow-faint mt-2 max-w-md mx-auto">
+              Pick <span className="text-ow-orange">Tank</span>,{' '}
+              <span className="text-ow-orange">DPS</span>,{' '}
+              <span className="text-ow-orange">Support</span> or{' '}
+              <span className="text-ow-orange">6v6</span> above. Pooling 5v5 and 6v6 skews every
+              number toward 6v6, which has more ally pairings per game — so the combined view
+              would be misleading rather than broader.
+            </p>
+          </div>
+        ) : (
+          <>
         {/* Controls */}
         <div className="bg-ow-panel rounded-xl border border-ow-line p-4">
           <div className="flex flex-wrap items-end gap-5">
@@ -382,6 +468,23 @@ export default function AnalyticsHeroesOverviewPage() {
               ) : (
                 <p className="text-sm text-ow-faint">Pick at least one hero above to build the grid.</p>
               )}
+
+              {/* (v1.1.0 Phase 6) The grid was the last surface applying the dimming
+                  convention WITHOUT stating it — the header said only "win rate ·
+                  diagonal = solo", so a faded cell read as a rendering quirk rather
+                  than as a sample-size signal. Every other panel on this page and on
+                  Matchups already carries this sentence; the grid didn't.
+                  ⚠️ The dot is NOT the same thing as the dimming. A cell dims for
+                  FEW games; it shows a dot for no DECISIVE games — which covers both
+                  an empty pairing and one you have only ever drawn. They are stated
+                  separately because a dot cell is never dimmed (see the opacity rule
+                  above: null win rate short-circuits to full opacity). */}
+              {matrix && matrix.heroes.length > 0 && (
+                <p className="text-[11px] text-ow-faint mt-2">
+                  Cells under {CONFIDENCE_MIN_GAMES} games are dimmed, not hidden — a confidence
+                  boundary, not a cutoff. A dot means no decisive games for that pairing yet.
+                </p>
+              )}
             </div>
 
             {/* Top combinations table */}
@@ -466,6 +569,8 @@ export default function AnalyticsHeroesOverviewPage() {
                 )}
               </div>
             )}
+          </>
+        )}
           </>
         )}
       </section>

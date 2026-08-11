@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 import { supabase } from '@/lib/supabase'
 import Select from '@/components/Select'
@@ -223,16 +223,74 @@ export default function ComparePage() {
   }, [])
 
   // ---- Deep Dive: refetch a single slot when its hero/filters change ----
-  const refetchSlot = useCallback(async (id: string) => {
-    setSlots(prev => prev.map(s => s.id === id ? { ...s, loading: true } : s))
-    const slot = slots.find(s => s.id === id)
-    if (!slot) return
-    const [data, breakdown] = await Promise.all([
-      fetchStats(slot.hero, slot.filters),
-      fetchBreakdown(slot.hero, slot.filters),
-    ])
-    setSlots(prev => prev.map(s => s.id === id ? { ...s, data, breakdown, loading: false } : s))
-  }, [slots, fetchStats, fetchBreakdown])
+  // (v1.1.0 Phase 5) DEEP DIVE IS NOW REACTIVE — the APPLY button is gone.
+  //
+  // The Compare tab has always refetched on change (see the cmpHeroes effect
+  // above); Deep Dive was the only surface in the app still requiring a manual
+  // apply, so this makes the two tabs behave the same way rather than adding a
+  // new convention.
+  //
+  // ⚠️ WHY A SIGNATURE STRING RATHER THAN AN EFFECT ON `slots`: the fetch writes
+  // back into `slots` (data/loading), so an effect depending on `slots` would
+  // retrigger itself forever. The signature contains ONLY the inputs — id, hero,
+  // filters — so completing a fetch leaves it unchanged and the effect rests.
+  //
+  // Per-slot signatures are held in a ref so only the slot that actually changed
+  // refetches. Editing slot 3's map must not re-request slots 1 and 2.
+  const slotSigs = useRef<Map<string, string>>(new Map())
+  const slotSignature = slots.map(s => `${s.id}\u241F${s.hero}\u241F${JSON.stringify(s.filters)}`).join('\u2016')
+
+  useEffect(() => {
+    let cancelled = false
+    const specs = slots.map(s => ({
+      id: s.id,
+      hero: s.hero,
+      filters: s.filters,
+      sig: `${s.id}\u241F${s.hero}\u241F${JSON.stringify(s.filters)}`,
+    }))
+
+    // Drop signatures for removed slots so an id reused later can't be treated
+    // as unchanged and skip its fetch.
+    const live = new Set(specs.map(s => s.id))
+    for (const id of [...slotSigs.current.keys()]) {
+      if (!live.has(id)) slotSigs.current.delete(id)
+    }
+
+    const changed = specs.filter(s => slotSigs.current.get(s.id) !== s.sig)
+    if (changed.length === 0) return
+    for (const s of changed) slotSigs.current.set(s.id, s.sig)
+
+    // An empty hero slot holds no data; clear it rather than querying for ''.
+    const withHero = changed.filter(s => s.hero !== '')
+    const empties = changed.filter(s => s.hero === '')
+    if (empties.length > 0) {
+      setSlots(prev => prev.map(x =>
+        empties.some(e => e.id === x.id) ? { ...x, data: null, breakdown: null, loading: false } : x))
+    }
+    if (withHero.length === 0) return
+
+    setSlots(prev => prev.map(x =>
+      withHero.some(c => c.id === x.id) ? { ...x, loading: true } : x))
+
+    ;(async () => {
+      for (const spec of withHero) {
+        const [data, breakdown] = await Promise.all([
+          fetchStats(spec.hero, spec.filters),
+          fetchBreakdown(spec.hero, spec.filters),
+        ])
+        if (cancelled) return
+        // Guard against a late response overwriting a newer edit: only apply if
+        // this slot's signature is still the one we fetched for.
+        if (slotSigs.current.get(spec.id) !== spec.sig) continue
+        setSlots(prev => prev.map(x =>
+          x.id === spec.id ? { ...x, data, breakdown, loading: false } : x))
+      }
+    })()
+
+    return () => { cancelled = true }
+    // `slots` is read but deliberately NOT a dependency — see the note above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slotSignature, fetchStats, fetchBreakdown])
 
   // ---- filter bar (shared component for both modes) ----
   function FilterBar({ value, onChange }: { value: Filters; onChange: (f: Filters) => void }) {
@@ -482,10 +540,6 @@ export default function ComparePage() {
                 </div>
                 <FilterBar value={s.filters}
                   onChange={f => setSlots(prev => prev.map(x => x.id === s.id ? { ...x, filters: f } : x))} />
-                <button onClick={() => refetchSlot(s.id)}
-                  className="text-xs bg-ow-dark border border-ow-line hover:border-ow-orange/40 text-ow-fg font-display tracking-wider px-3 py-1.5 rounded">
-                  APPLY
-                </button>
               </div>
             ))}
             {slots.length < MAX_SLOTS && (

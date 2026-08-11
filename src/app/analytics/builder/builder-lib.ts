@@ -35,6 +35,30 @@ export interface VarDef {
   group: string         // picker optgroup
   format?: ValueFormat  // how numeric values display (default plain number)
   lowerIsBetter?: boolean // for direction-aware cell highlighting (deaths etc.)
+  /**
+   * (v1.1.0 Phase 5) Which QUESTION SET this variable belongs to, when it
+   * belongs to one at all. Undefined = the variable is written under BOTH sets
+   * and pairs freely with anything.
+   *
+   * ⚠️ THE NEVER-POOL RULE. A version-1 and a version-2 feel variable measure
+   * different things at different resolutions: a v1 fun_rating of 5 is "best of
+   * 5", a v2 fun_rating_6 of 5 is "Great" — one rank below best of 6. Charting
+   * them on shared axes produces a number that means nothing.
+   *
+   * This is a STATIC property of the column, not a per-match lookup.
+   * `fun_rating` is always version 1; `fun_rating_6` is always version 2. That
+   * is why the refusal can live in this file at all — feel-lib resolves the
+   * version per MATCH via seasons.question_scale_version because it is
+   * classifying rows, whereas Builder is refusing a combination of COLUMNS and
+   * needs no season data to do it. Same rule, each file doing the form of it its
+   * job requires — and this one stays import-free.
+   *
+   * ⚠️ DO NOT TAG the leaver/thrower columns. `team_leaver_type` and
+   * `enemy_leaver_type` were added in v1.1.0 but BACKFILLED across every
+   * historical match, so they carry data under both question sets. Tagging them
+   * would refuse them against the Season 3 feel variables, which is wrong.
+   */
+  scaleVersion?: 1 | 2
 }
 
 // How a numeric value should render on axes / tooltips.
@@ -65,6 +89,22 @@ const TILT_ORDER = ['tilted', 'annoyed', 'fine', 'good', 'hyped']
 const FEEL_ORDER = ['stomped_them', 'close_game', 'got_stomped']
 const PERF_ORDER = ['smurfing', 'did_my_job', 'fed', 'threw']
 
+// (v1.1.0 Phase 5) Version-2 rating scales. Stored as smallints; the ORDER
+// arrays are the string forms the bucketing uses, so the axis reads 1→N rather
+// than sorting lexically ('10' before '2' would matter if a scale ever went that
+// high, and left→right is the point of an ordered scale either way).
+//
+// fun_rating_6 is 1–6 deliberately: an EVEN scale has NO MIDPOINT, so it cannot
+// be answered neutrally. That is why it is not simply the old 1–5 renamed, and
+// why the two must never share an axis.
+const RATING_5_ORDER = ['1', '2', '3', '4', '5']
+const RATING_6_ORDER = ['1', '2', '3', '4', '5', '6']
+const LEAVER_TYPE_ORDER = ['none', 'left', 'returned']
+
+// Picker group for the retired question set. Named as a constant so the marker
+// is written once — the whole point is that these read as historical at a glance.
+const FEEL_V1_GROUP = 'Feel — Season 3 & earlier (retired)'
+
 export const VARIABLES: VarDef[] = [
   // ---- Outcome / context (match grain) ----
   { key: 'result', label: 'Result', column: 'result', grain: 'match', kinds: ['cat'], ready: 'ready', order: RESULT_ORDER, group: 'Outcome & context' },
@@ -75,19 +115,41 @@ export const VARIABLES: VarDef[] = [
   { key: 'starting_side', label: 'Starting side', column: 'starting_side', grain: 'match', kinds: ['cat'], ready: 'thin', order: ['attack', 'defense'], group: 'Outcome & context' },
   { key: 'game_length_seconds', label: 'Game length', column: 'game_length_seconds', grain: 'match', kinds: ['num'], ready: 'ready', group: 'Outcome & context', format: 'duration' },
 
-  // ---- Feel (match grain) ----
-  { key: 'match_feel', label: 'Match feel', column: 'match_feel', grain: 'match', kinds: ['cat'], ready: 'ready', order: FEEL_ORDER, group: 'Feel' },
-  { key: 'performance_feel', label: 'Performance feel', column: 'performance_feel', grain: 'match', kinds: ['cat'], ready: 'ready', order: PERF_ORDER, group: 'Feel' },
-  { key: 'fun_rating', label: 'Fun rating', column: 'fun_rating', grain: 'match', kinds: ['cat', 'num'], ready: 'ready', order: ['1', '2', '3', '4', '5'], group: 'Feel' },
-  { key: 'tilt_mood', label: 'Tilt / mood', column: 'tilt_mood', grain: 'match', kinds: ['cat'], ready: 'thin', order: TILT_ORDER, group: 'Feel' },
-  { key: 'team_tempo', label: 'Team tempo', column: 'team_tempo', grain: 'match', kinds: ['cat'], ready: 'thin', order: TEMPO_ORDER, group: 'Feel' },
-  { key: 'team_coordination', label: 'Team coordination', column: 'team_coordination', grain: 'match', kinds: ['cat'], ready: 'thin', order: COORD_ORDER, group: 'Feel' },
-  { key: 'enemy_tempo', label: 'Enemy tempo', column: 'enemy_tempo', grain: 'match', kinds: ['cat'], ready: 'thin', order: TEMPO_ORDER, group: 'Feel' },
-  { key: 'enemy_coordination', label: 'Enemy coordination', column: 'enemy_coordination', grain: 'match', kinds: ['cat'], ready: 'thin', order: COORD_ORDER, group: 'Feel' },
-  { key: 'team_leaver', label: 'Team leaver', column: 'team_leaver', grain: 'match', kinds: ['cat'], ready: 'starved', order: ['true', 'false'], group: 'Feel' },
-  { key: 'team_thrower', label: 'Team thrower', column: 'team_thrower', grain: 'match', kinds: ['cat'], ready: 'starved', order: ['true', 'false'], group: 'Feel' },
-  { key: 'enemy_leaver', label: 'Enemy leaver', column: 'enemy_leaver', grain: 'match', kinds: ['cat'], ready: 'starved', order: ['true', 'false'], group: 'Feel' },
-  { key: 'enemy_thrower', label: 'Enemy thrower', column: 'enemy_thrower', grain: 'match', kinds: ['cat'], ready: 'starved', order: ['true', 'false'], group: 'Feel' },
+  // ---- Feel — CURRENT question set (version 2, v1.1.0 onward) ----
+  // The three ratings are plain smallints, so they are BOTH categorical (fixed
+  // 1..N buckets, ordered) and numeric (averageable) — unlike the version-1 feel
+  // variables, which are enums and categorical only.
+  // `starved` on purpose: nothing is written under this set until Season 4.
+  { key: 'matchup_feel', label: 'Matchup feel (1–5)', column: 'matchup_feel', grain: 'match', kinds: ['cat', 'num'], ready: 'starved', order: RATING_5_ORDER, group: 'Feel', scaleVersion: 2 },
+  { key: 'performance_rating', label: 'Performance rating (1–5)', column: 'performance_rating', grain: 'match', kinds: ['cat', 'num'], ready: 'starved', order: RATING_5_ORDER, group: 'Feel', scaleVersion: 2 },
+  { key: 'fun_rating_6', label: 'Fun rating (1–6)', column: 'fun_rating_6', grain: 'match', kinds: ['cat', 'num'], ready: 'starved', order: RATING_6_ORDER, group: 'Feel', scaleVersion: 2 },
+
+  // ---- Feel — RETIRED question set (version 1, Season 3 and earlier) ----
+  // KEPT, NOT DELETED. These still hold Season 3 data and must stay chartable.
+  // They are separated into their own picker group rather than hidden, so a chart
+  // built on them is obviously historical instead of mysteriously empty.
+  // No longer written by /process — see PATCH-SPEC §4.
+  { key: 'match_feel', label: 'Match feel', column: 'match_feel', grain: 'match', kinds: ['cat'], ready: 'ready', order: FEEL_ORDER, group: FEEL_V1_GROUP, scaleVersion: 1 },
+  { key: 'performance_feel', label: 'Performance feel', column: 'performance_feel', grain: 'match', kinds: ['cat'], ready: 'ready', order: PERF_ORDER, group: FEEL_V1_GROUP, scaleVersion: 1 },
+  { key: 'fun_rating', label: 'Fun rating (1–5)', column: 'fun_rating', grain: 'match', kinds: ['cat', 'num'], ready: 'ready', order: RATING_5_ORDER, group: FEEL_V1_GROUP, scaleVersion: 1 },
+  { key: 'tilt_mood', label: 'Tilt / mood', column: 'tilt_mood', grain: 'match', kinds: ['cat'], ready: 'thin', order: TILT_ORDER, group: FEEL_V1_GROUP, scaleVersion: 1 },
+  { key: 'team_tempo', label: 'Team tempo', column: 'team_tempo', grain: 'match', kinds: ['cat'], ready: 'thin', order: TEMPO_ORDER, group: FEEL_V1_GROUP, scaleVersion: 1 },
+  { key: 'team_coordination', label: 'Team coordination', column: 'team_coordination', grain: 'match', kinds: ['cat'], ready: 'thin', order: COORD_ORDER, group: FEEL_V1_GROUP, scaleVersion: 1 },
+  { key: 'enemy_tempo', label: 'Enemy tempo', column: 'enemy_tempo', grain: 'match', kinds: ['cat'], ready: 'thin', order: TEMPO_ORDER, group: FEEL_V1_GROUP, scaleVersion: 1 },
+  { key: 'enemy_coordination', label: 'Enemy coordination', column: 'enemy_coordination', grain: 'match', kinds: ['cat'], ready: 'thin', order: COORD_ORDER, group: FEEL_V1_GROUP, scaleVersion: 1 },
+
+  // ---- Leaver / thrower (match grain) — UNTAGGED, written under both sets ----
+  // The booleans are deliberately KEPT (PATCH-SPEC §4.2): they remain the right
+  // variable for "did this game have a leaver at all". The TYPE columns are an
+  // ADDITION, not a replacement — they split that into permanent vs returned.
+  // Neither carries a scaleVersion: the types were backfilled across all
+  // historical matches, so both pair freely with either question set.
+  { key: 'team_leaver', label: 'Team leaver', column: 'team_leaver', grain: 'match', kinds: ['cat'], ready: 'starved', order: ['true', 'false'], group: 'Leavers & throwers' },
+  { key: 'team_thrower', label: 'Team thrower', column: 'team_thrower', grain: 'match', kinds: ['cat'], ready: 'starved', order: ['true', 'false'], group: 'Leavers & throwers' },
+  { key: 'enemy_leaver', label: 'Enemy leaver', column: 'enemy_leaver', grain: 'match', kinds: ['cat'], ready: 'starved', order: ['true', 'false'], group: 'Leavers & throwers' },
+  { key: 'enemy_thrower', label: 'Enemy thrower', column: 'enemy_thrower', grain: 'match', kinds: ['cat'], ready: 'starved', order: ['true', 'false'], group: 'Leavers & throwers' },
+  { key: 'team_leaver_type', label: 'Team leaver kind', column: 'team_leaver_type', grain: 'match', kinds: ['cat'], ready: 'starved', order: LEAVER_TYPE_ORDER, group: 'Leavers & throwers' },
+  { key: 'enemy_leaver_type', label: 'Enemy leaver kind', column: 'enemy_leaver_type', grain: 'match', kinds: ['cat'], ready: 'starved', order: LEAVER_TYPE_ORDER, group: 'Leavers & throwers' },
 
   // ---- Combat — yours (match grain) ----
   { key: 'total_eliminations', label: 'Eliminations', column: 'total_eliminations', grain: 'match', kinds: ['num'], ready: 'ready', group: 'Combat (yours)' },
@@ -191,12 +253,17 @@ export interface HeroRow {
   mitigation_pct: number | null
 }
 
+// (v1.1.0 Phase 5) The five new columns are appended at the end: the three
+// version-2 rating columns and the two leaver-type columns. A variable whose
+// column is missing here reads undefined for every row and charts as empty —
+// so this list and VARIABLES must be changed together.
 export const MATCH_COLS =
   'id, played_at, result, map, game_mode, role_played, match_format, starting_side, ' +
   'game_length_seconds, match_feel, performance_feel, fun_rating, tilt_mood, team_tempo, ' +
   'team_coordination, enemy_tempo, enemy_coordination, team_leaver, team_thrower, ' +
   'enemy_leaver, enemy_thrower, total_eliminations, total_assists, total_deaths, ' +
-  'ally_team_comp, enemy_team_comp'
+  'ally_team_comp, enemy_team_comp, ' +
+  'matchup_feel, performance_rating, fun_rating_6, team_leaver_type, enemy_leaver_type'
 
 // ---- Derivations --------------------------------------------------------
 const SESSION_GAP_MS = 60 * 60 * 1000 // 60 min → new session
@@ -484,17 +551,46 @@ export interface HeroFilterable {
   game_mode: string | null
   map: string | null
 }
+
+/**
+ * The filter fields this lib reads. Declared HERE rather than imported from
+ * AnalyticsFilters, because this file has no imports at all — that is what lets
+ * it be compiled to plain JS and unit-checked against *_rows.sql exports, and
+ * importing a type from a React component module would give it a dependency it
+ * has never had. matchups-lib and hero-pairings-lib declare their own filter
+ * shapes for the same reason.
+ *
+ * It is structurally compatible with AnalyticsFilterState, so the page passes
+ * that straight in. Being a subset is deliberate: if the shared state renames
+ * or retypes one of these fields, every call site fails to compile — which is
+ * exactly how this function was found during the Phase 2 conversion.
+ *
+ * ⚠️ (v1.1.0 Phase 2) It was previously an inline `{ queue: string; mode: string;
+ * map: string }` at the parameter. Naming it means the next person who changes
+ * the shared filter shape can find it.
+ */
+export interface HeroGrainFilters {
+  queue: string
+  /** [] = all modes. */
+  modes: string[]
+  /** [] = all maps. */
+  maps: string[]
+}
+
 export function heroRowPasses(
   row: HeroFilterable,
-  f: { queue: string; mode: string; map: string }
+  f: HeroGrainFilters
 ): boolean {
   if (f.queue === '6v6' && row.match_format !== '6v6') return false
   // a specific 5v5 role can't be enforced on hero grain (no role column) — the
   // hero picker scopes by role instead; here we only ensure 5v5 when a 5v5 role
   // is chosen, so 6v6 rows don't leak into a 5v5-role view.
   if (f.queue !== 'all' && f.queue !== '6v6' && row.match_format !== '5v5') return false
-  if (f.mode !== 'all' && row.game_mode !== f.mode) return false
-  if (f.map !== '' && row.map !== f.map) return false
+  // OR within each list, AND between them. [] = no filter. A row with a null
+  // mode or map belongs to none of the ticked options, so ticking any of them
+  // excludes it — identical to the old `!== 'all' && row.x !== f.x` behaviour.
+  if (f.modes.length > 0 && !(row.game_mode != null && f.modes.includes(row.game_mode))) return false
+  if (f.maps.length > 0 && !(row.map != null && f.maps.includes(row.map))) return false
   return true
 }
 
@@ -593,6 +689,37 @@ export function pairValidity(x: VarDef, y: VarDef | null): PairValidity {
         `${y.label} is per-${y.grain === 'hero' ? 'hero' : 'match'} data. ` +
         `These two grains can't be combined on one chart (a cell would mix ` +
         `different-sized populations). Pick two variables of the same kind.`,
+    }
+  }
+
+  // (v1.1.0 Phase 5) NEVER-POOL RULE — refuse, don't warn.
+  //
+  // Placed AFTER the grain check because grain is the more fundamental problem:
+  // if a pairing fails both, the grain message is the more useful one.
+  //
+  // ⚠️ THIS IS A REFUSAL, NOT A WARNING, and that was a deliberate decision
+  // (PATCH-SPEC §10). The Feel page enforces the same rule structurally via its
+  // season selection. Builder has no equivalent single control, and it is the one
+  // page whose whole purpose is combining variables freely — which is exactly
+  // where a dismissible warning gets learned past. So it goes through the same
+  // `ok: false` path the grain mismatch uses, and the Build button disables.
+  //
+  // Only variables that CARRY a scaleVersion are affected. Everything untagged —
+  // result, map, leavers, combat, time — pairs with either set as before.
+  if (x.scaleVersion != null && y.scaleVersion != null && x.scaleVersion !== y.scaleVersion) {
+    const older = x.scaleVersion === 1 ? x : y
+    const newer = x.scaleVersion === 1 ? y : x
+    return {
+      ok: false,
+      shape: null,
+      cellMeasures: [],
+      reason:
+        `${older.label} is from the retired Season 3 question set and ` +
+        `${newer.label} is from the current one. The two sets ask different ` +
+        `questions at different resolutions, so a chart combining them would be ` +
+        `meaningless rather than merely sparse — no match has answers to both. ` +
+        `Pick two variables from the same question set, or pair one with a ` +
+        `non-feel variable such as Map, Result or Role.`,
     }
   }
 

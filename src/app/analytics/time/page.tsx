@@ -7,7 +7,7 @@ import {
 } from 'recharts'
 import { supabase } from '@/lib/supabase'
 import { matchQuery } from '@/lib/alpha'
-import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
+import { loadExclusionPrefs, EXCLUSION_COLS } from '@/lib/leaver'
 import { defaultSeasonSelection } from '@/lib/season-util'
 import AnalyticsFilters, {
   DEFAULT_FILTERS,
@@ -39,7 +39,7 @@ import {
 //
 //   • Win/loss streaks                 → headline stat cards
 //   • Session overview                 → headline stats (durations as h:mm / mm)
-//   • Avg session per month            → grouped bars (minutes + games)
+//   • Avg session per month            → grouped bars (session length h:mm + games)
 //   • Win rate by week, per season     → small-multiples + season-banded timeline
 //   • Win rate by time of day          → ordered bars
 //   • Win rate by game length          → ordered bars
@@ -61,9 +61,16 @@ import {
 
 interface TimeMatchRow extends FilterableMatch, TimeMatch { season_id: number | null }
 
-const MATCH_COLS = 'id, result, role_played, match_format, game_mode, map, played_at, game_length_seconds, season_id, team_leaver, enemy_leaver'
+const MATCH_COLS = 'id, result, role_played, match_format, game_mode, map, played_at, game_length_seconds, season_id, ' + EXCLUSION_COLS
 const HERO_COLS = 'match_id, hero_name'
 const SEASON_COLS = 'id, name, start_date, end_date'
+
+// (v1.1.0 Phase 6) Recharts identifies a series by its `name` string: the Legend
+// prints it and the Tooltip formatter receives it. Holding it in one constant
+// keeps those two in lockstep — previously the bar was named "Avg minutes" while
+// the tooltip relabelled it "Avg session length", so the legend and the hover
+// text disagreed about what the same bar was called.
+const SESSION_LENGTH_SERIES = 'Avg session length'
 
 // Win-rate colour for a bar (green strong, amber mid, red weak; grey when null).
 function wrColor(wr: number | null, c: ChartColors): string {
@@ -90,12 +97,24 @@ const tooltipStyleOf = (c: ChartColors) => ({
 // buckets red regardless of their own WR — the decay-point band.
 function WinRateBars({ data, label, flagDecay = false }: { data: CatRow[]; label: string; flagDecay?: boolean }) {
   const cc = useChartColors()
-  if (data.length === 0) return <Empty label={label} />
-  const height = Math.max(160, data.length * 34 + 40)
+  // (v1.1.0 Phase 4) Drop buckets with NO games before drawing anything.
+  //
+  // This page's categories are FIXED (time-of-day blocks, game-length bands), so
+  // a bucket you have never played still arrives as a row — and `winRate ?? 0`
+  // then drew a zero-width bar labelled "—" with n=0, which reads as "0% win
+  // rate here" rather than "no data here". Outcomes doesn't need this: its
+  // categories are derived from the rows themselves, so an empty one cannot
+  // occur.
+  //
+  // ⚠️ Everything below MUST read `shown`, not `data` — LabelList indexes back
+  // into the array by position, so a mismatch silently mislabels every bar.
+  const shown = data.filter(d => d.games > 0)
+  if (shown.length === 0) return <Empty label={label} />
+  const height = Math.max(160, shown.length * 34 + 40)
   return (
     <div style={{ height }}>
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} layout="vertical" margin={{ top: 4, right: 96, bottom: 4, left: 8 }}>
+        <BarChart data={shown} layout="vertical" margin={{ top: 4, right: 96, bottom: 4, left: 8 }}>
           <CartesianGrid stroke={cc.grid} horizontal={false} />
           <XAxis type="number" domain={[0, 100]} tick={axisTickOf(cc)} stroke={cc.axis} unit="%" />
           <YAxis type="category" dataKey="key" tick={axisTickOf(cc)} stroke={cc.axis} width={130} />
@@ -108,12 +127,12 @@ function WinRateBars({ data, label, flagDecay = false }: { data: CatRow[]; label
               return [`${wr == null ? '—' : wr + '%'} · ${row?.games ?? 0} games${tag}`, 'Win rate']
             }} />
           <Bar dataKey={(d: CatRow) => d.winRate ?? 0} radius={[0, 4, 4, 0]} isAnimationActive={false}>
-            {data.map((d, i) => (
+            {shown.map((d, i) => (
               <Cell key={i} fill={flagDecay && d.belowAverage ? cc.defeat : wrColor(d.winRate, cc)} fillOpacity={d.lowConfidence ? 0.4 : 1} />
             ))}
             <LabelList dataKey="winRate" position="right" content={(props: unknown) => {
               const p = props as { x?: number; y?: number; width?: number; height?: number; index?: number }
-              const row = data[p.index ?? -1]
+              const row = shown[p.index ?? -1]
               if (!row || p.x == null || p.y == null || p.width == null || p.height == null) return null
               const mark = flagDecay && row.belowAverage ? ' ↓' : ''
               const txt = `${row.winRate == null ? '—' : row.winRate + '%'}  n=${row.games}${mark}`
@@ -223,7 +242,7 @@ export default function TimePage() {
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    loadLeaverPref().then(() => { if (!cancelled) setLeaverReady(true) })
+    loadExclusionPrefs().then(() => { if (!cancelled) setLeaverReady(true) })
     Promise.all([
       matchQuery(MATCH_COLS).order('played_at', { ascending: true }),
       supabase.from('hero_match_facts').select(HERO_COLS),
@@ -252,12 +271,20 @@ export default function TimePage() {
     return m
   }, [heroRows])
 
+  // (v1.1.0 Phase 2) Hero is POOLED across the selection, per PATCH-SPEC §6.2:
+  // the per-hero id sets are UNIONED, so ticking two heroes means "games with
+  // either", not "games where both were played".
   const rows = useMemo(() => {
-    const excludeLeavers = !showLeaverGames()
-    const base = matches.filter(m => matchesFilters(m, filters, { excludeLeavers }))
-    if (filters.hero === '') return base
-    const ids = matchIdsByHero.get(filters.hero)
-    if (!ids) return []
+    // The page opts in; @/lib/leaver owns which games are excluded, so every
+    // performance surface agrees rather than each holding its own copy.
+    const base = matches.filter(m => matchesFilters(m, filters, { applyExclusions: true }))
+    if (filters.heroes.length === 0) return base
+    const ids = new Set<number>()
+    for (const h of filters.heroes) {
+      const s = matchIdsByHero.get(h)
+      if (s) for (const id of s) ids.add(id)
+    }
+    if (ids.size === 0) return []
     return base.filter(m => ids.has(m.id))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matches, filters, matchIdsByHero, leaverReady])
@@ -424,15 +451,25 @@ export default function TimePage() {
                   <BarChart data={monthSessions} margin={{ top: 8, right: 16, bottom: 4, left: -8 }}>
                     <CartesianGrid stroke={cc.grid} vertical={false} />
                     <XAxis dataKey="label" tick={axisTickOf(cc)} stroke={cc.axis} />
-                    <YAxis yAxisId="min" tick={axisTickOf(cc)} stroke={cc.axis} unit="m" />
+                    {/* (v1.1.0 Phase 6) Duration axis reads h:mm, matching the "Avg
+                        session length" stat above and the tooltip below — the chart
+                        was the only place still showing raw minutes, so a 105-minute
+                        session read as "105m" here and "1:45" three panels up.
+                        `unit="m"` is REMOVED, not kept: it would append to the
+                        formatted string and print "1:45m". */}
+                    <YAxis yAxisId="min" tick={axisTickOf(cc)} stroke={cc.axis}
+                      tickFormatter={(v: number) => formatDuration(v)} />
                     <YAxis yAxisId="games" orientation="right" tick={axisTickOf(cc)} stroke={cc.axis} />
                     <Tooltip {...tooltipStyleOf(cc)}
                       formatter={(v, n) => {
-                        if (n === 'Avg minutes') return [formatDuration(Number(v)), 'Avg session length']
+                        if (n === SESSION_LENGTH_SERIES) return [formatDuration(Number(v)), SESSION_LENGTH_SERIES]
                         return [`${v}`, 'Avg games / session']
                       }} />
                     <Legend wrapperStyle={{ fontSize: 11 }} />
-                    <Bar yAxisId="min" dataKey={(d: typeof monthSessions[number]) => d.avgMinutes ?? 0} name="Avg minutes" fill={cc.primary} radius={[4, 4, 0, 0]} isAnimationActive={false} />
+                    {/* The series NAME is what the legend and the tooltip both key off,
+                        so it lives in one constant — renaming it in place used to mean
+                        editing two strings that had to stay identical. */}
+                    <Bar yAxisId="min" dataKey={(d: typeof monthSessions[number]) => d.avgMinutes ?? 0} name={SESSION_LENGTH_SERIES} fill={cc.primary} radius={[4, 4, 0, 0]} isAnimationActive={false} />
                     <Bar yAxisId="games" dataKey={(d: typeof monthSessions[number]) => d.avgGames ?? 0} name="Avg games" fill={cc.categorical[3]} radius={[4, 4, 0, 0]} isAnimationActive={false} />
                   </BarChart>
                 </ResponsiveContainer>

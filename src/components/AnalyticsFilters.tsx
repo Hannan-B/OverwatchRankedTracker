@@ -6,8 +6,9 @@ import {
   getMapsByMode,
   type GameMode,
 } from '@/data/reference'
-import { matchQuery } from '@/lib/alpha'
+import { isExcludedGame } from '@/lib/leaver'
 import Select from '@/components/Select'
+import MultiSelect from '@/components/MultiSelect'
 
 // ============================================================
 // ANALYTICS FILTERS — shared across every analytics page
@@ -15,14 +16,29 @@ import Select from '@/components/Select'
 // SCOPE filters (left group): Queue, Mode, Map, Hero, Season.
 // THRESHOLD filters (right group): Min games, Playtime %.
 //
-//   • Queue carries the 5v5/6v6 split. Tank/DPS/Support are 5v5 roles; 6v6 is
-//     its own queue. 5v5 and 6v6 NEVER mix (hard product rule).
-//   • Mode → Map are linked: picking a mode narrows the map list to that mode,
-//     and an out-of-mode map selection is cleared automatically.
+//   • Queue carries the 5v5/6v6 split and is SINGLE-SELECT. Tank/DPS/Support
+//     are 5v5 roles; 6v6 is its own queue. 5v5 and 6v6 NEVER mix (hard product
+//     rule) — which is also why the control can't become multi-select: ticking
+//     Tank and 6v6 together would ask for exactly the mix the rule forbids.
+//   • Mode, Map, Hero and Season are MULTI-SELECT (v1.1.0 Phase 2).
+//   • Mode → Map are linked: picking modes narrows the map list to those modes'
+//     maps, and any selected map that falls outside is dropped automatically.
 //   • Hero is the full reference roster, SCOPED BY THE QUEUE ROLE ONLY:
 //       Queue = Tank/DPS/Support → only that role's heroes are offered.
 //       Queue = All or 6v6       → all heroes are offered.
 //     (No extra "hero role" sub-step — that's a Match-History-only pattern.)
+//
+// ⚠️ EMPTY ARRAY = NO FILTER, for all four multi-selects. `maps: []` means
+// every map, not "no maps". This replaced a sentinel mess where mode used the
+// string 'all' while map and hero used '' — the mismatch that caused the v1.0.1
+// empty-page bug, when `'' ?? 'all'` stayed '' across the Matchups bridge and
+// rejected every row. There is now one rule and no sentinel to translate.
+//
+// MULTI-SELECT SEMANTICS (settled, PATCH-SPEC §6.2):
+//   • WITHIN one filter: OR.  Three maps ticked = matches on any of them.
+//   • ACROSS filters: AND.    "these maps AND these heroes."
+//   • Hero on aggregate pages: POOLED across the selected heroes — see
+//     heroMatches() at the bottom.
 //
 // THRESHOLDS (step 9) — confidence/inclusion knobs, NOT row filters. They live
 // in the same shared state so any page can read them, but each page applies them
@@ -39,23 +55,25 @@ import Select from '@/components/Select'
 //     views' hard floor to 30s so the read side can filter live; the website
 //     re-applies 60s by default. Wired per page where it's reachable.
 //
-// HERO-GATING: the threshold group is HERO-FOCUSED, so it renders ONLY when a
-// specific hero is selected (value.hero !== ''). Under "All heroes" it stays
-// hidden. A page declares which thresholds it SUPPORTS via `show`; the hero gate
-// decides WHEN the supported ones are visible.
+// HERO-GATING: the threshold group is HERO-FOCUSED, so it renders ONLY when at
+// least one specific hero is selected. Under "All Heroes" it stays hidden. A
+// page declares which thresholds it SUPPORTS via `show`; the hero gate decides
+// WHEN the supported ones are visible.
 //
 // Controlled component: the parent owns the state and passes it in, so every
 // page shares one filter shape. Built standalone for reuse.
 //
-// Applying the filters (two paths, pick per page — see §3 of the handover):
-//   1. Reading the `matches` table directly → use applyMatchQueryFilters(),
-//      which pushes .eq() into a matchQuery() builder (alpha rule included).
-//   2. Reading SQL views (or already-fetched rows) → use matchesFilters() as a
-//      JS predicate after fetching.
+// ⚠️ ONE APPLICATION PATH (v1.1.0 Phase 2). Filtering happens in JS, on rows
+// already fetched, via matchesFilters(). The SQL-side twin — applyMatchQueryFilters()
+// — was DELETED, along with the applyFilters() array wrapper. Both were written,
+// both were correct, and grep confirmed neither had ever been called by anything.
+// Keeping them meant the excluded-games rule existed in two implementations that
+// could drift, in a copy that never ran and so could never reveal it had. If a
+// database-side path is ever needed (it isn't at this data volume), rebuild it
+// then against whatever the state shape is by that point.
 // ============================================================
 
 export type QueueFilter = 'all' | 'tank' | 'dps' | 'support' | '6v6'
-export type ModeFilter = 'all' | GameMode
 
 // Threshold options. Kept as explicit small sets (not free numbers) because the
 // user asked for tap-to-pick dropdowns with specific allowed values, not a slider.
@@ -65,11 +83,16 @@ export const DEFAULT_MIN_GAMES = 5
 export const DEFAULT_PLAYTIME_PCT = 95
 
 export interface AnalyticsFilterState {
+  /** Single-select. 6v6 is a format; a 5v5 role pins format AND role_played. */
   queue: QueueFilter
-  mode: ModeFilter
-  map: string // '' = all maps
-  hero: string // '' = all heroes
-  seasons: number[] // [] = All Time (no season filter); else exactly these season ids
+  /** [] = all modes. */
+  modes: GameMode[]
+  /** [] = all maps. */
+  maps: string[]
+  /** [] = all heroes. Pooled when several are selected. */
+  heroes: string[]
+  /** [] = All Time (no season filter); else exactly these season ids. */
+  seasons: number[]
   // Threshold knobs (step 9). Reactive + per-visit; NOT persisted. Each page that
   // opts into them reads these instead of a local constant. A page that doesn't
   // show them just keeps the defaults, so its behaviour is unchanged.
@@ -77,7 +100,7 @@ export interface AnalyticsFilterState {
   playtimePct: number // % of a match on a hero to count it as a "single-hero" game
 }
 
-/** A season the filter can offer as a checkbox (subset of the `seasons` table). */
+/** A season the filter can offer. Subset of the `seasons` table. */
 export interface SeasonOption {
   id: number
   name: string
@@ -96,9 +119,9 @@ export interface FilterVisibility {
 
 export const DEFAULT_FILTERS: AnalyticsFilterState = {
   queue: 'all',
-  mode: 'all',
-  map: '',
-  hero: '',
+  modes: [],
+  maps: [],
+  heroes: [],
   seasons: [],
   minGames: DEFAULT_MIN_GAMES,
   playtimePct: DEFAULT_PLAYTIME_PCT,
@@ -113,9 +136,23 @@ const selectCls =
 
 const labelCls = 'text-[11px] text-ow-muted font-display tracking-wider uppercase'
 
+const MODE_OPTIONS: { value: GameMode; label: string }[] = [
+  { value: 'escort', label: 'Escort' },
+  { value: 'control', label: 'Control' },
+  { value: 'hybrid', label: 'Hybrid' },
+  { value: 'push', label: 'Push' },
+  { value: 'flashpoint', label: 'Flashpoint' },
+]
+
 // Heroes offered for a given queue. A specific 5v5 role narrows to that role;
 // All/6v6 offers the whole roster. Sorted by name; full static reference roster.
-function heroOptionsForQueue(queue: QueueFilter): string[] {
+//
+// (v1.1.0 Phase 5) EXPORTED. Hero Pairings restricts its whole hero universe to
+// the selected queue's roster, and that is the same question this function
+// already answers for the Hero dropdown. Exported rather than copied so there is
+// exactly one definition of "which heroes are possible in this queue" — two would
+// drift the first time a hero changed role.
+export function heroOptionsForQueue(queue: QueueFilter): string[] {
   const all = [...HEROES].sort((a, b) => a.name.localeCompare(b.name))
   if (queue === 'tank' || queue === 'dps' || queue === 'support') {
     return all.filter(h => h.role === queue).map(h => h.name)
@@ -123,168 +160,139 @@ function heroOptionsForQueue(queue: QueueFilter): string[] {
   return all.map(h => h.name)
 }
 
+// Maps offered for a set of modes. No modes selected = every map. Several modes
+// = the UNION of their maps, deduped by name (the same map can serve more than
+// one mode in reference data, and a duplicated row would tick twice).
+function mapNamesForModes(modes: GameMode[]): string[] {
+  const src = modes.length === 0 ? [...MAPS] : modes.flatMap(m => getMapsByMode(m))
+  return Array.from(new Set(src.map(m => m.name))).sort((a, b) => a.localeCompare(b))
+}
+
 export default function AnalyticsFilters({
   value,
   onChange,
-  show = { queue: true, mode: true, map: true, hero: true, season: true },  seasonOptions = [],
+  show = { queue: true, mode: true, map: true, hero: true, season: true },
+  seasonOptions = [],
 }: {
   value: AnalyticsFilterState
   onChange: (next: AnalyticsFilterState) => void
   show?: FilterVisibility
   seasonOptions?: SeasonOption[]
 }) {
-  // Maps shown depend on the chosen mode (Mode→Map linkage).
-  const mapOptions =
-    value.mode === 'all'
-      ? [...MAPS].sort((a, b) => a.name.localeCompare(b.name))
-      : getMapsByMode(value.mode)
-
+  const mapOptions = mapNamesForModes(value.modes)
   const heroOptions = heroOptionsForQueue(value.queue)
 
-  // When the queue role changes, a previously-chosen hero may no longer be in
-  // the offered set — clear it so the visible selection can't contradict Queue.
+  // When the queue role changes, previously-chosen heroes may no longer be in
+  // the offered set — drop those so the visible selection can't contradict Queue.
+  // Survivors are kept: switching Tank → All should not throw away your picks.
   function changeQueue(queue: QueueFilter) {
-    const heroStillValid =
-      value.hero === '' || heroOptionsForQueue(queue).includes(value.hero)
-    onChange({ ...value, queue, hero: heroStillValid ? value.hero : '' })
+    const offered = new Set(heroOptionsForQueue(queue))
+    onChange({ ...value, queue, heroes: value.heroes.filter(h => offered.has(h)) })
   }
 
-  // When the mode changes, clear a map that doesn't belong to the new mode.
-  function changeMode(mode: ModeFilter) {
-    const mapStillValid =
-      value.map === '' ||
-      mode === 'all' ||
-      getMapsByMode(mode).some(m => m.name === value.map)
-    onChange({ ...value, mode, map: mapStillValid ? value.map : '' })
-  }
-
-  // Season multi-select. [] = All Time (no filtering). Checking "All Time" clears
-  // the set; toggling a season adds/removes its id. If unchecking the last season
-  // leaves the set empty, that's All Time again (no dead "nothing" state).
-  const allTime = value.seasons.length === 0
-  function setAllTime() {
-    onChange({ ...value, seasons: [] })
-  }
-  function toggleSeason(id: number) {
-    const has = value.seasons.includes(id)
-    const next = has ? value.seasons.filter(s => s !== id) : [...value.seasons, id]
-    onChange({ ...value, seasons: next })
+  // When the modes change, drop any selected map that no longer belongs to one
+  // of them. Clearing to "All Modes" widens the offer, so nothing is dropped.
+  function changeModes(modes: GameMode[]) {
+    const offered = new Set(mapNamesForModes(modes))
+    onChange({ ...value, modes, maps: value.maps.filter(m => offered.has(m)) })
   }
 
   return (
     <div className="flex flex-wrap items-start justify-between gap-4">
       {/* SCOPE filters — narrow which games are in view. */}
       <div className="flex flex-wrap gap-4">
-      {show.queue && (
-        <label className="flex flex-col gap-1">
-          <span className={labelCls}>Queue</span>
-          <Select<QueueFilter>
-            className={selectCls}
-            value={value.queue}
-            onChange={changeQueue}
-            options={[
-              { value: 'all', label: 'All Queues' },
-              { value: 'tank', label: 'Tank' },
-              { value: 'dps', label: 'DPS' },
-              { value: 'support', label: 'Support' },
-              { value: '6v6', label: '6v6' },
-            ]}
-          />
-        </label>
-      )}
+        {show.queue && (
+          <label className="flex flex-col gap-1">
+            <span className={labelCls}>Queue</span>
+            <Select<QueueFilter>
+              className={selectCls}
+              value={value.queue}
+              onChange={changeQueue}
+              options={[
+                { value: 'all', label: 'All Queues' },
+                { value: 'tank', label: 'Tank' },
+                { value: 'dps', label: 'DPS' },
+                { value: 'support', label: 'Support' },
+                { value: '6v6', label: '6v6' },
+              ]}
+            />
+          </label>
+        )}
 
-      {show.mode && (
-        <label className="flex flex-col gap-1">
-          <span className={labelCls}>Mode</span>
-          <Select<ModeFilter>
-            className={selectCls}
-            value={value.mode}
-            onChange={changeMode}
-            options={[
-              { value: 'all', label: 'All Modes' },
-              { value: 'escort', label: 'Escort' },
-              { value: 'control', label: 'Control' },
-              { value: 'hybrid', label: 'Hybrid' },
-              { value: 'push', label: 'Push' },
-              { value: 'flashpoint', label: 'Flashpoint' },
-            ]}
-          />
-        </label>
-      )}
+        {show.mode && (
+          <label className="flex flex-col gap-1">
+            <span className={labelCls}>Mode</span>
+            <MultiSelect<GameMode>
+              className={selectCls}
+              value={value.modes}
+              onChange={changeModes}
+              options={MODE_OPTIONS}
+              allLabel="All Modes"
+              noun="modes"
+              aria-label="Mode"
+            />
+          </label>
+        )}
 
-      {show.map && (
-        <label className="flex flex-col gap-1">
-          <span className={labelCls}>Map</span>
-          <Select<string>
-            className={selectCls}
-            value={value.map}
-            onChange={map => onChange({ ...value, map })}
-            options={[
-              { value: '', label: 'All Maps' },
-              ...mapOptions.map(m => ({ value: m.name, label: m.name })),
-            ]}
-          />
-        </label>
-      )}
+        {show.map && (
+          <label className="flex flex-col gap-1">
+            <span className={labelCls}>Map</span>
+            <MultiSelect<string>
+              className={selectCls}
+              value={value.maps}
+              onChange={maps => onChange({ ...value, maps })}
+              options={mapOptions.map(m => ({ value: m, label: m }))}
+              allLabel="All Maps"
+              noun="maps"
+              searchable
+              searchPlaceholder="Search maps…"
+              aria-label="Map"
+            />
+          </label>
+        )}
 
-      {show.hero && (
-        <label className="flex flex-col gap-1">
-          <span className={labelCls}>Hero</span>
-          <Select<string>
-            className={selectCls}
-            value={value.hero}
-            onChange={hero => onChange({ ...value, hero })}
-            options={[
-              { value: '', label: 'All Heroes' },
-              ...heroOptions.map(h => ({ value: h, label: h })),
-            ]}
-          />
-        </label>
-      )}
+        {show.hero && (
+          <label className="flex flex-col gap-1">
+            <span className={labelCls}>Hero</span>
+            <MultiSelect<string>
+              className={selectCls}
+              value={value.heroes}
+              onChange={heroes => onChange({ ...value, heroes })}
+              options={heroOptions.map(h => ({ value: h, label: h }))}
+              allLabel="All Heroes"
+              noun="heroes"
+              searchable
+              searchPlaceholder="Search heroes…"
+              aria-label="Hero"
+            />
+          </label>
+        )}
 
-      {show.season && seasonOptions.length > 0 && (
-        <div className="flex flex-col gap-1">
-          <span className={labelCls}>Season</span>
-          <div className="flex flex-wrap items-center gap-2 bg-ow-dark border border-ow-line rounded-lg px-3 py-2">
-            <label className="flex items-center gap-1.5 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={allTime}
-                onChange={setAllTime}
-                className="accent-ow-orange w-3.5 h-3.5"
-              />
-              <span className={`text-sm font-display tracking-wider ${allTime ? 'text-ow-orange' : 'text-ow-muted'}`}>
-                All Time
-              </span>
-            </label>
-            {seasonOptions.map(s => {
-              const checked = value.seasons.includes(s.id)
-              return (
-                <label key={s.id} className="flex items-center gap-1.5 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={() => toggleSeason(s.id)}
-                    className="accent-ow-orange w-3.5 h-3.5"
-                  />
-                  <span className={`text-sm font-display tracking-wider ${checked ? 'text-ow-fg' : 'text-ow-muted'}`}>
-                    {s.name}
-                  </span>
-                </label>
-              )
-            })}
-          </div>
-        </div>
-      )}
+        {/* Season stays hidden until seasons exist — that's why the control is
+            invisible before the first season is created, not a bug. */}
+        {show.season && seasonOptions.length > 0 && (
+          <label className="flex flex-col gap-1">
+            <span className={labelCls}>Season</span>
+            <MultiSelect<number>
+              className={selectCls}
+              value={value.seasons}
+              onChange={seasons => onChange({ ...value, seasons })}
+              options={seasonOptions.map(s => ({ value: s.id, label: s.name }))}
+              allLabel="All Time"
+              noun="seasons"
+              aria-label="Season"
+            />
+          </label>
+        )}
       </div>
 
       {/* THRESHOLD filters (right group) — confidence/inclusion knobs, not row
-          filters. These are HERO-FOCUSED tools, so they appear ONLY when a
-          specific hero is selected (value.hero !== ''). With "All heroes" they
-          stay hidden, because the aggregate view across every hero isn't what
+          filters. These are HERO-FOCUSED tools, so they appear ONLY when at
+          least one specific hero is selected. With "All Heroes" they stay
+          hidden, because the aggregate view across every hero isn't what
           they're for. A page still declares which thresholds it SUPPORTS via
           `show`; the hero gate decides WHEN they're visible. */}
-      {value.hero !== '' && (show.minGames || show.playtimePct) && (
+      {value.heroes.length > 0 && (show.minGames || show.playtimePct) && (
         <div className="flex flex-wrap gap-4">
           {show.minGames && (
             <label className="flex flex-col gap-1">
@@ -318,64 +326,30 @@ export default function AnalyticsFilters({
 // ============================================================
 // FILTER APPLICATION
 // ------------------------------------------------------------
-// Two ways to apply the same filter state, so every page filters identically.
-// Hero is applied per-page (it depends on the row's hero shape, which differs
-// between a flat `matches` read and the hero-grain views) — see notes below.
+// ONE path: a JS predicate over rows the page has already fetched. Hero is
+// applied separately (see heroMatches) because the hero field's name and shape
+// differ between a flat `matches` read and the hero-grain views.
 // ============================================================
 
-/**
- * PATH 1 — reading the `matches` table directly.
- * Returns a matchQuery() builder with the alpha rule + Queue/Mode/Map pushed in
- * as .eq() clauses. Chain .order()/.select-derived calls as usual.
- *
- *   const { data } = await applyMatchQueryFilters(
- *     'id, played_at, map, game_mode, result, role_played, match_format', f
- *   ).order('played_at', { ascending: false })
- *
- * NOTE: Hero is NOT applied here — the `matches` table has no single hero column
- * (heroes live in scoreboard_players / hero_performances / match_overview).
- * Pages that filter by hero join/merge that data and apply Hero in JS.
- */
-export function applyMatchQueryFilters(
-  columns: string,
-  f: AnalyticsFilterState,
-  opts?: { excludeLeavers?: boolean },
-) {
-  let q = matchQuery(columns)
-  // Queue: 6v6 is a format; a 5v5 role pins both format and role_played.
-  if (f.queue === '6v6') {
-    q = q.eq('match_format', '6v6')
-  } else if (f.queue !== 'all') {
-    q = q.eq('match_format', '5v5').eq('role_played', f.queue)
-  }
-  if (f.mode !== 'all') q = q.eq('game_mode', f.mode)
-  if (f.map !== '') q = q.eq('map', f.map)
-  // Season multi-select: [] = All Time (no filter); else restrict to those ids.
-  if (f.seasons.length > 0) q = q.in('season_id', f.seasons)
-  // Leaver exclusion (opt-in, performance surfaces only). A leaver game has
-  // team_leaver or enemy_leaver true; exclude both. Feel/Builder DON'T pass this
-  // (they analyse leaver games on purpose). The caller decides whether to exclude
-  // by reading showLeaverGames() — see leaver.ts — so the toggle is honoured.
-  if (opts?.excludeLeavers) {
-    q = q.eq('team_leaver', false).eq('enemy_leaver', false)
-  }
-  return q
-}
-
-/**
- * PATH 2 — JS predicate for already-fetched rows (e.g. SQL-view reads).
- * Applies Queue/Mode/Map. Hero is handled separately (see heroMatches) because
- * the hero field name/shape varies by view.
- */
 export interface FilterableMatch {
   match_format: '5v5' | '6v6'
   role_played: 'tank' | 'dps' | 'support'
   game_mode: string | null
   map: string | null
   // Optional: present on rows read from `matches` (and any view that SELECTs
-  // them). Used only when matchesFilters is called with { excludeLeavers: true }.
+  // them). Used only when matchesFilters is called with { applyExclusions: true }.
+  //
+  // (v1.1.0) The leaver BOOLEANS alone are not enough: they are true for both a
+  // permanent and a returned leaver, and those now have separate switches. A
+  // filtering surface should select EXCLUSION_COLS so the type and thrower
+  // columns come through too — with booleans only, isExcludedGame() falls back
+  // to treating every leaver as permanent.
   team_leaver?: boolean | null
   enemy_leaver?: boolean | null
+  team_leaver_type?: string | null
+  enemy_leaver_type?: string | null
+  team_thrower?: boolean | null
+  enemy_thrower?: boolean | null
   // Optional: present on rows carrying season_id. Used for the season filter;
   // a row without it is treated as season_id = null (only matched by All Time).
   season_id?: number | null
@@ -384,51 +358,68 @@ export interface FilterableMatch {
 export function matchesFilters<T extends FilterableMatch>(
   row: T,
   f: AnalyticsFilterState,
-  opts?: { excludeLeavers?: boolean }
+  opts?: { applyExclusions?: boolean }
 ): boolean {
+  // Queue — single-select, unchanged. 6v6 pins the format; a 5v5 role pins both
+  // the format and the role queued.
   if (f.queue === '6v6') {
     if (row.match_format !== '6v6') return false
   } else if (f.queue !== 'all') {
     if (row.match_format !== '5v5' || row.role_played !== f.queue) return false
   }
-  if (f.mode !== 'all' && row.game_mode !== f.mode) return false
-  if (f.map !== '' && row.map !== f.map) return false
-  // Season multi-select: [] = All Time (no filter); else the row's season_id must
-  // be one of the selected ids. A row with null/absent season_id only shows under
-  // All Time (it belongs to no specific season).
+  // Mode / Map — OR within each filter, AND between them. [] = no filter.
+  // A row with a null value is only ever matched by the empty (all) selection:
+  // it belongs to none of the ticked options, so ticking any of them excludes it.
+  if (f.modes.length > 0 && !(row.game_mode != null && (f.modes as string[]).includes(row.game_mode))) {
+    return false
+  }
+  if (f.maps.length > 0 && !(row.map != null && f.maps.includes(row.map))) {
+    return false
+  }
+  // Season — same rule. [] = All Time; a row with null/absent season_id belongs
+  // to no specific season and so only shows under All Time.
   if (f.seasons.length > 0 && !(row.season_id != null && f.seasons.includes(row.season_id))) {
     return false
   }
-  // Leaver exclusion (opt-in). Only filters when the row carries the flags; a row
-  // without them is treated as non-leaver (kept). The caller gates this on
-  // showLeaverGames() so the toggle is honoured.
-  if (opts?.excludeLeavers && (row.team_leaver === true || row.enemy_leaver === true)) {
+  // Excluded-games policy (opt-in). Delegates to @/lib/leaver, which owns all
+  // three switches — permanent leavers, returned leavers, throwers.
+  //
+  // ⚠️ (v1.1.0) THE CALLER NO LONGER DECIDES. This used to take a boolean the
+  // page computed from showLeaverGames(), which meant every page held a copy of
+  // the rule and a page could disagree with the others. It now takes a plain
+  // opt-in: pass applyExclusions and the user's current policy is applied.
+  //
+  // Surfaces that must see every game (Feel, Builder) stay exempt by NOT
+  // passing it — exemption by omission, so a new page is exempt only if it
+  // deliberately says nothing rather than by remembering to opt out.
+  //
+  // The row must carry the columns in EXCLUSION_COLS for this to distinguish
+  // permanent from returned leavers; see isExcludedGame() for what happens when
+  // it doesn't.
+  if (opts?.applyExclusions && isExcludedGame(row)) {
     return false
   }
   return true
 }
 
-/** Convenience: filter an array with matchesFilters (Queue/Mode/Map only). */
-export function applyFilters<T extends FilterableMatch>(
-  rows: T[],
-  f: AnalyticsFilterState,
-  opts?: { excludeLeavers?: boolean }
-): T[] {
-  return rows.filter(r => matchesFilters(r, f, opts))
-}
-
 /**
  * Hero predicate, applied per-page once the row's hero(es) are known.
  * `heroesInRow` is whatever heroes that row represents (one, or a list).
- * Returns true when no hero filter is active or the row includes the hero.
+ * Returns true when no hero filter is active or the row includes ANY selected hero.
+ *
+ * POOLED, per PATCH-SPEC §6.2. Ana + Kiriko ticked means a row counts if it
+ * involves either of them — their games pool into one set. It does NOT mean
+ * "every match where either appeared, including my other heroes' rows from
+ * those matches"; that would drag unselected heroes' data in through the back
+ * door. Rows are matched on the heroes they actually represent.
  */
 export function heroMatches(
   heroesInRow: string | string[] | null | undefined,
   f: AnalyticsFilterState
 ): boolean {
-  if (f.hero === '') return true
+  if (f.heroes.length === 0) return true
   if (heroesInRow == null) return false
   return Array.isArray(heroesInRow)
-    ? heroesInRow.includes(f.hero)
-    : heroesInRow === f.hero
+    ? heroesInRow.some(h => f.heroes.includes(h))
+    : f.heroes.includes(heroesInRow)
 }

@@ -69,11 +69,26 @@ export type Result = 'victory' | 'defeat' | 'draw'
 
 // ---- Filters (mirrors AnalyticsFilterState's relevant fields) ------
 // We accept the shared filter state but only read what matchups uses.
+//
+// (v1.1.0 Phase 2) mode and map became ARRAYS, matching the shared state, and
+// `seasons` was ADDED — this surface previously ignored the season filter
+// entirely, which was harmless only while one season existed.
+//
+// ⚠️ EMPTY ARRAY = NO FILTER, exactly as in AnalyticsFilterState. The old
+// sentinel here was the string 'all' while the shared state used '' for map and
+// hero, and reconciling the two in toMatchupFilters is what produced the v1.0.1
+// empty-page bug ('' ?? 'all' stayed '', so every row was rejected). There is
+// no sentinel left to translate: the bridge now copies arrays across unchanged.
 export type AttributionMode = 'all' | 'min1' | 'pct95'
 export interface MatchupFilters {
+  /** Single-select, unchanged: 5v5 and 6v6 never mix. */
   queue: 'all' | 'tank' | 'dps' | 'support' | '6v6'
-  mode: 'all' | string
-  map: 'all' | string
+  /** [] = all modes. OR within the list. */
+  modes: string[]
+  /** [] = all maps. OR within the list. */
+  maps: string[]
+  /** [] = All Time. Rows carry season_id; a null one shows only under All Time. */
+  seasons: number[]
   // how strictly to count a game as "me playing the anchor hero":
   //   all   = attribute to primary hero regardless of playtime
   //   min1  = require >=60s on the primary hero
@@ -136,13 +151,18 @@ export function passesFilters(
   r: {
     match_format: Format; user_role_played: Role | null
     game_mode: string | null; map: string | null
+    season_id?: number | null
     anchor_pct?: number | null; anchor_seconds?: number | null
   },
   f: MatchupFilters,
 ): boolean {
   if (!queuePredicate(f.queue)(r)) return false
-  if (f.mode !== 'all' && r.game_mode !== f.mode) return false
-  if (f.map !== 'all' && r.map !== f.map) return false
+  // Mode / Map / Season — OR within each list, AND between them. [] = no filter.
+  // A row whose value is null belongs to none of the ticked options, so ticking
+  // any of them excludes it; it shows only under the empty (all) selection.
+  if (f.modes.length > 0 && !(r.game_mode != null && f.modes.includes(r.game_mode))) return false
+  if (f.maps.length > 0 && !(r.map != null && f.maps.includes(r.map))) return false
+  if (f.seasons.length > 0 && !(r.season_id != null && f.seasons.includes(r.season_id))) return false
   // attribution: how committed was I to the primary (anchor) hero?
   // If the playtime fields are absent (older data / null), we DON'T
   // exclude — absence shouldn't silently drop games. 'all' never filters.
@@ -192,6 +212,140 @@ export function aggregateSingles(
   }
 
   return [...byHero.values()].map((e) => finalizeCell(e.cell))
+}
+
+// ====================================================================
+// STANDOUTS  (v1.1.0 Phase 5) — impressed allies / troublesome enemies
+// ====================================================================
+// Subjective post-match picks, rendered as two lists of five tiles.
+//
+// WHY THESE LIVE ON THIS PAGE: the denominator. "I struggled with Sombra"
+// is meaningless as a raw count — what matters is "flagged in 4 of the 12
+// matches where Sombra was on the enemy team". Games-where-hero-appeared-
+// by-relation is exactly what aggregateSingles() already produces, so the
+// rate is a join rather than a second aggregation that could drift from
+// the win rates sitting beside it.
+//
+// SCOPE follows the page: pass the same `filters` and `anchorHero` used for
+// the ranked lists and the tiles re-scope with them for free. anchorHero
+// null = every game; a hero = only games where that hero was played.
+//
+// THE TWO LISTS ARE NEVER MERGED. You flag an ally who IMPRESSED and an
+// enemy who gave TROUBLE — there is no "ally who played badly" pick, so
+// they are not mirror images and must not be presented as one scale.
+export type StandoutKind = 'impressed_ally' | 'struggled_enemy'
+
+// One match_standouts row, trimmed to what this file needs.
+export interface StandoutRow {
+  match_id: number
+  kind: StandoutKind
+  slot: number
+  hero_name: string | null   // null until resolved at save time
+}
+
+export interface StandoutCell {
+  hero: string
+  role: Role
+  picks: number            // matches where this hero was flagged
+  appearances: number      // matches where this hero appeared, same relation
+  rate: number | null      // picks / appearances as 0..100, 2dp
+  winRate: number | null   // carried across so the tile can sit beside it
+  lowConfidence: boolean   // appearances < CONFIDENCE_MIN_GAMES — dim, don't hide
+}
+
+/**
+ * Rank standout picks for one kind.
+ *
+ * `cells` must be the aggregateSingles() output for the MATCHING relation —
+ * 'ally' for impressed_ally, 'enemy' for struggled_enemy — computed with the
+ * same filters and anchor. That is where both the denominator and the win rate
+ * come from, so the tiles cannot disagree with the lists above them.
+ *
+ * ⚠️ SELF-PICKS ARE DROPPED. Ally slots are 1–5 (1–6 in 6v6) and include YOUR
+ * OWN slot, so a pick can resolve to a hero you were playing. Those have no
+ * denominator here — aggregateSingles emits cells for OTHER heroes, never
+ * yours — and would render as a tile with picks over zero appearances.
+ * `userHeroesByMatch` supplies your heroes per match so they can be excluded.
+ * A match can hold SEVERAL of your heroes (a swap game), hence a set per match.
+ *
+ * A hero can be flagged at most once per match per kind — the table's
+ * unique (match_id, kind, slot) allows two slots to resolve to the same hero
+ * only across teams, so picks are deduped by match anyway.
+ */
+export function aggregateStandouts(
+  standouts: StandoutRow[],
+  kind: StandoutKind,
+  cells: Cell[],
+  inScopeMatchIds: Set<number>,
+  userHeroesByMatch: Map<number, Set<string>>,
+): StandoutCell[] {
+  const byHero = new Map<string, Set<number>>()
+
+  for (const s of standouts) {
+    if (s.kind !== kind) continue
+    if (s.hero_name == null) continue          // unresolved pick — not chartable
+    if (!inScopeMatchIds.has(s.match_id)) continue
+    // Self-pick guard — see the warning above.
+    if (userHeroesByMatch.get(s.match_id)?.has(s.hero_name)) continue
+    let seen = byHero.get(s.hero_name)
+    if (!seen) { seen = new Set(); byHero.set(s.hero_name, seen) }
+    seen.add(s.match_id)                        // distinct matches, not raw rows
+  }
+
+  const cellByHero = new Map(cells.map(c => [c.hero, c]))
+  const out: StandoutCell[] = []
+  for (const [hero, matchIds] of byHero) {
+    const c = cellByHero.get(hero)
+    // No matching cell means the hero was flagged in a game that the current
+    // filters exclude from the pair rows. Skip rather than show a rate over an
+    // unknown denominator.
+    if (!c) continue
+    const picks = matchIds.size
+    out.push({
+      hero,
+      role: c.role,
+      picks,
+      appearances: c.games,
+      rate: c.games > 0 ? Math.round((100 * picks / c.games) * 100) / 100 : null,
+      winRate: c.winRate,
+      lowConfidence: c.games < CONFIDENCE_MIN_GAMES,
+    })
+  }
+
+  // Rate first (that is the question being asked), then picks as the tiebreak
+  // so a 2-of-3 does not outrank a 7-of-12 on volume alone.
+  out.sort((a, b) => (b.rate ?? -1) - (a.rate ?? -1) || b.picks - a.picks || a.hero.localeCompare(b.hero))
+  return out
+}
+
+/** Distinct match ids among pair rows passing the filters (and anchor, if set).
+ *  This is the standouts' scope: it inherits alpha exclusion, the queue/mode/map
+ *  /season filters and the anchor from the same rows the lists are built from. */
+export function inScopeMatchIds(
+  rows: PairRow[],
+  filters: MatchupFilters,
+  anchorHero: string | null,
+): Set<number> {
+  const out = new Set<number>()
+  for (const r of rows) {
+    if (anchorHero !== null && r.anchor_hero !== anchorHero) continue
+    if (!passesFilters(r, filters)) continue
+    out.add(r.match_id)
+  }
+  return out
+}
+
+/** Your own heroes per match, for the self-pick guard. Built from every pair
+ *  row regardless of filters: whether a hero was YOURS is a fact about the
+ *  match, not a function of the current view. */
+export function userHeroesByMatch(rows: PairRow[]): Map<number, Set<string>> {
+  const m = new Map<number, Set<string>>()
+  for (const r of rows) {
+    let s = m.get(r.match_id)
+    if (!s) { s = new Set(); m.set(r.match_id, s) }
+    s.add(r.anchor_hero)
+  }
+  return m
 }
 
 // ---- Ranking: best / worst, top-N per role -------------------------
@@ -402,7 +556,21 @@ export function aggregateBoth(
 // ---- 6v6 2-2-2 conformance (drives the UI caveat) ------------------
 // For 6v6 ally team-sets, how many deviated from the assumed 2-2-2
 // once the user is added back? We can't see the user's hero in the set
-// (it's excluded), but we know their role (anchor_role); add it back.
+// (it's excluded), but we know their role; add it back.
+//
+// USES `user_role_played`, NOT `anchor_role`.
+// matchup_user emits ONE ROW PER HERO PLAYED (changed from a single
+// longest-played anchor per match). anchor_role is therefore per-HERO:
+// a 6v6 open-queue match where tank was played and then DPS produces two
+// ally rows with DIFFERENT anchor_role values. The distinct-match_id guard
+// below keeps whichever row arrives FIRST, and Postgres row order is not
+// stable -- so the same match could count as conforming on one load and
+// deviating on the next.
+//
+// user_role_played comes from matches.role_played: exactly one value per
+// match by construction, and it means "the role I queued". Both it and the
+// old anchor_role are approximations when two roles were genuinely played
+// in one open-queue game, but only this one is deterministic.
 export function conformance222(rows: TeamSetRow[]): { conforming: number; deviating: number; total: number } {
   let conforming = 0, deviating = 0, total = 0
   const seen = new Set<number>()
@@ -411,9 +579,9 @@ export function conformance222(rows: TeamSetRow[]): { conforming: number; deviat
     if (seen.has(r.match_id)) continue
     seen.add(r.match_id)
     total++
-    const t = r.n_tank + (r.anchor_role === 'tank' ? 1 : 0)
-    const d = r.n_dps + (r.anchor_role === 'dps' ? 1 : 0)
-    const s = r.n_support + (r.anchor_role === 'support' ? 1 : 0)
+    const t = r.n_tank + (r.user_role_played === 'tank' ? 1 : 0)
+    const d = r.n_dps + (r.user_role_played === 'dps' ? 1 : 0)
+    const s = r.n_support + (r.user_role_played === 'support' ? 1 : 0)
     if (t === 2 && d === 2 && s === 2) conforming++
     else deviating++
   }

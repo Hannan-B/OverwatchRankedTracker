@@ -4,8 +4,9 @@ import { useEffect, useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
 import { formatBritishDate } from '@/lib/date-format'
 import AlphaToggle from '@/components/AlphaToggle'
-import LeaverToggle from '@/components/LeaverToggle'
+import ExcludedGames from '@/components/ExcludedGames'
 import ThemeControl from '@/components/ThemeControl'
+import { CURRENT_QUESTION_SCALE, QUESTION_SCALE_LABELS } from '@/data/reference'
 
 // ============================================================
 // SETTINGS + SEASON MANAGEMENT (Phase 2)
@@ -13,13 +14,23 @@ import ThemeControl from '@/components/ThemeControl'
 // - Gamertag (display/scoreboard ID) — kept
 // - Default role — REMOVED (user plays all roles)
 // - Change password (Supabase auth.updateUser) — NEW
+// - Excluded games — three switches (v1.1.0), replacing the single leaver
+//   toggle: permanent leavers, returned leavers, throwers
 // - Season Management — NEW:
 //     create / edit seasons (name + start + end date)
 //     delete ONLY if no matches fall in that season
 //     date ranges may not overlap (validated before save)
 //
 // `seasons` table confirmed: id(bigint), name(text), start_date(date),
-// end_date(date), created_at. No migration needed.
+// end_date(date), created_at.
+//
+// (v1.1.0) `question_scale_version` (smallint, NOT NULL, default 1) added.
+// Which post-match question set a season was played under. NEW seasons are
+// stamped with CURRENT_QUESTION_SCALE from reference.ts automatically -- this
+// used to be a manual SQL step, and a manual step performed once every few
+// months is one you eventually forget. EDITING a season deliberately does NOT
+// restamp it: the questions a season was played under are a historical fact,
+// not a setting. Changing one is a deliberate SQL act.
 // ============================================================
 
 interface Season {
@@ -27,6 +38,7 @@ interface Season {
   name: string
   start_date: string // YYYY-MM-DD
   end_date: string
+  question_scale_version: number
 }
 
 // inclusive overlap test for two date ranges
@@ -63,7 +75,7 @@ export default function SettingsPage() {
   const loadSeasons = useCallback(async () => {
     const { data } = await supabase
       .from('seasons')
-      .select('id, name, start_date, end_date')
+      .select('id, name, start_date, end_date, question_scale_version')
       .order('start_date', { ascending: false })
     const list = (data as Season[]) || []
     setSeasons(list)
@@ -134,7 +146,10 @@ export default function SettingsPage() {
     if (editing) {
       await supabase.from('seasons').update({ name: name.trim(), start_date, end_date }).eq('id', editing.id)
     } else {
-      await supabase.from('seasons').insert({ name: name.trim(), start_date, end_date })
+      await supabase.from('seasons').insert({
+        name: name.trim(), start_date, end_date,
+        question_scale_version: CURRENT_QUESTION_SCALE,
+      })
     }
     setSeasonBusy(false)
     startNew()
@@ -213,6 +228,7 @@ export default function SettingsPage() {
         </div>
         <p className="text-xs text-ow-faint -mt-2">
           Matches auto-assign to a season by their real played date. Ranges can't overlap.
+          New seasons are saved with question set <span className="text-ow-muted">Q{CURRENT_QUESTION_SCALE}</span>.
         </p>
 
         {/* existing seasons */}
@@ -223,16 +239,39 @@ export default function SettingsPage() {
           {seasons.map(s => {
             const count = seasonCounts[s.id] || 0
             const isCurrent = s.start_date <= today && today <= s.end_date
+            const scale = s.question_scale_version ?? 1
+            // The safeguard: if the season you are ACTIVELY PLAYING was stamped
+            // with a different question set than the app now writes, the Feel
+            // page will look empty -- it reads the columns for the season's
+            // scale while uploads fill the columns for the current one. Nothing
+            // is lost, but it looks broken. Surface it here rather than let it
+            // be discovered weeks later.
+            const scaleMismatch = isCurrent && scale !== CURRENT_QUESTION_SCALE
             return (
               <div key={s.id} className="bg-ow-dark/60 rounded-lg p-3 flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <p className="font-display text-ow-fg tracking-wider truncate">{s.name}</p>
                     {isCurrent && <span className="text-[10px] bg-ow-orange text-ow-dark font-bold px-1.5 py-0.5 rounded font-display tracking-wider">CURRENT</span>}
+                    <span
+                      title={QUESTION_SCALE_LABELS[scale] ?? `Unknown question scale (${scale})`}
+                      className={`text-[10px] font-display tracking-wider px-1.5 py-0.5 rounded border ${
+                        scaleMismatch
+                          ? 'border-ow-defeat/60 text-ow-defeat'
+                          : 'border-ow-line text-ow-faint'
+                      }`}>
+                      Q{scale}
+                    </span>
                   </div>
                   <p className="text-xs text-ow-faint mt-0.5">
                     {formatBritishDate(s.start_date)} – {formatBritishDate(s.end_date)} · {count} match{count !== 1 ? 'es' : ''}
                   </p>
+                  {scaleMismatch && (
+                    <p className="text-[11px] text-ow-defeat mt-1">
+                      This season uses question set Q{scale}, but new matches are saved as
+                      Q{CURRENT_QUESTION_SCALE}. Feel analytics will look empty until this is corrected.
+                    </p>
+                  )}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <button onClick={() => startEdit(s)}
@@ -283,8 +322,8 @@ export default function SettingsPage() {
         </div>
       </section>
 
-      {/* ---------- LEAVER GAME VISIBILITY ---------- */}
-      <LeaverToggle />
+      {/* ---------- EXCLUDED GAMES (leavers x2 + throwers) ---------- */}
+      <ExcludedGames />
 
       {/* ---------- DEV: ALPHA DATA VISIBILITY (localhost only) ---------- */}
       <AlphaToggle />

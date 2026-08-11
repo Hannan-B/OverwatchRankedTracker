@@ -6,6 +6,14 @@ import { showAlpha } from '@/lib/alpha'
 import { formatBritishDateTime } from '@/lib/date-format'
 import { useRouter } from 'next/navigation'
 import type { Match, ScoreboardPlayer, HeroPerformance, HeroStat } from '@/lib/types'
+import {
+  scaleVersionOf,
+  bareLabel,
+  LABELS,
+  MATCHUP_FEEL_LABELS,
+  PERF_RATING_LABELS,
+  FUN6_LABELS,
+} from '@/app/analytics/feel/feel-lib'
 
 // ============================================================
 // MATCH DETAIL — /matches/[id]  (Phase 2 — v2)
@@ -52,6 +60,10 @@ export default function MatchDetailPage({ params }: { params: { id: string } }) 
   const [perfs, setPerfs] = useState<HeroPerformance[]>([])
   const [statsByPerf, setStatsByPerf] = useState<Record<number, HeroStat[]>>({})
   const [gamertag, setGamertag] = useState<string>('You')
+  // season_id → question_scale_version. Which question set a match was answered
+  // under is a property of its SEASON, never of which columns happen to be
+  // populated — see scaleVersionOf().
+  const [seasonVersions, setSeasonVersions] = useState<Map<number, number>>(new Map())
   const [loading, setLoading] = useState(true)
 
   const load = useCallback(async () => {
@@ -87,6 +99,12 @@ export default function MatchDetailPage({ params }: { params: { id: string } }) 
 
     const { data: us } = await supabase.from('user_settings').select('gamertag').limit(1).single()
     if (us?.gamertag) setGamertag(us.gamertag)
+
+    const { data: sv } = await supabase.from('seasons').select('id, question_scale_version')
+    const vmap = new Map<number, number>()
+    ;(sv as { id: number; question_scale_version: number | null }[] | null)
+      ?.forEach(s => { if (s.question_scale_version != null) vmap.set(s.id, s.question_scale_version) })
+    setSeasonVersions(vmap)
 
     setLoading(false)
   }, [matchId])
@@ -138,12 +156,52 @@ export default function MatchDetailPage({ params }: { params: { id: string } }) 
             <div className="bg-ow-panel rounded-xl p-5 border border-ow-line space-y-2 text-sm">
               <Row label="Role" value={match.role_played?.toUpperCase()} />
               <Row label="Format" value={match.match_format} />
-              {match.starting_side && <Row label="Started on" value={match.starting_side === 'attack' ? 'Attack' : 'Defense'} />}
+              {/* ⚠️ The COLUMN value stays the US-spelled 'defense' — it is a database
+                  enum. Only the rendered string is British. (v1.1.0 Phase 6, item #20) */}
+              {match.starting_side && <Row label="Started on" value={match.starting_side === 'attack' ? 'Attack' : 'Defence'} />}
               {match.game_length_seconds != null && (
                 <Row label="Length" value={`${Math.floor(match.game_length_seconds / 60)}:${String(match.game_length_seconds % 60).padStart(2, '0')}`} />
               )}
-              {match.fun_rating != null && (
-                <Row label="Fun" value={<span className="text-ow-orange">{'★'.repeat(match.fun_rating)}<span className="text-ow-faint">{'★'.repeat(5 - match.fun_rating)}</span></span>} />
+              {/* ── FEEL ──────────────────────────────────────────────────
+                  (v1.1.0 Phase 4) Version 1 and version 2 ask DIFFERENT
+                  questions on DIFFERENT scales, so exactly one set renders —
+                  chosen by the match's SEASON via scaleVersionOf(), never by
+                  sniffing which columns are populated.
+
+                  ⚠️ Previously this showed only `fun_rating` as five stars. A
+                  version-2 match has fun_rating NULL and fun_rating_6 set, so
+                  the guard failed and the Fun row VANISHED with no indication
+                  anything was missing — and matchup_feel / performance_rating,
+                  now the main qualitative fields, appeared nowhere at all.
+
+                  Values render as LABELS, not numbers: "4" means different
+                  things on a 5-point and a 6-point scale, and on a single match
+                  there is no axis for the number to order against. bareLabel()
+                  strips the rank prefix the chart maps carry. */}
+              {scaleVersionOf(match, seasonVersions) === 2 ? (
+                <>
+                  {bareLabel(MATCHUP_FEEL_LABELS, match.matchup_feel) && (
+                    <Row label="Match-up" value={bareLabel(MATCHUP_FEEL_LABELS, match.matchup_feel)} />
+                  )}
+                  {bareLabel(PERF_RATING_LABELS, match.performance_rating) && (
+                    <Row label="Performance" value={bareLabel(PERF_RATING_LABELS, match.performance_rating)} />
+                  )}
+                  {bareLabel(FUN6_LABELS, match.fun_rating_6) && (
+                    <Row label="Fun" value={<span className="text-ow-orange">{bareLabel(FUN6_LABELS, match.fun_rating_6)}</span>} />
+                  )}
+                </>
+              ) : (
+                <>
+                  {match.match_feel && <Row label="Match feel" value={LABELS[match.match_feel] ?? match.match_feel} />}
+                  {match.performance_feel && <Row label="Performance" value={LABELS[match.performance_feel] ?? match.performance_feel} />}
+                  {/* Version 1 fun keeps its stars: it was CAPTURED as a 5-star
+                      rating and has no label map, so stars are what it means.
+                      Version 2 deliberately dropped stars — they invite the lazy
+                      middle the 6-point no-midpoint scale exists to remove. */}
+                  {match.fun_rating != null && (
+                    <Row label="Fun" value={<span className="text-ow-orange">{'★'.repeat(match.fun_rating)}<span className="text-ow-faint">{'★'.repeat(5 - match.fun_rating)}</span></span>} />
+                  )}
+                </>
               )}
               {match.personal_thoughts && (
                 <div className="pt-2 border-t border-ow-line">

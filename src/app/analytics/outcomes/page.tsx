@@ -7,7 +7,7 @@ import {
 } from 'recharts'
 import { supabase } from '@/lib/supabase'
 import { matchQuery } from '@/lib/alpha'
-import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
+import { loadExclusionPrefs, EXCLUSION_COLS } from '@/lib/leaver'
 import { defaultSeasonSelection } from '@/lib/season-util'
 import AnalyticsFilters, {
   DEFAULT_FILTERS,
@@ -17,6 +17,7 @@ import AnalyticsFilters, {
   type SeasonOption,
 } from '@/components/AnalyticsFilters'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
+import { GAME_MODE_CONFIG, type GameMode } from '@/data/reference'
 import { useChartColors } from '@/components/useChartColors'
 import { type ChartColors } from '@/lib/chart-theme'
 
@@ -47,7 +48,7 @@ interface OutcomeMatch extends FilterableMatch {
   season_id: number | null
 }
 
-const MATCH_COLS = 'id, result, role_played, match_format, game_mode, map, starting_side, played_at, season_id, team_leaver, enemy_leaver'
+const MATCH_COLS = 'id, result, role_played, match_format, game_mode, map, starting_side, played_at, season_id, ' + EXCLUSION_COLS
 // Hero-grain rows, only to resolve "which matches did I play hero X in" for the
 // Hero filter (matches has no hero column). Alpha excluded via match_id.
 const HERO_COLS = 'match_id, hero_name'
@@ -173,7 +174,7 @@ export default function OutcomesPage() {
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    loadLeaverPref().then(() => { if (!cancelled) setLeaverReady(true) })
+    loadExclusionPrefs().then(() => { if (!cancelled) setLeaverReady(true) })
     Promise.all([
       matchQuery(MATCH_COLS).order('played_at', { ascending: false }),
       supabase.from('hero_match_facts').select(HERO_COLS),
@@ -204,20 +205,36 @@ export default function OutcomesPage() {
     return m
   }, [heroRows])
 
-  // Apply shared Queue/Mode/Map filters, then the Hero filter (a match counts if
-  // the selected hero was played in it at all — the honest reading for outcomes).
+  // Apply shared Queue/Mode/Map/Season filters, then the Hero filter (a match
+  // counts if any selected hero was played in it at all — the honest reading for
+  // outcomes).
+  //
+  // (v1.1.0 Phase 2) POOLED across the selected heroes, per PATCH-SPEC §6.2:
+  // the id sets are UNIONED, not intersected. Ana + Kiriko ticked means "games
+  // with either of them", not "games where both were played" — the latter would
+  // return almost nothing and isn't what ticking two heroes asks for.
   const rows = useMemo(() => {
-    const excludeLeavers = !showLeaverGames()
-    const base = matches.filter(m => matchesFilters(m, filters, { excludeLeavers }))
-    if (filters.hero === '') return base
-    const ids = matchIdsByHero.get(filters.hero)
-    if (!ids) return []
+    // The page opts in; @/lib/leaver owns which games are excluded, so every
+    // performance surface agrees rather than each holding its own copy.
+    const base = matches.filter(m => matchesFilters(m, filters, { applyExclusions: true }))
+    if (filters.heroes.length === 0) return base
+    const ids = new Set<number>()
+    for (const h of filters.heroes) {
+      const s = matchIdsByHero.get(h)
+      if (s) for (const id of s) ids.add(id)
+    }
+    if (ids.size === 0) return []
     return base.filter(m => ids.has(m.id))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matches, filters, matchIdsByHero, leaverReady])
 
   // Queue narrowed to a specific format → the 5v5/6v6 chart is redundant.
   const queueIsFormatSpecific = filters.queue !== 'all'
+
+  // Does the attack/defence panel apply to this selection? See the panel for why
+  // this is "any selected mode" rather than "every selected mode".
+  const sideApplies = filters.modes.length === 0
+    || filters.modes.some(m => GAME_MODE_CONFIG[m as GameMode]?.needsStartingSide)
 
   const byMode = useMemo(() => byCategory(rows, m => m.game_mode, filters.minGames), [rows, filters.minGames])
   const byMap = useMemo(() => byCategory(rows, m => m.map, filters.minGames), [rows, filters.minGames])
@@ -291,7 +308,7 @@ export default function OutcomesPage() {
     <div className="space-y-6">
       <AnalyticsHeader
         title="Outcomes"
-        subtitle="Win rate by mode, map, role; 5v5 vs 6v6; result mix; attack vs defense."
+        subtitle="Win rate by mode, map, role; 5v5 vs 6v6; result mix; attack vs defence."
       />
       <AnalyticsNav />
 
@@ -330,7 +347,21 @@ export default function OutcomesPage() {
                         {resultMix.map((d, i) => <Cell key={i} fill={d.color} />)}
                       </Pie>
                       <Tooltip {...tooltipStyleOf(c)} formatter={(v, n) => [`${v} games`, String(n)]} />
-                      <Legend wrapperStyle={{ fontSize: 12 }} />
+                      {/* (v1.1.0 Phase 6) The legend carries the COUNT. A donut shows
+                          proportion and nothing else, so "Victory / Defeat / Draw"
+                          read identically whether it summarised 8 games or 800 — the
+                          one number that decides how much to trust the slices was the
+                          one number not on screen. The tooltip had it, but only on
+                          hover, which a screenshot doesn't keep.
+                          ⚠️ Read from `resultMix`, the same array the Pie renders, so
+                          the legend cannot report a different total than the chart.
+                          Zero-count results are already filtered out of that array, so
+                          a slice named here always has n ≥ 1. */}
+                      <Legend wrapperStyle={{ fontSize: 12 }}
+                        formatter={(value) => {
+                          const slice = resultMix.find(d => d.name === value)
+                          return slice ? `${value} · n=${slice.value}` : String(value)
+                        }} />
                     </PieChart>
                   </ResponsiveContainer>
                 </div>
@@ -342,8 +373,28 @@ export default function OutcomesPage() {
             <WinRateBars data={byMap} label="map" />
           </Panel>
 
-          <Panel title="Attack vs defense, per map" hint="win rate by starting side">
-            {sideByMap.length === 0 ? <Empty label="attack/defense" /> : (
+          {/* (v1.1.0 Phase 4) The attack/defence panel is HIDDEN when no selected
+              mode can have a starting side — pick Control and it disappears
+              rather than sitting there permanently empty.
+
+              ⚠️ THE RULE HERE IS "ANY", AND ON heroes/[name] IT IS "EVERY".
+              That is deliberate, not an inconsistency. There, Side is a FILTER:
+              under an "any" rule, selecting Escort + Control and then Attack
+              would silently delete every Control game. Here it is a DESCRIPTION
+              grouped by map — with Escort + Control selected it simply shows the
+              escort maps, which is true and useful rather than misleading. A
+              filter that deletes data and a panel that reports it need opposite
+              tests.
+
+              With no modes selected (= all modes) it shows, because some modes
+              do have sides.
+
+              ⚠️ Expect it to be EMPTY on all historical data regardless:
+              starting_side is NULL on all 192 pre-Season-4 matches (the upload
+              stale closure, fixed in Phase 1 — no backfill possible). */}
+          {sideApplies && (
+            <Panel title="Attack vs defence, per map" hint="win rate by starting side">
+            {sideByMap.length === 0 ? <Empty label="attack/defence" /> : (
               <div style={{ height: Math.max(180, sideByMap.length * 40 + 40) }}>
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={sideByMap} layout="vertical" margin={{ top: 4, right: 40, bottom: 4, left: 8 }}>
@@ -360,12 +411,13 @@ export default function OutcomesPage() {
                       }} />
                     <Legend wrapperStyle={{ fontSize: 12 }} />
                     <Bar dataKey={(d: { attack: number | null }) => d.attack ?? 0} name="Attack" fill={c.primary} radius={[0, 4, 4, 0]} isAnimationActive={false} />
-                    <Bar dataKey={(d: { defense: number | null }) => d.defense ?? 0} name="Defense" fill={c.categorical[3]} radius={[0, 4, 4, 0]} isAnimationActive={false} />
+                    <Bar dataKey={(d: { defense: number | null }) => d.defense ?? 0} name="Defence" fill={c.categorical[3]} radius={[0, 4, 4, 0]} isAnimationActive={false} />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
             )}
           </Panel>
+          )}
 
           <Panel title="Win rate by day of week" hint="Mon → Sun · your local time">
             <WinRateBars data={byDayOfWeek} label="day of week" />

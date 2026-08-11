@@ -20,6 +20,7 @@
 import type {
   ScoreboardOcrAnalysis,
   ScoreboardPlayerStats,
+  ScoreboardHeroIdentification,
   ScoreboardGrid,
 } from './types'
 import type { SbCellConfidence } from './scoreboard-extractor'
@@ -45,6 +46,15 @@ export type SignalKind =
   | 'phase_disagreement'    // tier 3: Phase-1 != Pass-1 hero ID
   | 'low_user_margin'       // tier 3: username best-vs-runner-up margin narrow
   | 'sampled_summary'       // tier 4: routine spot-check on a clean field
+  // ── Deterministic coherence checks (v1.0.2) ──
+  // These need no confidence score and no ground truth: they are facts about
+  // the game that a correct extraction cannot violate. Measured against the
+  // 6v6 ground-truth set they fired on 4 real errors with ZERO false positives
+  // across 324 slots. They are tier 1 because a check that is certain should
+  // never lose a question slot to a probabilistic one.
+  | 'duplicate_hero'        // tier 1: same hero twice on ONE team (cross-team is legal)
+  | 'user_hero_absent'      // tier 1: user's scoreboard hero not among the heroes played
+  | 'row_count_bad'         // tier 1: scoreboard row count != 10 (5v5) / 12 (6v6)
 
 export type FieldKind =
   | 'scoreboard'
@@ -86,6 +96,9 @@ export const SIGNAL_TIER: Record<SignalKind, 1 | 2 | 3 | 4> = {
   phase_disagreement: 3,
   low_user_margin: 3,
   sampled_summary: 4,
+  duplicate_hero: 1,
+  user_hero_absent: 1,
+  row_count_bad: 1,
 }
 
 export interface HighlightRegion {
@@ -122,6 +135,11 @@ export interface ConfirmationCandidate {
    *  hybrid map) prompts an inline attack/defend follow-up before the card
    *  resolves. The chosen side rides back on ConfirmationResult.sideValue. */
   requiresSideFollowUp?: boolean
+  /** Scoreboard slot this candidate refers to, where it refers to one.
+   *  Set on hero_id and scoreboard-cell candidates so onBetaComplete can write
+   *  an answer back to the right row WITHOUT parsing it out of `id`. The id is
+   *  a display/dedupe key and must not become a data channel. */
+  slot?: number
 }
 
 // ── Config ───────────────────────────────────────────────────
@@ -140,6 +158,30 @@ export interface BetaConfirmConfig {
    *  low playtime it is mathematically unstable (a hero played <1–2min has a
    *  meaningless per-10min figure), which was the main false-positive source. */
   avgMinPlaytimeSeconds: number
+  /** (v1.0.2) Restrict confirmation to hero identification only.
+   *  ----------------------------------------------------------------
+   *  Everything the extraction pipeline produces EXCEPT hero identity is now
+   *  measured correct: against the 29-match 6v6 ground truth, all 1,944
+   *  numeric scoreboard cells, all 324 is_user flags, all 116 map/result/
+   *  score/game-length fields and all 47 play_time_seconds values matched
+   *  exactly. Hero identity was the only defective field, and the questions
+   *  asked about everything else were overwhelmingly false alarms — 94 logged
+   *  avg_crosscheck_fail events were ALL confirmed_correct.
+   *
+   *  With this true, buildConfirmationQuestions returns ONLY hero-identity
+   *  candidates (and the deterministic checks that invalidate them), and a
+   *  clean match asks NOTHING rather than a routine spot-check.
+   *
+   *  ⚠️ TRADE-OFF, read before leaving this on. Two suppressed checks are the
+   *  ONLY recovery path for their field, and both have write-backs in
+   *  onBetaComplete that become unreachable:
+   *    · map_detect_fail  — a missed map is never recovered; the map drives
+   *                         starting_side and game_mode.
+   *    · result_conflict  — an unreadable or contradicted win/loss banner is
+   *                         never corrected; result feeds win-rate everywhere.
+   *  Both fire rarely and cost ~1 question when they do. Set this to false to
+   *  restore them; the code for every suppressed check is intact, not deleted. */
+  heroIdentificationOnly: boolean
 }
 
 export const DEFAULT_CONFIG: BetaConfirmConfig = {
@@ -152,6 +194,10 @@ export const DEFAULT_CONFIG: BetaConfirmConfig = {
   // band absorbs the remaining rounding noise above the floor).
   avgTolerance: 0.40,
   avgMinPlaytimeSeconds: 150,
+  // v1.0.2: hero identity is the only field the pipeline gets wrong, so it is
+  // the only field worth asking about. See the field doc above for the two
+  // recovery paths this suppresses.
+  heroIdentificationOnly: true,
 }
 
 // ── Date check constants (step 3) ────────────────────────────
@@ -192,9 +238,17 @@ export interface ConfirmInputs {
   lowConfHeroSlots?: number[]
   /** Slots where Phase-1 != Pass-1 hero id disagreed (slot numbers). */
   phaseDisagreementSlots?: number[]
+  /** Per-slot hero identification incl. match confidence. Used by the
+   *  duplicate-hero check to decide WHICH of a duplicated pair to ask about
+   *  (the lower-confidence one) rather than asking about both. */
+  scoreboardHeroes?: ScoreboardHeroIdentification[]
   /** Reference lists for unrecognized map/mode detection. */
   knownMaps?: string[]
   knownModes?: string[]
+  /** Canonical roster, passed in rather than imported so this module stays
+   *  domain-lookup-free (same rationale as knownMaps). When present, hero_id
+   *  cards offer a role-filtered dropdown instead of a free-text box. */
+  knownHeroes?: { name: string; role: 'tank' | 'dps' | 'support' }[]
   /** Step 10: the phone's map auto-detect returned null at upload (so the
    *  attack/defend question was skipped). Set from metadata.map_detect_missed.
    *  Combined with a null/unrecognized laptop OCR map, this raises the map
@@ -510,6 +564,123 @@ function scoreboardPortraitRegion(inp: ConfirmInputs, slot: number): HighlightRe
   return { imageUrl: inp.scoreboardImageUrl, box: { x: x / W, y: y / H, w: w / W, h: h / H } }
 }
 
+/** Role-filtered hero dropdown for a slot, when the roster was supplied.
+ *  Returns undefined when unavailable so the card falls back to free text. */
+function heroOptionsForSlot(inp: ConfirmInputs, slot: number): string[] | undefined {
+  if (!inp.knownHeroes || inp.knownHeroes.length === 0) return undefined
+  const role = inp.scoreboardStats?.find(p => p.slot === slot)?.role ?? null
+  // Role comes from the row's icon, which is independent of the portrait match,
+  // so it stays trustworthy even when the hero is wrong. If it is missing,
+  // offer the whole roster rather than guess.
+  const pool = role ? inp.knownHeroes.filter(h => h.role === role) : inp.knownHeroes
+  const names = pool.map(h => h.name).sort((a, b) => a.localeCompare(b))
+  return names.length > 0 ? names : undefined
+}
+
+/** Deterministic coherence checks — certainties, not confidence scores.
+ *  ------------------------------------------------------------------
+ *  Each of these is a fact about how the game works that a correct read
+ *  cannot violate, so they need no threshold and no ground truth. Measured
+ *  against the 6v6 ground-truth set (324 slots) they flagged 4 real errors
+ *  with zero false positives.
+ *
+ *  NOT included, deliberately: any check on team ROLE SHAPE. 6v6 here is open
+ *  queue — Test 23's enemy team is 2-3-1 — so a "must be 2-2-2" rule would
+ *  manufacture errors. Cross-team duplicate heroes are likewise LEGAL (Test 23
+ *  has Anran and Bastion on both sides), which is why 5a groups by team.
+ */
+function coherenceCandidates(inp: ConfirmInputs): ConfirmationCandidate[] {
+  const out: ConfirmationCandidate[] = []
+  const stats = inp.scoreboardStats
+  if (!stats || stats.length === 0) return out
+
+  const confidenceFor = (slot: number) =>
+    inp.scoreboardHeroes?.find(h => h.slot === slot)?.confidence ?? 0
+
+  // ── A. Same hero twice on one team ──
+  // One of the pair is wrong. Ask about the LOWER-confidence slot(s) and leave
+  // the best-scoring one alone, so a duplicate costs one question, not two.
+  const byTeamHero = new Map<string, ScoreboardPlayerStats[]>()
+  for (const p of stats) {
+    if (!p.heroName) continue
+    const key = `${p.team}::${p.heroName}`
+    const list = byTeamHero.get(key)
+    if (list) list.push(p)
+    else byTeamHero.set(key, [p])
+  }
+  for (const [key, group] of byTeamHero) {
+    if (group.length < 2) continue
+    const heroName = key.split('::')[1]
+    const ranked = [...group].sort((a, b) => confidenceFor(b.slot) - confidenceFor(a.slot))
+    for (const p of ranked.slice(1)) {
+      out.push({
+        id: `hero:slot${p.slot}:duplicate`,
+        slot: p.slot,
+        field: 'hero_id',
+        fieldDetail: `${positionalLabel(stats, p.slot)} — hero identity`,
+        signal: 'duplicate_hero',
+        tier: 1,
+        region: scoreboardPortraitRegion(inp, p.slot),
+        extractedValue: p.heroName ?? '?',
+        confidence: confidenceFor(p.slot),
+        options: heroOptionsForSlot(inp, p.slot),
+        note: `${heroName} appears twice on the ${p.team} team. A team cannot run the same hero twice, so one of these two rows is wrong — this is the lower-scoring one.`,
+      })
+    }
+  }
+
+  // ── B. The user's scoreboard hero is not among the heroes they played ──
+  // heroes_played comes from the summary screen and the breakdown pages, which
+  // are read by a different pipeline from the portrait matcher, so this is a
+  // genuinely independent cross-check. Skipped when that list is empty (a
+  // failed summary read would otherwise flag every match).
+  const played = new Set(
+    [
+      ...(inp.summary?.heroNames ?? []),
+      ...(inp.breakdowns ?? []).map(b => b.heroName),
+    ]
+      .filter((n): n is string => !!n)
+      .map(n => n.toLowerCase()),
+  )
+  const userRow = stats.find(p => p.isUser)
+  if (played.size > 0 && userRow?.heroName && !played.has(userRow.heroName.toLowerCase())) {
+    out.push({
+      id: `hero:slot${userRow.slot}:notplayed`,
+      slot: userRow.slot,
+      field: 'hero_id',
+      fieldDetail: `Your row (slot ${userRow.slot}) — hero identity`,
+      signal: 'user_hero_absent',
+      tier: 1,
+      region: scoreboardPortraitRegion(inp, userRow.slot),
+      extractedValue: userRow.heroName,
+      confidence: confidenceFor(userRow.slot),
+      options: heroOptionsForSlot(inp, userRow.slot),
+      note: `Your row reads ${userRow.heroName}, but the heroes you played this match were: ${[...played].join(', ')}. Those come from a different screen, so one of the two reads is wrong.`,
+    })
+  }
+
+  // ── C. Wrong number of scoreboard rows ──
+  // Structural, and NOT fixable from the card — the grid detection failed and
+  // the whole scoreboard is suspect. Raised at tier 1 so it cannot be missed
+  // before saving; the useful response is usually to abandon and re-shoot the
+  // batch rather than to answer.
+  const expectedRows = inp.format === '6v6' ? 12 : 10
+  if (stats.length !== expectedRows) {
+    out.push({
+      id: `scoreboard:rowcount`,
+      field: 'scoreboard',
+      fieldDetail: `Scoreboard row count`,
+      signal: 'row_count_bad',
+      tier: 1,
+      region: inp.scoreboardImageUrl ? { imageUrl: inp.scoreboardImageUrl } : null,
+      extractedValue: `${stats.length} rows`,
+      note: `A ${inp.format} scoreboard must have ${expectedRows} rows but ${stats.length} were detected. Grid detection failed, so every value on this scoreboard is suspect — consider discarding this batch rather than saving it.`,
+    })
+  }
+
+  return out
+}
+
 function heroIdCandidates(inp: ConfirmInputs): ConfirmationCandidate[] {
   const out: ConfirmationCandidate[] = []
   const seen = new Set<number>()
@@ -518,12 +689,14 @@ function heroIdCandidates(inp: ConfirmInputs): ConfirmationCandidate[] {
     seen.add(slot)
     out.push({
       id: `hero:slot${slot}:lowconf`,
+      slot,
       field: 'hero_id',
       fieldDetail: `${positionalLabel(inp.scoreboardStats, slot)} — hero identity`,
       signal: 'low_hero_conf',
       tier: 3,
       region: scoreboardPortraitRegion(inp, slot),
       extractedValue: inp.scoreboardStats?.find(p => p.slot === slot)?.heroName ?? '?',
+      options: heroOptionsForSlot(inp, slot),
       note: 'Portrait match scored below the confidence gate.',
     })
   }
@@ -531,12 +704,14 @@ function heroIdCandidates(inp: ConfirmInputs): ConfirmationCandidate[] {
     if (seen.has(slot)) continue   // don't double-ask the same slot
     out.push({
       id: `hero:slot${slot}:phasedisagree`,
+      slot,
       field: 'hero_id',
       fieldDetail: `${positionalLabel(inp.scoreboardStats, slot)} — hero identity`,
       signal: 'phase_disagreement',
       tier: 3,
       region: scoreboardPortraitRegion(inp, slot),
       extractedValue: inp.scoreboardStats?.find(p => p.slot === slot)?.heroName ?? '?',
+      options: heroOptionsForSlot(inp, slot),
       note: 'Phase-1 and Pass-1 hero identification disagreed.',
     })
   }
@@ -740,6 +915,11 @@ export function buildConfirmationQuestions(
   inp: ConfirmInputs,
   cfg: BetaConfirmConfig = DEFAULT_CONFIG,
 ): ConfirmationCandidate[] {
+  // NOTE: mapDetect / unrecognized are computed before the hero-only branch
+  // because the suppression rule between them (dropdown supersedes the plain
+  // unknown_map card) must stay correct if heroIdentificationOnly is turned
+  // off again. They cost one pass over the inputs and are discarded when the
+  // flag is on.
   const mapDetect = mapDetectCandidate(inp)
   // When the map dropdown question is raised, suppress the plain unknown_map
   // confirm/correct candidate (the dropdown supersedes it — same field, better
@@ -748,14 +928,44 @@ export function buildConfirmationQuestions(
     ? unrecognizedCandidates(inp).filter(c => !c.id.startsWith('unknown_map:'))
     : unrecognizedCandidates(inp)
 
+  // Deterministic checks first. They are certainties, so when one claims a
+  // slot the probabilistic hero checks for that same slot are dropped —
+  // otherwise a duplicated hero could burn two question slots asking the same
+  // thing twice with different wording.
+  const coherence = coherenceCandidates(inp)
+  const coherenceSlots = new Set(
+    coherence.map(c => c.slot).filter((n): n is number => typeof n === 'number'),
+  )
+  const heroIds = heroIdCandidates(inp).filter(
+    c => typeof c.slot !== 'number' || !coherenceSlots.has(c.slot),
+  )
+
+  // ── Hero-identification-only mode (v1.0.2 default) ──
+  // Returns hero-identity candidates plus the deterministic checks, and
+  // NOTHING else. A clean match asks no questions at all — the routine
+  // spot-check is skipped too, since spot-checking a field measured correct
+  // on 1,944 of 1,944 cells only spends the user's attention.
+  //
+  // row_count_bad is retained here even though its field is 'scoreboard'
+  // rather than 'hero_id': a wrong row count means grid detection failed, so
+  // every hero on that scoreboard is unreliable. It is a precondition for
+  // hero identification being meaningful at all, not a separate concern.
+  // Drop it from `coherence` below if you want strictly hero_id and nothing more.
+  if (cfg.heroIdentificationOnly) {
+    const heroOnly = [...coherence, ...heroIds]
+    heroOnly.sort((a, b) => (a.tier - b.tier) || withinTierSort(a, b))
+    return heroOnly.slice(0, cfg.maxQuestions)
+  }
+
   const priority: ConfirmationCandidate[] = [
+    ...coherence,
     ...mapDetect,
     ...resultConflictCandidate(inp),
     ...unrecognized,
     ...dateCandidate(inp),
     ...scoreboardVoteSplitCandidates(inp),
     ...avgCrossCheckCandidates(inp, cfg),
-    ...heroIdCandidates(inp),
+    ...heroIds,
     ...userMarginCandidate(inp),
   ]
 

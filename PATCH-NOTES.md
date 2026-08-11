@@ -9,6 +9,247 @@
 
 ---
 
+## v1.1.0 — released 11 August 2026
+
+The "mega patch". Six phases, one push. A redesigned feel-question set on new columns, a
+filter system converted from scalars to arrays, three-state leaver tracking, post-match
+standout picks, and a correctness pass. **DB change? Yes** — one enum, one new table, six new
+columns across three tables, and two view rebuilds.
+
+⚠️ **The version-2 question set only applies from Season 4 onward.** Season 3 and earlier
+read the version-1 set. `seasons.question_scale_version` is the sole authority for which set a
+match belongs to, and **the two scales are never pooled or averaged together.**
+
+| # | Area | Symptom | Fix | DB change? |
+|---|------|---------|-----|-----------|
+| 1 | Feel questions | Tempo/coordination unanswerable for multi-round games and being clicked through without thought | Both retired; five-question v2 set on NEW columns, old enums frozen | **Yes** (3 columns + version flag) |
+| 2 | Leaver tracking | A leaver who reconnects was indistinguishable from one who never returned | `leaver_type` enum, three states; permanent discards the scoreboard, returned keeps it | **Yes** (enum + 2 columns) |
+| 3 | Standout picks | No record of which hero stood out in a match | `match_standouts` child table + post-match slot picks + Matchups tiles | **Yes** (new table) |
+| 4 | Filters | Mode/map/hero were single-select with three different "no filter" sentinels | Converted to arrays; empty array = no filter, everywhere; season became a dropdown | No |
+| 5 | Match detail | A version-2 match showed NO fun rating and none of the new fields | Renders one question set chosen by the match's SEASON, as labels not numbers | No |
+| 6 | `heroes_played` | Nine matches returned `{NULL}` — a one-element array containing null | `array_remove` on the view's aggregate; they now return `{}` | **Yes** (view) |
+| 7 | Correctness pass | Combat chart vanished on a hero filter; Outcomes side panel permanently blank; Time drew zero-width bars for never-played buckets | Four independent fixes | No |
+| 8 | Cosmetic pass | Stale menu copy promising retired fields; raw DB enum rendered to the user; minutes shown where h:mm was used elsewhere | Six files | No |
+
+### 1. Feel questions — retired two, moved the rest to new columns
+
+**Symptom.** `team_tempo` and `team_coordination` (and their enemy twins) were unanswerable by
+construction and contaminated in practice. A control match can have a contested first point, a
+collapse, and another collapse; any single value for a multi-round game is a lie. The owner
+also reports clicking through these questions quickly without thought when not in the mood — a
+rushed field is worthless regardless of how healthy its histogram looks.
+
+**Root cause.** Not a bug. A question-design error carried since the original schema.
+
+**Fix.** Tempo and coordination retired outright. The surviving set is five questions plus two
+slot picks: `matchup_feel` (5-point, midpoint kept, closeness folded in), `performance_rating`
+(5-point), `fun_rating_6` (**6-point, no midpoint, behaviourally anchored** — the missing
+middle is deliberate, to remove the lazy centre answer).
+
+⚠️ **NEW COLUMNS, NOT ALTERED ENUMS.** Old and new answers are never compared or pooled, so
+there was no reason to mutate the existing types. `match_feel`, `performance_feel`,
+`fun_rating`, `tilt_mood`, `team_tempo`, `team_coordination` and the enemy twins are **frozen
+as-is**. `seasons.question_scale_version` decides which set a match reads. The Builder
+**refuses** any v1×v2 variable pairing via `VarDef.scaleVersion` in `pairValidity`.
+
+**Files.** `src/lib/types.ts`, `src/app/review/*`, `src/app/matches/new/page.tsx`
+(`StarRating` → `ScaleSelect`), `feel-lib.ts`, `builder-lib.ts`. **DB:**
+`seasons.question_scale_version` (smallint, default 1), plus three columns on `matches`.
+
+### 2. Leaver tracking — three states, not a boolean
+
+**Symptom.** `team_leaver` / `enemy_leaver` were booleans. A player who left and **reconnected**
+was recorded identically to one who never came back — but the two cases have opposite
+implications for the scoreboard, which is valid in one and meaningless in the other.
+
+**Fix.** A `leaver_type` enum with three states. **Permanent leavers discard the scoreboard;
+returned leavers keep it and are filtered at read time.** Both booleans retained and seeded
+from the new columns, so nothing downstream broke on the day.
+
+**Files.** `src/lib/types.ts`, `alpha.ts`, the review flow, Home's leaver grids. **DB:** the
+`leaver_type` enum, `matches.team_leaver_type` / `enemy_leaver_type`, plus `team_thrower` /
+`enemy_thrower`; `combat_facts` rebuilt to expose them.
+
+**Verified live 9 Aug 2026:** 192 non-alpha matches · 13 permanent leavers (8 enemy, 4 team,
+1 both) · 4 thrower matches, 3 carrying no leaver · 0 returned leavers, since none can exist
+until new matches are played. Every boolean matches its seeded `leaver_type`.
+
+### 3. Standout picks — capture, storage, and ten tiles
+
+**Fix.** A `match_standouts` child table plus post-match slot picks, surfaced as ten tiles on
+the Matchups page. Self-picks are excluded and null `hero_name` rows are skipped.
+
+⚠️ **The denominator is the whole argument.** A standout rate is only meaningful against the
+number of matches where that hero *could* have been picked, not against total matches.
+
+**Files.** review flow, `matchups/page.tsx`. **DB:** new `match_standouts` table.
+
+⚠️ **Both guards are synthetic-tested only** — the table is empty and neither has seen a real
+slot→hero resolution. First thing to eyeball in beta. (Open item #26.)
+
+### 4. Filter system — scalars to arrays
+
+**Symptom.** Mode, map and hero were single-select, with **three different sentinels for "no
+filter"** (`''` for map and hero, `'all'` for mode) that had to be translated between
+surfaces. That mismatch caused the v1.0.1 empty-page bug.
+
+**Fix.** `AnalyticsFilterState` converted to arrays. **The fields were RENAMED deliberately**
+(`mode`→`modes`, `map`→`maps`, `hero`→`heroes`) so every consumer became a hard compile error
+rather than a silent type change. **Empty array = no filter, everywhere** — there is no longer
+anything to translate. Queue stays single-select, since 5v5 and 6v6 never mix. Season became a
+dropdown; mode/map/hero became multi-select with type-ahead.
+
+**Files.** NEW `src/components/MultiSelect.tsx` (separate from `Select.tsx`, which is
+untouched); `AnalyticsFilters.tsx`; `matchups-lib.ts`; `hero-pairings-lib.ts`; `builder-lib.ts`;
+the outcomes, time, feel, combat, heroes and hero-detail pages. **DELETED:** the duplicate
+`src/lib/builder-lib.ts`, plus both dead filter-application paths (`applyMatchQueryFilters`,
+`applyFilters`). No SQL, no DB.
+
+### 5. Match detail — the real version-2 blank
+
+**Symptom.** A version-2 match showed **no fun rating at all**, and `matchup_feel` /
+`performance_rating` appeared nowhere.
+
+**Root cause.** The Summary block rendered only `fun_rating`, as five stars, behind an
+`!= null` guard. A version-2 match has `fun_rating` null and `fun_rating_6` set, so the guard
+failed and the row **vanished with no indication anything was missing**.
+
+⚠️ **The spec blamed `match_overview` for this and was wrong.** Nothing read those columns off
+the view — Home selects `id, result, map, played_at`; `/matches` selects `id, heroes_played`.
+Confirmed by grep across `src/` before changing anything.
+
+**Fix.** Renders exactly one question set, chosen by the match's **season** via
+`scaleVersionOf()` — never by sniffing which columns are populated. Values render as **labels,
+not numbers**: "4" means different things on a 5-point and a 6-point scale, and a single match
+has no axis for the number to order against. **Version-1 fun keeps its five stars**, because
+that scale was *captured* as stars; version 2 drops them deliberately.
+
+**Files.** `src/app/matches/[id]/page.tsx`, `feel-lib.ts`. No SQL, no DB.
+
+### 6. `heroes_played` returned `{NULL}` for nine matches
+
+**Symptom.** Nine matches returned a one-element array containing null rather than an empty
+array.
+
+**Root cause.** `array_agg` over a LEFT JOIN produces one phantom null element when the joined
+side has no rows. Those nine matches have zero `hero_performances` rows.
+
+**Fix.** `array_remove(array_agg(...), NULL)` in the `match_overview` definition. The nine now
+return `{}`. Verified: `null_array_matches = 0`, `empty_array_matches = 9`, `total_rows = 192`
+unchanged, and a cardinality spot-check confirming no match with a breakdown lost a hero.
+
+⚠️ **This migration carried Phase 4's with it, because Phase 4's had never gone live.**
+`pg_get_viewdef` returned the pre-Phase-4 definition — 15 columns, none of the four the
+documents recorded as applied 9 Aug. **A documented migration is not an applied one.** The
+cause could not be determined and was not guessed at (open item #27).
+
+⚠️ **Why the nine have no breakdown is still undetermined.** All nine fall between 25 and 31
+July 2026 and seven are 6v6 — a six-day episode, not a background rate. `/process` now warns.
+
+**DB:** `match_overview` rebuilt (the four appended columns plus the `array_remove`).
+
+### 7. Correctness pass
+
+Four independent fixes, no DB impact:
+
+- **Combat** — `drillDimension` read `if (heroActive) return 'none'`, so picking a hero removed
+  the damage/healing/mitigation chart entirely, even though "how does my Ana healing share vary
+  by mode" is exactly what it could still answer. Now drills by the coarsest unfiltered
+  dimension.
+- **Outcomes** — the attack/defence panel rendered permanently blank; now hidden when no
+  selected mode can have a starting side.
+- **Time** — zero-game buckets drew a zero-width bar labelled "—" with n=0, which reads as "0%
+  win rate here" rather than "no data here". Now dropped before render.
+- **Home `topBy`** — recorded as outstanding; **had already shipped.** Verified by reading the
+  code. No change.
+
+### 8. Cosmetic pass
+
+- **Menu copy** promised "tilt" and "tempo" — fields this patch retires. Reworded to describe
+  what the page *asks about*, so it survives the next question change. ⚠️ Blurbs must never
+  name a version-specific feel field.
+- **A raw database enum was being rendered to the user.** The hero detail page's last-5 rows
+  interpolated `starting_side` directly, which would have printed lowercase `defense` on the
+  first Season 4 escort game. Fixed with a `sideLabel()` helper. ⚠️ **The column stays
+  US-spelled** (`'attack'` / `'defense'`) — it is matched by `.eq()` in queries. Only rendered
+  strings are British.
+- **Session duration** on the Time month chart now reads h:mm, matching the stat card and
+  tooltip that already did. Legend and tooltip series names unified.
+- **Result mix** legend now carries `n=`.
+- **Confidence legend** added to the Hero Pairings grid — the last surface applying the
+  dimming convention without stating it.
+
+**Files.** `AnalyticsNav.tsx`, `analytics/heroes/[name]/page.tsx`, `analytics/time/page.tsx`,
+`analytics/heroes-overview/page.tsx`, `analytics/outcomes/page.tsx`, `matches/[id]/page.tsx`.
+No SQL, no DB.
+
+### Deploy checklist — v1.1.0
+
+**All migrations are already applied** (Phase 1 on 9 Aug, `match_overview` on 10 Aug). Verify
+before shipping code rather than after:
+
+```sql
+-- Phase 1 schema — expect all four present.
+select
+  (select count(*) from information_schema.columns
+    where table_name='seasons' and column_name='question_scale_version')     as has_version,
+  (select count(*) from information_schema.columns
+    where table_name='matches' and column_name='team_leaver_type')           as has_leaver_type,
+  (select count(*) from information_schema.columns
+    where table_name='matches' and column_name='matchup_feel')               as has_v2_feel,
+  (select count(*) from information_schema.tables
+    where table_name='match_standouts')                                      as has_standouts;
+
+-- match_overview — expect 0 / 9 / 192.
+select
+  count(*) filter (where heroes_played = array[null]::text[])  as null_array_matches,
+  count(*) filter (where cardinality(heroes_played) = 0)       as empty_array_matches,
+  count(*)                                                     as total_rows
+from match_overview;
+```
+
+⚠️ **If the second query returns a non-zero `null_array_matches`, STOP** — the view has
+reverted, and that has happened silently once already in this patch.
+
+Files to ship: the full v1.1.0 working tree. This is a single push covering six phases; there
+is no partial-deploy path, and the phases were verified in sequence on localhost rather than
+staged to production.
+
+Docs updated:
+- `Supabase Map.md` — Parts F/H/I; the `leaver_type` enum, `match_standouts`, the v2 feel
+  columns, `question_scale_version`, the `combat_facts` and `match_overview` rebuilds, and the
+  correction recording that Phase 4's migration was never live.
+- `FILE-MAP.md` — bumped to v1.1.0; entries for `MultiSelect`, the filter conversion, both
+  standouts guards, the six cosmetic files, and a correction to the dimming convention (the
+  Heroes list is a hard gate, not a dim).
+- `PATCH-SPEC-v1_1_0.md` — phases 0–6 closed, Phase 7 deferred out of the release.
+- Session logs for 8–9, 9, 10 and 11 August.
+
+**Post-deploy:** hard-refresh and unregister the service worker. Then, in order:
+
+1. **Create Season 4 through Settings, NOT SQL** — this is the single most consequential manual
+   step in the release. Created by hand it will not be stamped `question_scale_version = 2`,
+   and the v1/v2 separation breaks silently. **The badge should read Q2.**
+2. Process one real match and confirm the version-2 questions appear, the standout slot picks
+   save, and the match detail page renders labels rather than numbers.
+3. Check any escort or hybrid game shows **"Started on: Attack/Defence"** on both the match
+   detail and hero detail pages — see the watch note below.
+
+**Watch after deploy.**
+
+⚠️ **Four surfaces will be legitimately EMPTY until version-2 data exists**, and none of them
+are broken: the returned-leaver row and column on Home's grids, the three v2 Builder variables,
+and both standouts rows. The first real match through the pipeline is the actual test.
+
+⚠️ **Two fixes in this patch have NEVER RENDERED.** `starting_side` is null on all 192
+historical matches, so the attack/defence displays on `matches/[id]` and `heroes/[name]` are
+code-complete but have never been seen on screen. The first Season 4 escort or hybrid game is
+their first execution. **Where the code and the data agree, check whether the data is capable
+of disagreeing** — absence of a symptom proves nothing where the column is empty by
+construction.
+
+---
+
 ## v1.0.2 — released 4 August 2026
 
 Scoreboard hero identification: **21.9% wrong → 0%**. Two code fixes, one feature

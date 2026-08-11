@@ -11,8 +11,71 @@ import {
 } from '@/data/reference'
 import type {
   MatchResult, RoleType, StartingSide,
-  MatchFeel, PerformanceFeel
 } from '@/lib/types'
+
+// ============================================================
+// MANUAL MATCH ENTRY
+//
+// (v1.1.0) QUESTION SET REBUILT — question scale version 2, matching
+// upload/page.tsx. See PATCH-SPEC-v1.1.0.md §3.
+//
+// WHY THIS FORM WRITES VERSION 2 UNCONDITIONALLY, rather than asking the
+// current season which scale it is on: the phone hardcodes
+// question_scale_version: 2, so a season-aware form here would let the two
+// capture surfaces disagree with each other — the same match logged two ways
+// would land in different columns. The guard against writing version-2 answers
+// into a version-1 season lives in Settings, where the per-season Q1/Q2 badge
+// turns red when the season being actively played carries a different version
+// than the app writes. Create the new season with version 2 before playing and
+// this form is correct; do it the other way round and Settings will say so.
+//
+// The OLD columns (match_feel, performance_feel, fun_rating, tilt_mood, tempo,
+// coordination) are FROZEN, not dropped. They keep their Season 3 data and are
+// no longer written by anything. Do NOT map these answers onto them — the
+// scales differ and the two sets are never pooled.
+// ============================================================
+
+/** Q1 — "How did you feel your team matched up against the enemy?"
+ *  KEEPS ITS MIDPOINT, unlike fun. "Okay" was a dumping ground on the fun
+ *  scale, but here the midpoint IS the signal: "evenly matched" is the exact
+ *  state the founding hypothesis (a tight loss is still fun) is about, so
+ *  removing it would delete the thing being measured.
+ *  Measures TEAM STRENGTH, not result — "Behind" plus a victory is a
+ *  legitimate and interesting combination. */
+const MATCHUP_SCALE = [
+  { value: 1, label: 'OUTCLASSED', test: 'Never had a chance' },
+  { value: 2, label: 'BEHIND',     test: 'They had the edge throughout' },
+  { value: 3, label: 'EVEN',       test: 'Genuinely contested' },
+  { value: 4, label: 'AHEAD',      test: 'We had the edge throughout' },
+  { value: 5, label: 'DOMINANT',   test: 'Never in doubt' },
+]
+
+/** Q2 — "How did you play?"
+ *  ⚠️ WATCH: if "Did my job" exceeds 40% of answers it is behaving like the
+ *  old fun 3/4 pair and should be cut to four points at the next boundary. */
+const PERFORMANCE_SCALE = [
+  { value: 1, label: 'OFF MY GAME', test: 'I was part of the problem' },
+  { value: 2, label: 'BELOW PAR',   test: 'Not my usual standard' },
+  { value: 3, label: 'DID MY JOB',  test: 'Normal game for me' },
+  { value: 4, label: 'PLAYED WELL', test: 'Better than usual' },
+  { value: 5, label: 'CARRIED',     test: 'I was the reason we were in it' },
+]
+
+/** Q3 — Fun. SIX points, deliberately NO midpoint.
+ *  A 7-point scale has a centre and a centre becomes the default. Six has no
+ *  middle — it falls between 3 and 4 — so every answer must lean one way. The
+ *  scale is one binary question (did I enjoy this?) with two intensity steps
+ *  either side, and the 3/4 boundary is the whole decision.
+ *  Accepted trade-off: some games genuinely are neutral. A neutral bucket does
+ *  not record indifference, it absorbs every answer not worth thinking about. */
+const FUN_SCALE = [
+  { value: 1, label: 'MISERABLE', test: 'I wanted to stop playing' },
+  { value: 2, label: 'BAD',       test: 'Actively unpleasant, but I saw it out' },
+  { value: 3, label: 'POOR',      test: "No, I didn't enjoy that" },
+  { value: 4, label: 'GOOD',      test: 'Yes, I enjoyed that' },
+  { value: 5, label: 'GREAT',     test: "I'd happily play that again" },
+  { value: 6, label: 'BRILLIANT', test: 'Memorable — the reason I play' },
+]
 
 // ============================================================
 // SUB-COMPONENTS
@@ -59,21 +122,51 @@ function ChipSelect<T extends string>({
   )
 }
 
-function StarRating({ value, onChange }: { value: number | null; onChange: (v: number | null) => void }) {
+/**
+ * A behaviourally-anchored rating scale.
+ *
+ * Each point carries a TEST — a one-second decision — rather than an intensity
+ * word. Abstract words (poor / fair / decent) reproduce the coin-flip that made
+ * the old fun 3 and 4 interchangeable, holding 128 of 192 answers between them.
+ * The wording here is deliberately IDENTICAL to upload/page.tsx: a manually
+ * logged match and an uploaded one must mean the same thing by "4", or the two
+ * capture routes quietly measure different quantities.
+ *
+ * Stars were REMOVED from the fun question on purpose. A star strip invites a
+ * lazy middle, which is the exact failure being designed out.
+ */
+function ScaleSelect({
+  options,
+  value,
+  onChange,
+}: {
+  options: { value: number; label: string; test: string }[]
+  value: number | null
+  onChange: (v: number | null) => void
+}) {
   return (
-    <div className="flex gap-1">
-      {[1, 2, 3, 4, 5].map(star => (
-        <button
-          key={star}
-          type="button"
-          onClick={() => onChange(value === star ? null : star)}
-          className={`text-2xl transition-colors ${
-            value && star <= value ? 'text-ow-orange' : 'text-ow-faint hover:text-ow-muted'
-          }`}
-        >
-          ★
-        </button>
-      ))}
+    <div className="space-y-1.5">
+      {options.map(opt => {
+        const selected = value === opt.value
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            onClick={() => onChange(selected ? null : opt.value)}
+            className={`w-full text-left px-4 py-2.5 rounded-lg border transition-all
+              ${selected
+                ? 'bg-ow-orange/15 border-ow-orange/50'
+                : 'bg-ow-dark border-ow-line hover:border-ow-line hover:bg-ow-panel'
+              }`}
+          >
+            <span className={`font-display tracking-wider text-sm
+              ${selected ? 'text-ow-orange font-bold' : 'text-ow-fg'}`}>
+              {opt.value}. {opt.label}
+            </span>
+            <span className="block text-xs text-ow-faint mt-0.5">{opt.test}</span>
+          </button>
+        )
+      })}
     </div>
   )
 }
@@ -180,10 +273,10 @@ export default function NewMatchPage() {
   // Heroes
   const [heroes, setHeroes] = useState<string[]>([])
 
-  // Qualitative
-  const [matchFeel, setMatchFeel] = useState<MatchFeel | null>(null)
-  const [perfFeel, setPerfFeel] = useState<PerformanceFeel | null>(null)
-  const [funRating, setFunRating] = useState<number | null>(null)
+  // Qualitative — question scale version 2 (see the header comment)
+  const [matchupFeel, setMatchupFeel] = useState<number | null>(null)
+  const [perfRating, setPerfRating] = useState<number | null>(null)
+  const [funRating6, setFunRating6] = useState<number | null>(null)
   const [thoughts, setThoughts] = useState('')
 
   // Load default role from settings
@@ -247,9 +340,13 @@ export default function NewMatchPage() {
           total_eliminations: elims ? parseInt(elims) : null,
           total_assists: assists ? parseInt(assists) : null,
           total_deaths: deaths ? parseInt(deaths) : null,
-          match_feel: matchFeel,
-          performance_feel: perfFeel,
-          fun_rating: funRating,
+          // Scale version 2 columns ONLY. The version-1 columns are frozen and
+          // are left null on every new row — writing both sets would put two
+          // incompatible scales in one match, which is what the separate
+          // columns exist to prevent.
+          matchup_feel: matchupFeel,
+          performance_rating: perfRating,
+          fun_rating_6: funRating6,
           personal_thoughts: thoughts || null,
         })
         .select('id')
@@ -453,44 +550,38 @@ export default function NewMatchPage() {
       {/* ======================== QUALITATIVE ======================== */}
       <SectionHeader>HOW DID IT FEEL?</SectionHeader>
 
-      <div className="space-y-4">
+      <div className="space-y-5">
         <div>
           <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
-            MATCH FEEL
+            HOW DID YOU FEEL YOUR TEAM MATCHED UP AGAINST THE ENEMY?
           </label>
-          <ChipSelect
-            options={['stomped_them', 'close_game', 'got_stomped'] as MatchFeel[]}
-            value={matchFeel}
-            onChange={setMatchFeel}
-            labels={{
-              stomped_them: 'STOMPED THEM',
-              close_game: 'CLOSE GAME',
-              got_stomped: 'GOT STOMPED',
-            }}
+          <ScaleSelect
+            options={MATCHUP_SCALE}
+            value={matchupFeel}
+            onChange={setMatchupFeel}
           />
         </div>
 
         <div>
           <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
-            YOUR PERFORMANCE
+            HOW DID YOU PLAY?
           </label>
-          <ChipSelect
-            options={['carried', 'did_my_job', 'struggled'] as PerformanceFeel[]}
-            value={perfFeel}
-            onChange={setPerfFeel}
-            labels={{
-              carried: 'CARRIED',
-              did_my_job: 'DID MY JOB',
-              struggled: 'STRUGGLED',
-            }}
+          <ScaleSelect
+            options={PERFORMANCE_SCALE}
+            value={perfRating}
+            onChange={setPerfRating}
           />
         </div>
 
         <div>
           <label className="block text-xs text-ow-muted font-display tracking-wider mb-2">
-            FUN RATING
+            HOW MUCH DID YOU ENJOY IT?
           </label>
-          <StarRating value={funRating} onChange={setFunRating} />
+          <ScaleSelect
+            options={FUN_SCALE}
+            value={funRating6}
+            onChange={setFunRating6}
+          />
         </div>
 
         <div>

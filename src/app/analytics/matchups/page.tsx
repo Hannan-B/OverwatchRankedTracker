@@ -8,6 +8,7 @@ import { heroPortrait } from '@/lib/hero-image'
 import AnalyticsFilters, {
   DEFAULT_FILTERS,
   type AnalyticsFilterState,
+  type SeasonOption,
 } from '@/components/AnalyticsFilters'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 import { HEROES, getHeroesByRole } from '@/data/reference'
@@ -23,6 +24,7 @@ import {
   conformance222,
   queueFixedRole,
   otherSlotShape,
+  passesFilters,
   CONFIDENCE_MIN_GAMES,
   type PairRow,
   type TeamSetRow,
@@ -38,6 +40,8 @@ import {
   type LiftView,
   type LiftViewBoth,
   type AttributionMode,
+  aggregateStandouts, inScopeMatchIds, userHeroesByMatch,
+  type StandoutRow, type StandoutCell,
 } from './matchups-lib'
 
 // ============================================================
@@ -55,6 +59,16 @@ const ROLE_LABEL: Record<Role, string> = { tank: 'Tank', dps: 'DPS', support: 'S
 
 type Format = '5v5' | '6v6'
 
+// Bridge the shared filter state to this surface's own MatchupFilters.
+//
+// (v1.1.0 Phase 2) Now a straight copy of arrays. The old version coalesced the
+// shared sentinels into this lib's 'all' with `||`, because the two sides
+// disagreed about how "no filter" was spelled — '' on one side, 'all' on the
+// other. Getting that wrong once (`??` instead of `||`) emptied the entire page
+// in v1.0.1. Both sides now use an empty array and there is nothing to coerce.
+//
+// `seasons` is passed through for the first time: this surface ignored the
+// season filter entirely until Phase 2 (PATCH-SPEC §6.4).
 function toMatchupFilters(
   f: AnalyticsFilterState,
   attribution: AttributionMode,
@@ -62,9 +76,10 @@ function toMatchupFilters(
   secThreshold: number,
 ): MatchupFilters {
   return {
-    queue: (f.queue || 'all') as MatchupFilters['queue'],
-    mode: (f.mode || 'all') as MatchupFilters['mode'],
-    map: (f.map || 'all') as MatchupFilters['map'],
+    queue: f.queue as MatchupFilters['queue'],
+    modes: f.modes,
+    maps: f.maps,
+    seasons: f.seasons,
     attribution,
     pctThreshold,
     secThreshold,
@@ -105,6 +120,12 @@ export default function MatchupsPage() {
   // data
   const [pairs, setPairs] = useState<PairRow[]>([])
   const [teamSets, setTeamSets] = useState<TeamSetRow[]>([])
+  // (v1.1.0 Phase 5) Post-match standout picks. Fetched UNFILTERED — the table
+  // carries no is_alpha and no filter columns, so scoping is done by intersecting
+  // with the in-scope match ids derived from `pairs`, which already has alpha and
+  // every filter applied. One source of truth for what is in view.
+  const [standouts, setStandouts] = useState<StandoutRow[]>([])
+  const [seasonOptions, setSeasonOptions] = useState<SeasonOption[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -114,15 +135,28 @@ export default function MatchupsPage() {
       setLoading(true)
       setError(null)
       try {
-        const [pairRes, setRes] = await Promise.all([
+        // Seasons are fetched alongside the matchup views (new in Phase 2 —
+        // this page had no seasons query at all, because it had no season
+        // filter). Newest first, matching the other analytics surfaces.
+        const [pairRes, setRes, seasonRes, standoutRes] = await Promise.all([
           supabase.from('matchup_pairs').select('*'),
           supabase.from('matchup_team_sets').select('*'),
+          supabase.from('seasons').select('id, name').order('start_date', { ascending: false }),
+          supabase.from('match_standouts').select('match_id, kind, slot, hero_name'),
         ])
         if (pairRes.error) throw pairRes.error
         if (setRes.error) throw setRes.error
         if (cancelled) return
         setPairs(keepVisible(pairRes.data ?? []) as PairRow[])
         setTeamSets(keepVisible(setRes.data ?? []) as TeamSetRow[])
+        // Non-fatal, like seasons: a failed standouts read empties two tile rows
+        // rather than blanking the page. The table is also legitimately empty
+        // until Season 4, so "no rows" is a normal state, not an error.
+        if (!standoutRes.error) setStandouts((standoutRes.data ?? []) as StandoutRow[])
+        // A failed seasons read is NOT fatal: the control hides itself when the
+        // list is empty, and every other panel on the page still works. Throwing
+        // here would blank the whole surface over a filter that is optional.
+        if (!seasonRes.error) setSeasonOptions((seasonRes.data ?? []) as SeasonOption[])
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load matchup data')
       } finally {
@@ -165,6 +199,37 @@ export default function MatchupsPage() {
 
   const conf = useMemo(() => conformance222(teamSets), [teamSets])
   const needsHero = anchorMode === 'hero' && !activeAnchor
+
+  // --- (v1.1.0 Phase 5) standout tiles ---
+  // Scope rule: when a hero IS anchored, the tiles narrow to games where that
+  // hero was played. When one is NOT — General mode, or Hero mode with nothing
+  // picked yet — they cover every game and follow the queue/mode/map/season
+  // filters only. `needsHero` is treated as unanchored rather than hidden: the
+  // filters still mean something there, so the tiles still do.
+  const standoutAnchor = needsHero ? null : activeAnchor
+  const scopeIds = useMemo(
+    () => inScopeMatchIds(pairs, mf, standoutAnchor),
+    [pairs, mf, standoutAnchor],
+  )
+  const ownHeroes = useMemo(() => userHeroesByMatch(pairs), [pairs])
+  // The denominator + win rate source. Same call the ranked lists make, so the
+  // tiles and the lists can never report different games for the same hero.
+  const allyCells = useMemo(
+    () => aggregateSingles(pairs, 'ally', mf, standoutAnchor),
+    [pairs, mf, standoutAnchor],
+  )
+  const enemyCells = useMemo(
+    () => aggregateSingles(pairs, 'enemy', mf, standoutAnchor),
+    [pairs, mf, standoutAnchor],
+  )
+  const impressedAllies = useMemo(
+    () => aggregateStandouts(standouts, 'impressed_ally', allyCells, scopeIds, ownHeroes).slice(0, 5),
+    [standouts, allyCells, scopeIds, ownHeroes],
+  )
+  const struggledEnemies = useMemo(
+    () => aggregateStandouts(standouts, 'struggled_enemy', enemyCells, scopeIds, ownHeroes).slice(0, 5),
+    [standouts, enemyCells, scopeIds, ownHeroes],
+  )
 
   // flatten role-keyed picks to arrays
   const allySel = useMemo(() => [...allyPick.tank, ...allyPick.dps, ...allyPick.support], [allyPick])
@@ -261,7 +326,8 @@ export default function MatchupsPage() {
       <AnalyticsFilters
         value={filters}
         onChange={setFilters}
-        show={{ queue: true, mode: true, map: true, hero: false }}
+        show={{ queue: true, mode: true, map: true, hero: false, season: true }}
+        seasonOptions={seasonOptions}
       />
 
       {/* surface controls */}
@@ -386,7 +452,13 @@ export default function MatchupsPage() {
 
       {!loading && !error && (
         needsHero ? (
-          <Panel><Muted>Pick one of your heroes above to see its matchups and pairings.</Muted></Panel>
+          // Hero mode with nothing picked. The ranked lists and the lab need an
+          // anchor, but the standouts do not — the filters above still apply, so
+          // the tiles show every game rather than the page showing nothing.
+          <>
+            <Panel><Muted>Pick one of your heroes above to see its matchups and pairings.</Muted></Panel>
+            <StandoutTiles impressed={impressedAllies} struggled={struggledEnemies} anchored={null} />
+          </>
         ) : (
           <>
             <SparsityNote pairs={pairs} anchor={activeAnchor} mf={mf} />
@@ -397,6 +469,15 @@ export default function MatchupsPage() {
               <ListCard title="Best ENEMY matchups" hint="Opponents you beat most" data={enemyBest} relation="enemy" />
               <ListCard title="Worst ENEMY matchups" hint="Opponents you struggle against most" data={enemyWorst} relation="enemy" />
             </div>
+
+            {/* Standouts sit between the ranked lists and the lab: the tiles are
+                a read on the same heroes the lists rank, so they belong next to
+                them rather than after the lab's own controls. */}
+            <StandoutTiles
+              impressed={impressedAllies}
+              struggled={struggledEnemies}
+              anchored={standoutAnchor}
+            />
 
             <ComboLab
               layout={labLayout}
@@ -688,6 +769,102 @@ function ResultBlock({ label, cell }: { label: string; cell: Cell | null }) {
       </div>
       <WinRateBadge cell={cell} big />
     </div>
+  )
+}
+
+// ---- (v1.1.0 Phase 5) Standout tiles -------------------------------
+// Five tiles per kind, in TWO SEPARATE ROWS that are never merged. You flag an
+// ally who impressed and an enemy who gave trouble; there is no "ally who played
+// badly" pick, so the rows are not mirror images of one scale and must not be
+// laid out as though they were.
+//
+// The headline is the RATE, not the count: "flagged in 4 of 12 games" is the
+// claim being made. The win rate rides alongside because that is the whole
+// reason these live on this page — a subjective flag beside the objective
+// number for the same hero, which only works co-located.
+//
+// Dimming reuses the page's existing < CONFIDENCE_MIN_GAMES convention rather
+// than inventing a second one. Nothing is GATED: sparse rows are shown dim.
+function StandoutRow_({
+  title, hint, data, accent,
+}: {
+  title: string
+  hint: string
+  data: StandoutCell[]
+  accent: 'blue' | 'red'
+}) {
+  const bar = accent === 'blue' ? 'bg-sky-400/70' : 'bg-red-400/70'
+  return (
+    <div>
+      <div className="flex items-baseline gap-2 mb-2">
+        <div className={`h-1 w-8 rounded-full ${bar}`} />
+        <h3 className="font-display tracking-wider text-ow-fg text-sm uppercase">{title}</h3>
+        <span className="text-xs text-ow-faint">{hint}</span>
+      </div>
+      {data.length === 0 ? (
+        <Muted>No picks recorded for these filters yet.</Muted>
+      ) : (
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+          {data.map(c => (
+            <div key={c.hero}
+              className={`bg-ow-dark rounded-lg border border-ow-line p-3 ${c.lowConfidence ? 'opacity-50' : ''}`}
+              title={`${c.hero} — flagged in ${c.picks} of ${c.appearances} game${c.appearances === 1 ? '' : 's'}`}>
+              <p className="font-display text-sm text-ow-fg truncate">{c.hero}</p>
+              <p className="text-2xl font-display font-bold text-ow-orange mt-1 tabular-nums">
+                {c.rate == null ? '—' : `${Math.round(c.rate)}%`}
+              </p>
+              <p className="text-[11px] text-ow-faint tabular-nums">
+                {c.picks} of {c.appearances} game{c.appearances === 1 ? '' : 's'}
+              </p>
+              <p className="text-[11px] text-ow-muted tabular-nums mt-1">
+                {c.winRate == null ? 'no decisive games' : `${Math.round(c.winRate)}% win rate`}
+              </p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function StandoutTiles({
+  impressed, struggled, anchored,
+}: {
+  impressed: StandoutCell[]
+  struggled: StandoutCell[]
+  anchored: string | null
+}) {
+  return (
+    <Panel>
+      <div className="space-y-5">
+        <div>
+          <h2 className="font-display tracking-wider text-ow-fg text-sm uppercase">
+            Standouts
+            {anchored && <span className="text-ow-orange"> · as {anchored}</span>}
+          </h2>
+          <p className="text-xs text-ow-faint mt-1 max-w-3xl">
+            Your post-match picks, as a share of the games that hero appeared in — so a hero you
+            flagged twice out of three games ranks above one you flagged four times out of twenty.
+            {anchored
+              ? ' Scoped to games where you played this hero.'
+              : ' Across every game matching the filters above.'}
+            {' '}Rows under {CONFIDENCE_MIN_GAMES} games are dimmed, not hidden.
+          </p>
+        </div>
+        <StandoutRow_
+          title="Allies who impressed"
+          hint="teammates you flagged"
+          data={impressed}
+          accent="blue"
+        />
+        <StandoutRow_
+          title="Enemies who gave trouble"
+          hint="opponents who got your number"
+          data={struggled}
+          accent="red"
+        />
+      </div>
+    </Panel>
   )
 }
 
@@ -1232,16 +1409,24 @@ function SixShapeChooser({ shape, setShape }: { shape: SlotShape; setShape: (s: 
   )
 }
 
+// The "based on N games" line under the ranked lists.
+//
+// ⚠️ (v1.1.0 Phase 2) This USED TO re-implement the queue/mode/map tests inline
+// and skip the attribution test entirely, so with attribution set to 95% it
+// could report 40 games above lists built from 12. It now calls passesFilters —
+// the same predicate the aggregators use — so the number is true by construction
+// and cannot drift from the panels it describes.
+//
+// Counts DISTINCT match_id, not rows. Since the v1.1.0 matchup_user rewrite,
+// matchup_pairs carries one row per hero played per match, so a match where two
+// heroes were played appears more than once. That also means per-hero counts
+// across the page legitimately do not sum to this total.
 function SparsityNote({ pairs, anchor, mf }: { pairs: PairRow[]; anchor: string | null; mf: MatchupFilters }) {
   const games = useMemo(() => {
     const ids = new Set<number>()
     for (const p of pairs) {
       if (anchor !== null && p.anchor_hero !== anchor) continue
-      if (mf.queue === '6v6' && p.match_format !== '6v6') continue
-      if (mf.queue !== 'all' && mf.queue !== '6v6'
-        && !(p.match_format === '5v5' && p.user_role_played === mf.queue)) continue
-      if (mf.mode !== 'all' && p.game_mode !== mf.mode) continue
-      if (mf.map !== 'all' && p.map !== mf.map) continue
+      if (!passesFilters(p, mf)) continue
       ids.add(p.match_id)
     }
     return ids.size
