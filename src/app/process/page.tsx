@@ -29,7 +29,9 @@ import { matchQuery } from '@/lib/alpha'
 import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus } from '@/lib/image-processor'
 import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
 import { getGameModeForMap, needsStartingSide, MAPS, HEROES } from '@/data/reference'
-import type { RoleType, MatchFeel, PerformanceFeel, StartingSide } from '@/lib/types'
+import type {
+  RoleType, MatchFeel, PerformanceFeel, StartingSide, LeaverType, StandoutKind,
+} from '@/lib/types'
 import { logHeroAudit, logMatchSummary, logProcessingError } from '@/lib/beta-issue-log'
 // Beta confirmation is SUNSET (v1.0.2). The confidence-gated question flow
 // could measure how often a flag was right but never how many errors went
@@ -37,25 +39,64 @@ import { logHeroAudit, logMatchSummary, logProcessingError } from '@/lib/beta-is
 // a per-slot audit of every scoreboard row.
 import { HeroAuditPanel, type HeroAuditResult } from '@/app/review/HeroAuditPanel'
 
+// ── metadata.json, as written by the phone ────────────────────────────────
+// TWO SHAPES ARRIVE HERE, and both must keep working.
+//
+// A batch sits in pending/ for up to 21 days (PENDING_RETENTION_DAYS), so a
+// match uploaded by the OLD phone flow can be processed WEEKS after the new
+// one shipped. Every version-2 field is therefore optional, and
+// `question_scale_version` is the discriminator: present and === 2 means the
+// rebuilt question set; absent means a legacy batch that must be handled
+// exactly as it was before v1.1.0.
+//
+// Do NOT collapse the two shapes into one "just read whichever field is
+// there" reader. The scales are different and the two sets are NEVER pooled —
+// a legacy fun_rating of 5 and a version-2 fun_rating_6 of 5 mean different
+// things, and mixing them at the point of save would make that permanent.
 interface PendingBatch {
   batchId: string
   metadata: {
     role_played: RoleType | null
     match_format?: '5v5' | '6v6'
     roles_played?: RoleType[]
-    match_feel: MatchFeel | null
-    performance_feel: PerformanceFeel | null
-    tilt_mood: string | null
-    team_tempo: string | null
-    team_coordination: string | null
+
+    /** Absent on legacy batches. 2 = the v1.1.0 question set. */
+    question_scale_version?: number
+
+    // ---- scale version 2 (absent on legacy batches) ----
+    matchup_feel?: number | null
+    performance_rating?: number | null
+    fun_rating_6?: number | null
+    team_leaver_type?: LeaverType
+    enemy_leaver_type?: LeaverType
+    /** Slot picks. Empty array = explicitly nothing stood out; absent = a
+     *  legacy batch that never asked. Permanent-leaver games skip the step,
+     *  so they arrive empty. */
+    impressed_ally_slots?: number[]
+    struggled_enemy_slots?: number[]
+
+    // ---- scale version 1, FROZEN (absent on version-2 batches) ----
+    // The phone stopped writing these when the question set was rebuilt.
+    // They are still read here so a legacy batch saves its answers into the
+    // legacy columns, where they belong.
+    match_feel?: MatchFeel | null
+    performance_feel?: PerformanceFeel | null
+    tilt_mood?: string | null
+    team_tempo?: string | null
+    team_coordination?: string | null
+    enemy_tempo?: string | null
+    enemy_coordination?: string | null
+    fun_rating?: number | null
+
+    // ---- written by BOTH shapes ----
     team_leaver: boolean
     team_thrower: boolean
-    enemy_tempo: string | null
-    enemy_coordination: string | null
     enemy_leaver: boolean
     enemy_thrower: boolean
+    /** ⚠️ MEANING CHANGED IN v1.1.0. On a version-2 batch this is TRUE ONLY
+     *  FOR A PERMANENT LEAVER. It previously meant ANY leaver. Never read it
+     *  without checking the scale version first — see resolveLeaver(). */
     has_leaver?: boolean
-    fun_rating: number | null
     personal_thoughts: string | null
     starting_side?: StartingSide | null
     detected_map?: string | null
@@ -67,6 +108,64 @@ interface PendingBatch {
   }
   photoUrls: string[]
   photoPaths: string[]
+}
+
+/** Is this batch on the rebuilt (v1.1.0) question set? */
+function isScaleV2(meta: PendingBatch['metadata']): boolean {
+  return meta.question_scale_version === 2
+}
+
+/**
+ * Should this match's scoreboard be discarded?
+ *
+ * ONLY a PERMANENT leaver ('left') qualifies. When a player leaves for good
+ * their row DISAPPEARS, so the board becomes asymmetric — five allies against
+ * six enemies — and detectScoreboard derives its grid from the VS-gap on the
+ * assumption that both sides match. Slot N may then not be the player the
+ * extractor believes it is. That is structural misalignment, not merely
+ * distorted stats, which is why this is a data-integrity rule rather than a
+ * preference like the thrower filter.
+ *
+ * A RETURNED leaver is the opposite case: at screenshot time the board has its
+ * full complement of rows, so the geometry is intact and only the NUMBERS are
+ * skewed. Its scoreboard IS kept, and is excluded from scoreboard-derived
+ * surfaces at READ time instead.
+ *
+ * ⚠️ THE BOOLEANS CANNOT BE USED FOR THIS ON A VERSION-2 BATCH. team_leaver /
+ * enemy_leaver are still written, and are true for BOTH 'left' and 'returned'
+ * — so ORing them in, as the pre-v1.1.0 code did, would re-discard exactly the
+ * returned-leaver boards this change exists to keep. Read the TYPES.
+ *
+ * Legacy batches have no types to read and keep the old behaviour verbatim:
+ * any leaver at all discards the board. That is the conservative reading, and
+ * it is what those matches were tagged under.
+ */
+function discardsScoreboard(meta: PendingBatch['metadata']): boolean {
+  if (isScaleV2(meta)) {
+    return meta.team_leaver_type === 'left' || meta.enemy_leaver_type === 'left'
+  }
+  return !!(meta.has_leaver || meta.team_leaver || meta.enemy_leaver)
+}
+
+/** The three-state leaver values to STORE, for either metadata shape.
+ *  A legacy batch cannot distinguish left-forever from left-and-returned, so
+ *  its leavers seed as 'left' — the same conservative choice the schema
+ *  migration made when seeding the 192 historical rows, and consistent with
+ *  those matches having no scoreboard. */
+function resolveLeaverTypes(meta: PendingBatch['metadata']): {
+  team: LeaverType
+  enemy: LeaverType
+} {
+  if (isScaleV2(meta)) {
+    return {
+      team: meta.team_leaver_type ?? 'none',
+      enemy: meta.enemy_leaver_type ?? 'none',
+    }
+  }
+  return {
+    team: meta.team_leaver ? 'left' : 'none',
+    enemy: meta.enemy_leaver ? 'left' : 'none',
+  }
 }
 
 // A processed-but-not-yet-saved match held in memory through Phase 2.
@@ -404,15 +503,22 @@ export default function ProcessPage() {
           gamertag || undefined,
         )
 
-        // Leaver games: a leaver collapses the scoreboard layout, so its stats
-        // can't be read reliably. Discard whatever was extracted from the
+        // PERMANENT-leaver games: the leaver's row disappears, so the board is
+        // asymmetric and the VS-gap grid can no longer be trusted to say which
+        // slot is which player. Discard whatever was extracted from the
         // scoreboard — the summary + hero breakdowns are still kept. Dropping it
-        // here means everything downstream (the confirmation cards, the username
-        // check, and the scoreboard insert in saveMatch) all correctly see "no
+        // here means everything downstream (the hero audit, the username check,
+        // and the scoreboard insert in saveMatch) all correctly see "no
         // scoreboard" without any further special-casing.
-        const isLeaverGame = !!(batch.metadata.has_leaver || batch.metadata.team_leaver || batch.metadata.enemy_leaver)
-        // Omit the scoreboard key (rather than set it undefined) so this is valid
-        // under exactOptionalPropertyTypes as well as the default config.
+        //
+        // ⚠️ A RETURNED leaver no longer lands here. Its board is complete, so
+        // it is processed, saved, and filtered at READ time instead. See
+        // discardsScoreboard() for why the leaver BOOLEANS must not be used for
+        // this test on a version-2 batch.
+        const isLeaverGame = discardsScoreboard(batch.metadata)
+        // Null the scoreboard rather than omitting the key: ProcessedMatch
+        // declares it required-nullable, so omission is not valid under
+        // exactOptionalPropertyTypes.
         const result = isLeaverGame ? { ...rawResult, scoreboard: null } : rawResult
 
         seq += 1
@@ -687,6 +793,44 @@ export default function ProcessPage() {
     const { data: seasonId } = await supabase
       .rpc('get_season_for_date', { match_date: playedAtISO })
 
+    // ── Feel answers: one scale or the other, NEVER both ──────────────────
+    // Old and new answers are never compared or pooled, which is why they live
+    // in separate columns rather than a widened enum. Writing both sets from
+    // one batch would defeat that at the storage level, so the branch is
+    // exclusive: whichever scale this batch was captured under gets written,
+    // and the other set stays NULL for this row.
+    //
+    // Which scale a SEASON was played under is recorded separately, on
+    // seasons.question_scale_version, and that is what charts read. This is
+    // just making sure the row agrees with it.
+    const scaleV2 = isScaleV2(meta)
+    const feelColumns = scaleV2
+      ? {
+          matchup_feel:       meta.matchup_feel ?? null,
+          performance_rating: meta.performance_rating ?? null,
+          fun_rating_6:       meta.fun_rating_6 ?? null,
+        }
+      : {
+          match_feel:        meta.match_feel ?? null,
+          performance_feel:  meta.performance_feel ?? null,
+          fun_rating:        meta.fun_rating ?? null,
+          tilt_mood:         meta.tilt_mood ?? null,
+          team_tempo:        meta.team_tempo ?? null,
+          team_coordination: meta.team_coordination ?? null,
+          enemy_tempo:       meta.enemy_tempo ?? null,
+          enemy_coordination: meta.enemy_coordination ?? null,
+        }
+
+    // ── Leavers: types and booleans written TOGETHER, always ──────────────
+    // The booleans are not legacy debris — they are read in many places
+    // (builder-lib's variable registry, combat_facts, the Home leaver
+    // displays) and are deliberately kept in this patch. Writing the type
+    // without the boolean, or vice versa, would break the invariant that every
+    // true boolean pairs with a non-'none' type — which is exactly what the
+    // schema migration verified across all 192 historical rows. Derive the
+    // boolean FROM the type so the two cannot drift.
+    const leaverTypes = resolveLeaverTypes(meta)
+
     const { data: match, error: matchError } = await supabase
       .from('matches')
       .insert({
@@ -706,18 +850,13 @@ export default function ProcessPage() {
         total_eliminations: processed.eliminations,
         total_assists: processed.assists,
         total_deaths: processed.deaths,
-        match_feel: meta.match_feel,
-        performance_feel: meta.performance_feel,
-        tilt_mood: meta.tilt_mood ?? null,
-        team_tempo: meta.team_tempo ?? null,
-        team_coordination: meta.team_coordination ?? null,
-        team_leaver: meta.team_leaver ?? false,
-        team_thrower: meta.team_thrower ?? false,
-        enemy_tempo: meta.enemy_tempo ?? null,
-        enemy_coordination: meta.enemy_coordination ?? null,
-        enemy_leaver: meta.enemy_leaver ?? false,
+        ...feelColumns,
+        team_leaver_type:  leaverTypes.team,
+        enemy_leaver_type: leaverTypes.enemy,
+        team_leaver:  leaverTypes.team !== 'none',
+        enemy_leaver: leaverTypes.enemy !== 'none',
+        team_thrower:  meta.team_thrower ?? false,
         enemy_thrower: meta.enemy_thrower ?? false,
-        fun_rating: meta.fun_rating,
         personal_thoughts: meta.personal_thoughts,
         is_alpha: isAlpha,
       })
@@ -802,6 +941,78 @@ export default function ProcessPage() {
         .insert(scoreboardInserts)
       if (sbError) console.warn('Failed to save scoreboard players:', sbError)
       else console.log(`Saved ${scoreboardInserts.length} scoreboard players to database`)
+    }
+
+    // ── match_standouts: impressed ally / struggled enemy ─────────────────
+    // The picks were captured ON THE PHONE as bare SLOT NUMBERS, immediately
+    // after the match, because that is when the answer is remembered rather
+    // than invented. They are resolved to a hero HERE, at save time, and this
+    // ordering is the whole point: onAuditComplete has already written the
+    // audited heroes into all four scoreboard arrays, so a slot the matcher
+    // got wrong and the user corrected resolves to the CORRECTED hero. Resolve
+    // any earlier and a misidentification would be baked into the pick.
+    //
+    // Both the slot and the resolved name are stored. The slot is the captured
+    // fact and never changes; hero_name is an interpretation of it.
+    //
+    // hero_name stays NULL when no scoreboard row exists for that slot — a
+    // failed extraction, or a photo the detector missed. The pick is still
+    // written: the subjective answer is real and was given, and losing it
+    // because the machine had a bad day would be the wrong trade. In normal
+    // operation the audit resolves every slot, so a null here is a signal that
+    // something upstream went wrong, not routine.
+    //
+    // Permanent-leaver games contribute nothing: the phone skips the step
+    // entirely, so both arrays arrive empty.
+    if (match) {
+      const standoutInserts: {
+        match_id: number
+        kind: StandoutKind
+        slot: number
+        hero_name: string | null
+      }[] = []
+
+      const heroForSlot = (slot: number): string | null =>
+        processed.scoreboard?.stats.find(s => s.slot === slot)?.heroName ?? null
+
+      const collect = (slots: number[] | undefined, kind: StandoutKind) => {
+        // Dedupe defensively — the phone's toggles cannot produce a repeat,
+        // but a duplicate would violate unique(match_id, kind, slot) and take
+        // the whole batch of picks down with it.
+        for (const slot of new Set(slots ?? [])) {
+          // The DB CHECK allows 1-12. Anything outside that is malformed
+          // metadata; drop the row rather than let it reject the insert.
+          if (!Number.isInteger(slot) || slot < 1 || slot > 12) {
+            console.warn(`[standouts] ignoring out-of-range slot ${slot} (${kind})`)
+            continue
+          }
+          standoutInserts.push({
+            match_id: match.id,
+            kind,
+            slot,
+            hero_name: heroForSlot(slot),
+          })
+        }
+      }
+
+      collect(meta.impressed_ally_slots, 'impressed_ally')
+      collect(meta.struggled_enemy_slots, 'struggled_enemy')
+
+      if (standoutInserts.length > 0) {
+        const { error: standoutError } = await supabase
+          .from('match_standouts')
+          .insert(standoutInserts)
+        // Warn, never throw. A subjective pick failing to store must not cost
+        // the user the match — same posture as the hero-stats insert above.
+        if (standoutError) console.warn('Failed to save match standouts:', standoutError)
+        else {
+          const unresolved = standoutInserts.filter(s => s.hero_name === null).length
+          console.log(
+            `Saved ${standoutInserts.length} match standouts` +
+            (unresolved > 0 ? ` (${unresolved} unresolved — no scoreboard row for that slot)` : ''),
+          )
+        }
+      }
     }
 
     // Clean up pending files — LAST, only after every insert above succeeded.
@@ -1023,6 +1234,37 @@ export default function ProcessPage() {
                 Confirm every row against the scoreboard before saving.
               </p>
             </div>
+            {/* (v1.1.0 Phase 4) NO HERO BREAKDOWN — warn BEFORE saving.
+                Nine matches (25–31 July 2026, 4.7% of the database) saved with a
+                complete scoreboard and zero hero_performances rows. They are
+                invisible to every hero-grain surface in the app — Hero Analytics,
+                Combat, Home's Season Breakdown — and nothing said a word at the
+                time. Re-processing is not viable (feel answers are subjective and
+                unrecoverable), so the only place this can be caught is here,
+                while the photos are still to hand.
+
+                The cause was never determined: the pre-v1.0.2 OpenCV worker leak
+                was silent by construction (the throw was caught and orb set to 0),
+                so "extraction crashed" and "the screenshots were never uploaded"
+                leave identical evidence. This warns either way.
+
+                Deliberately NOT blocking. Saving a match with no breakdown is
+                legitimate — the summary, result and scoreboard are all still
+                worth keeping. This makes the loss visible, not impossible. */}
+            {item.result.heroes.length === 0 && (
+              <div className="bg-ow-panel border border-ow-orange/50 rounded-lg p-4 text-sm">
+                <p className="text-ow-orange font-display tracking-wider uppercase text-xs mb-1">
+                  No hero breakdown
+                </p>
+                <p className="text-ow-muted">
+                  This match has no per-hero data, so it won&apos;t appear in Hero
+                  Analytics, Combat, or the Season Breakdown — only its result and
+                  scoreboard will be kept. If you have the breakdown screenshots,
+                  discard this batch and re-upload with them included. Saving now is
+                  fine if you don&apos;t.
+                </p>
+              </div>
+            )}
             {sb ? (
               <HeroAuditPanel
                 heroes={sb.heroes}
@@ -1033,11 +1275,22 @@ export default function ProcessPage() {
                 onComplete={onAuditComplete}
               />
             ) : (
-              // Leaver games legitimately have no scoreboard, so there is
-              // nothing to audit — save straight through.
+              // No scoreboard to audit — save straight through. Two different
+              // causes now reach this branch and they must not read alike: a
+              // PERMANENT-leaver game is expected and correct, whereas a
+              // missing board on any other match means extraction failed and
+              // is worth noticing. (A RETURNED leaver no longer lands here at
+              // all — its board is complete and gets audited normally.)
               <>
                 <div className="bg-ow-panel border border-ow-line rounded-lg p-4 text-sm text-ow-muted">
-                  No scoreboard for this match (leaver game) — nothing to check.
+                  {discardsScoreboard(item.batch.metadata) ? (
+                    <>Permanent leaver — the board is a row short, so its stats aren&apos;t
+                    read. Nothing to check.</>
+                  ) : (
+                    <>No scoreboard was extracted for this match. Nothing to check —
+                    but this wasn&apos;t a leaver game, so the scoreboard photo may be
+                    missing or unreadable.</>
+                  )}
                 </div>
                 <button
                   onClick={() => onAuditComplete({ rows: [], correctedSlots: [], bulkConfirmedSlots: [], reviewSeconds: 0 })}

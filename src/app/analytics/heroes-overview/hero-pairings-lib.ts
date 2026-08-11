@@ -45,10 +45,16 @@ export interface HeroPlayRow {
 // Filters shared with the rest of analytics (queue/mode/map). Queue's role
 // component can't be enforced on hero grain (no role column) — handled by the
 // page's hero scoping, same as the builder. Format + mode + map apply here.
+//
+// (v1.1.0 Phase 2) mode and map became ARRAYS, matching AnalyticsFilterState.
+// ⚠️ EMPTY ARRAY = NO FILTER. The old 'all' sentinel is gone; the page's bridge
+// now copies the arrays across instead of translating a sentinel.
+// `format` stays scalar because Queue is still single-select — 5v5 and 6v6
+// never mix, so there is nothing to multi-select.
 export interface ComboFilters {
   format: '5v5' | '6v6' | 'all'
-  mode: string | 'all'
-  map: string | 'all'
+  modes: string[]
+  maps: string[]
 }
 
 // A match reduced to: my lineup (heroes >= threshold) + its result + dims.
@@ -69,8 +75,11 @@ export function buildLineups(
   const byMatch = new Map<number, { heroes: Set<string>; result: Result }>()
   for (const r of rows) {
     if (filters.format !== 'all' && r.match_format !== filters.format) continue
-    if (filters.mode !== 'all' && r.game_mode !== filters.mode) continue
-    if (filters.map !== 'all' && r.map !== filters.map) continue
+    // OR within each list, AND between them. [] = no filter. A row with a null
+    // mode or map belongs to none of the ticked options, so ticking any of them
+    // excludes it — identical to the old `!== 'all' && r.x !== filters.x` test.
+    if (filters.modes.length > 0 && !(r.game_mode != null && filters.modes.includes(r.game_mode))) continue
+    if (filters.maps.length > 0 && !(r.map != null && filters.maps.includes(r.map))) continue
     const pct = r.percent_played == null ? 0 : r.percent_played
     if (pct < thresholdPct) continue
     if (!byMatch.has(r.match_id)) byMatch.set(r.match_id, { heroes: new Set(), result: r.result })

@@ -7,12 +7,13 @@ import {
 } from 'recharts'
 import { supabase } from '@/lib/supabase'
 import { keepVisible } from '@/lib/alpha'
-import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
+import { loadExclusionPrefs, EXCLUSION_COLS } from '@/lib/leaver'
 import { defaultSeasonSelection } from '@/lib/season-util'
 import { HEROES } from '@/data/reference'
 import AnalyticsFilters, {
   DEFAULT_FILTERS,
   matchesFilters,
+  heroMatches,
   type AnalyticsFilterState,
   type FilterableMatch,
   type SeasonOption,
@@ -60,7 +61,12 @@ const COLS =
   'eff_play_time_seconds, scoreboard_hero, user_elims, user_assists, user_deaths, user_damage, ' +
   'user_healing, user_mitigation, ally_total_damage, enemy_total_damage, damage_pct, healing_pct, ' +
   'mitigation_pct, final_blows, solo_kills, obj_contest_time, players_saved, role_played, is_alpha, ' +
-  'team_leaver, enemy_leaver, ally_total_deaths'
+  'ally_total_deaths, ' +
+  // The six columns the excluded-games policy needs. Selecting the leaver
+  // BOOLEANS alone is not enough — they are true for both a permanent and a
+  // returned leaver, which now have separate switches. combat_facts was
+  // rebuilt in v1.1.0 to expose the type and thrower columns for this.
+  EXCLUSION_COLS
 
 const HERO_ROLE = buildHeroRoleMap(HEROES.map(h => ({ name: h.name, role: h.role as Role })))
 
@@ -177,8 +183,8 @@ function RoleBreakdown({ rows, role, modeActive, mapActive, heroActive, minGames
           <ShareDrillChart data={drill} dimLabel={dimLabel} />
         </Panel>
       ) : (
-        <Panel title={`${shareLabel}`} hint="hero selected — see the stat cards above">
-          <p className="text-sm text-ow-faint">With a single hero filtered, the breakdown chart is hidden; the averages above cover that hero.</p>
+        <Panel title={`${shareLabel}`} hint="nothing left to break down by">
+          <p className="text-sm text-ow-faint">Mode, map and hero are all filtered, so there is no dimension left to vary across; the averages above cover the current selection.</p>
         </Panel>
       )}
 
@@ -361,16 +367,16 @@ export default function CombatPage() {
   const [seasonOptions, setSeasonOptions] = useState<SeasonOption[]>([])
   const [loading, setLoading] = useState(true)
   const [sixRoles, setSixRoles] = useState<Set<Role>>(new Set())
-  // Bumped once the leaver preference has loaded, so the filter memo re-runs
-  // with the correct show/hide decision (the cache starts at "hide").
+  // Bumped once the excluded-games preferences have loaded, so the filter memo
+  // re-runs with the correct show/hide decisions (the cache starts fully hidden).
   const [leaverReady, setLeaverReady] = useState(false)
   const seasonDefaulted = useRef(false)
 
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    // Load the leaver-visibility preference (cached) alongside the data.
-    loadLeaverPref().then(() => { if (!cancelled) setLeaverReady(true) })
+    // Load the excluded-games preferences (cached) alongside the data.
+    loadExclusionPrefs().then(() => { if (!cancelled) setLeaverReady(true) })
     Promise.all([
       supabase.from('combat_facts').select(COLS),
       supabase.from('seasons').select('id, name, start_date, end_date').order('start_date', { ascending: false }),
@@ -391,19 +397,27 @@ export default function CombatPage() {
 
   const role = roleFromQueue(filters.queue)
   const is6v6 = filters.queue === '6v6'
-  const modeActive = filters.mode !== 'all'
-  const mapActive = filters.map !== ''
-  const heroActive = filters.hero !== ''
+  // "Is this filter narrowing anything?" — feeds drillDimension, which picks the
+  // next UNFILTERED dimension to break the chart down by (mode → map → hero).
+  // An empty array means no filter, so the test is length-based now.
+  const modeActive = filters.modes.length > 0
+  const mapActive = filters.maps.length > 0
+  const heroActive = filters.heroes.length > 0
 
-  // Apply shared Queue/Mode/Map/Hero filters, plus leaver exclusion (unless the
-  // Settings switch is on). Combat is a performance surface, so leaver games are
-  // hidden by default. leaverReady is in the deps so this re-runs once the
-  // preference has loaded from the DB.
+  // Apply shared Queue/Mode/Map/Season/Hero filters, plus the excluded-games policy.
+  // Combat is a performance surface, so leavers and throwers are hidden unless
+  // their switches are on. The page no longer decides WHICH games to drop — it
+  // opts in and @/lib/leaver owns the rule, so every surface agrees. leaverReady
+  // is in the deps so this re-runs once the prefs arrive from the DB.
+  //
+  // (v1.1.0 Phase 2) Hero is tested with the shared heroMatches() rather than a
+  // local comparison. These rows are HERO-GRAIN (one per hero per match, from
+  // combat_facts), so pooling is a direct membership test — unlike the
+  // match-grain pages, which have to union id sets to reach the same semantics.
   const rows = useMemo(() => {
-    const excludeLeavers = !showLeaverGames()
     return factRows.filter(r => {
-      if (!matchesFilters(r, filters, { excludeLeavers })) return false
-      if (filters.hero !== '' && r.hero_name !== filters.hero) return false
+      if (!matchesFilters(r, filters, { applyExclusions: true })) return false
+      if (!heroMatches(r.hero_name, filters)) return false
       return true
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps

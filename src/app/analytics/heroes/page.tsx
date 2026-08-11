@@ -3,9 +3,11 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
-import Select from '@/components/Select'
+// (v1.1.0 Phase 2) <Select> is no longer used here — Season, Mode and Map are all
+// multi-select now, and Format/Role are button toggles.
+import MultiSelect from '@/components/MultiSelect'
 import { matchQuery } from '@/lib/alpha'
-import { loadLeaverPref, showLeaverGames } from '@/lib/leaver'
+import { loadExclusionPrefs, isExcludedGame, EXCLUSION_COLS, type ExcludableRow } from '@/lib/leaver'
 import { defaultSeasonSelection } from '@/lib/season-util'
 import { HEROES, MAPS, GAME_MODE_CONFIG, type GameMode } from '@/data/reference'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
@@ -36,6 +38,21 @@ const SINGLE_HERO_PCT = 95   // a "single-hero game" = played >= this % on the h
 const HERO_ROLE = new Map<string, 'tank' | 'dps' | 'support'>(HEROES.map(h => [h.name, h.role]))
 const GAME_MODES = Object.keys(GAME_MODE_CONFIG) as GameMode[]
 const mapsForMode = (mode: GameMode) => MAPS.filter(m => m.mode === mode).map(m => m.name).sort()
+
+// (v1.1.0 Phase 5) How the hero list is ordered. Kept as a union rather than a
+// boolean so a third order (avg deaths, playtime) is an addition, not a rewrite.
+type HeroSort = 'games' | 'win_rate'
+// (v1.1.0 Phase 2) Maps offered for a SET of modes: no modes = every map, several
+// modes = the UNION of their maps, deduped (the same map can serve more than one
+// mode in reference data, and a duplicate row would tick twice). Mirrors
+// AnalyticsFilters.mapNamesForModes — kept local because this page holds its own
+// filter state rather than the shared one.
+const mapNamesForModes = (modes: GameMode[]): string[] => {
+  const src = modes.length === 0
+    ? MAPS.map(m => m.name)
+    : modes.flatMap(m => mapsForMode(m))
+  return Array.from(new Set(src)).sort((a, b) => a.localeCompare(b))
+}
 
 function heroPortrait(name: string): string {
   const cleaned = name.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/:/g, '')
@@ -118,12 +135,15 @@ export default function AnalyticsHeroesPage() {
 
   const [format, setFormat] = useState<Format>('5v5')
   const [roleTab, setRoleTab] = useState<RoleTab>('all')
-  const [mode, setMode] = useState<GameMode | ''>('')
-  const [mapName, setMapName] = useState<string>('')
+  const [modes, setModes] = useState<GameMode[]>([])
+  const [maps, setMaps] = useState<string[]>([])
   const [seasons, setSeasons] = useState<SeasonRow[]>([])
   // Season multi-select: [] = All Time; else exactly these season ids.
   const [seasonSel, setSeasonSel] = useState<number[]>([])
   const [expanded, setExpanded] = useState<string | null>(null)
+  // (v1.1.0 Phase 5) Sort order for the hero list. 'games' is the default and
+  // reproduces the previous fixed behaviour exactly, so the page opens unchanged.
+  const [sortBy, setSortBy] = useState<HeroSort>('games')
   const seasonDefaulted = useRef(false)
 
   const load = useCallback(async () => {
@@ -139,19 +159,21 @@ export default function AnalyticsHeroesPage() {
     }
 
     const [mIds, { data: mf }, { data: sf }] = await Promise.all([
-      matchQuery('id, team_leaver, enemy_leaver').order('played_at', { ascending: false }),
+      matchQuery('id, ' + EXCLUSION_COLS).order('played_at', { ascending: false }),
       supabase.from('hero_match_facts').select(MATCH_FACT_COLS),
       supabase.from('hero_stat_facts').select(STAT_FACT_COLS),
     ])
-    await loadLeaverPref()
+    // MUST be awaited BEFORE isExcludedGame runs: the predicate reads a
+    // synchronous cache that starts fully hidden, so calling it first would drop
+    // every flagged game regardless of the switches.
+    await loadExclusionPrefs()
     // visibleIds gates every fact row (match + stat). The set already honours the
-    // alpha rule (matchQuery). Heroes is a performance surface, so leaver games are
-    // ALSO excluded here unless the Settings switch is on — by dropping their ids
-    // from the visible set, which removes them from both grains at once.
+    // alpha rule (matchQuery). Heroes is a performance surface, so the
+    // excluded-games policy applies here too — by dropping those ids from the
+    // visible set, which removes them from both grains at once.
     const idRows =
-      (((mIds as unknown) as { data: { id: number; team_leaver: boolean | null; enemy_leaver: boolean | null }[] | null }).data) || []
-    const showLeavers = showLeaverGames()
-    const keptIds = idRows.filter(r => showLeavers || (r.team_leaver !== true && r.enemy_leaver !== true))
+      (((mIds as unknown) as { data: ({ id: number } & ExcludableRow)[] | null }).data) || []
+    const keptIds = idRows.filter(r => !isExcludedGame(r))
     setVisibleIds(new Set(keptIds.map(r => r.id)))
     setMatchFacts((mf as MatchFactRow[] | null) || [])
     setStatFacts((sf as StatFactRow[] | null) || [])
@@ -167,28 +189,36 @@ export default function AnalyticsHeroesPage() {
     return sid != null && seasonSel.includes(sid)
   }, [seasonSel])
 
+  // (v1.1.0 Phase 2) Mode and map are multi-select. OR within each list, AND
+  // between them; [] = no filter. A row with a null mode/map belongs to none of
+  // the ticked options, so it shows only under the empty selection — identical
+  // to the old `mode && r.game_mode !== mode` behaviour.
+  const modeMapOk = useCallback((gm: string | null, mp: string | null) => {
+    if (modes.length > 0 && !(gm != null && (modes as string[]).includes(gm))) return false
+    if (maps.length > 0 && !(mp != null && maps.includes(mp))) return false
+    return true
+  }, [modes, maps])
+
   // Shared row filter: alpha-excluded, format, season, mode, map.
   const matchRowsInScope = useMemo(() => {
     return matchFacts.filter(r => {
       if (!visibleIds.has(r.match_id)) return false
       if (r.match_format !== format) return false
       if (!seasonOk(r.season_id)) return false
-      if (mode && r.game_mode !== mode) return false
-      if (mapName && r.map !== mapName) return false
+      if (!modeMapOk(r.game_mode, r.map)) return false
       return true
     })
-  }, [matchFacts, visibleIds, format, seasonOk, mode, mapName])
+  }, [matchFacts, visibleIds, format, seasonOk, modeMapOk])
 
   const statRowsInScope = useMemo(() => {
     return statFacts.filter(r => {
       if (!visibleIds.has(r.match_id)) return false
       if (r.match_format !== format) return false
       if (!seasonOk(r.season_id)) return false
-      if (mode && r.game_mode !== mode) return false
-      if (mapName && r.map !== mapName) return false
+      if (!modeMapOk(r.game_mode, r.map)) return false
       return true
     })
-  }, [statFacts, visibleIds, format, seasonOk, mode, mapName])
+  }, [statFacts, visibleIds, format, seasonOk, modeMapOk])
 
   // ---- aggregate per hero (games-weighted, one match counted once) ----
   interface HeroAgg {
@@ -269,7 +299,23 @@ export default function AnalyticsHeroesPage() {
 
   let heroes = heroAggs.filter(h => h.games >= MIN_GAMES)
   if (roleTab !== 'all') heroes = heroes.filter(h => HERO_ROLE.get(h.hero_name) === roleTab)
-  heroes.sort((a, b) => b.games - a.games)
+  // (v1.1.0 Phase 5) Sortable. Games remains the default.
+  //
+  // ⚠️ A null win rate means NO DECISIVE GAMES (all draws) — not a zero. Those
+  // heroes sink to the bottom under the win-rate sort rather than sorting as 0%,
+  // which would rank "never won or lost" below a genuine 0% and above nothing.
+  // Games is the tiebreak either way, so equal win rates put the larger sample
+  // first — the same convention the matchups lists use.
+  heroes.sort((a, b) => {
+    if (sortBy === 'win_rate') {
+      const aw = a.win_rate, bw = b.win_rate
+      if (aw == null && bw == null) return b.games - a.games
+      if (aw == null) return 1
+      if (bw == null) return -1
+      if (bw !== aw) return bw - aw
+    }
+    return b.games - a.games
+  })
 
   const fmtToggle = (f: Format) => (
     <button key={f} onClick={() => { setFormat(f); setExpanded(null) }}
@@ -296,66 +342,79 @@ export default function AnalyticsHeroesPage() {
         </div>
         <div className="flex flex-col gap-1">
           <span className={labelCls}>Season</span>
-          <div className="flex flex-wrap items-center gap-2 bg-ow-dark border border-ow-line rounded-lg px-3 py-2 min-h-[2.5rem]">
-            <label className="flex items-center gap-1.5 cursor-pointer select-none">
-              <input type="checkbox" className="accent-ow-orange w-3.5 h-3.5"
-                checked={seasonSel.length === 0}
-                onChange={() => { setSeasonSel([]); setExpanded(null) }} />
-              <span className={`text-sm font-display tracking-wider ${seasonSel.length === 0 ? 'text-ow-orange' : 'text-ow-muted'}`}>All Time</span>
-            </label>
-            {seasons.map(s => {
-              const checked = seasonSel.includes(s.id)
-              return (
-                <label key={s.id} className="flex items-center gap-1.5 cursor-pointer select-none">
-                  <input type="checkbox" className="accent-ow-orange w-3.5 h-3.5"
-                    checked={checked}
-                    onChange={() => {
-                      setSeasonSel(sel => sel.includes(s.id) ? sel.filter(x => x !== s.id) : [...sel, s.id])
-                      setExpanded(null)
-                    }} />
-                  <span className={`text-sm font-display tracking-wider ${checked ? 'text-ow-fg' : 'text-ow-muted'}`}>{s.name}</span>
-                </label>
-              )
-            })}
-          </div>
+          <MultiSelect<number>
+            className={selectCls}
+            value={seasonSel}
+            onChange={sel => { setSeasonSel(sel); setExpanded(null) }}
+            options={seasons.map(s => ({ value: s.id, label: s.name }))}
+            allLabel="All Time"
+            noun="seasons"
+            aria-label="Season"
+          />
         </div>
         <label className="flex flex-col gap-1">
           <span className={labelCls}>Game Mode</span>
-          <Select<GameMode | ''>
+          <MultiSelect<GameMode>
             className={selectCls}
-            value={mode}
-            onChange={m => { setMode(m); setMapName(''); setExpanded(null) }}
-            options={[
-              { value: '', label: 'All modes' },
-              ...GAME_MODES.map(m => ({ value: m, label: m })),
-            ]}
+            value={modes}
+            onChange={next => {
+              // Drop any selected map that no longer belongs to one of the chosen
+              // modes. Clearing to "All modes" widens the offer, so nothing is
+              // dropped — widening never destroys picks.
+              const offered = new Set(mapNamesForModes(next))
+              setMaps(prev => prev.filter(m => offered.has(m)))
+              setModes(next)
+              setExpanded(null)
+            }}
+            options={GAME_MODES.map(m => ({ value: m, label: m }))}
+            allLabel="All modes"
+            noun="modes"
+            aria-label="Game Mode"
           />
         </label>
-        {mode && (
-          <label className="flex flex-col gap-1">
-            <span className={labelCls}>Map</span>
-            <Select<string>
-              className={selectCls}
-              value={mapName}
-              onChange={m => { setMapName(m); setExpanded(null) }}
-              options={[
-                { value: '', label: `All ${mode} maps` },
-                ...mapsForMode(mode).map(m => ({ value: m, label: m })),
-              ]}
-            />
-          </label>
-        )}
+        <label className="flex flex-col gap-1">
+          <span className={labelCls}>Map</span>
+          <MultiSelect<string>
+            className={selectCls}
+            value={maps}
+            onChange={m => { setMaps(m); setExpanded(null) }}
+            options={mapNamesForModes(modes).map(m => ({ value: m, label: m }))}
+            allLabel="All maps"
+            noun="maps"
+            searchable
+            searchPlaceholder="Search maps…"
+            aria-label="Map"
+          />
+        </label>
       </div>
 
-      <div className="flex gap-2">
-        {(['all', 'tank', 'dps', 'support'] as RoleTab[]).map(role => (
-          <button key={role} onClick={() => { setRoleTab(role); setExpanded(null) }}
-            className={`px-4 py-1.5 rounded-lg text-sm font-display tracking-wider transition-colors
-              ${roleTab === role ? 'bg-ow-orange text-ow-dark font-bold'
-                                 : 'bg-ow-panel text-ow-muted hover:text-ow-fg border border-ow-line'}`}>
-            {role.toUpperCase()}
-          </button>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex gap-2">
+          {(['all', 'tank', 'dps', 'support'] as RoleTab[]).map(role => (
+            <button key={role} onClick={() => { setRoleTab(role); setExpanded(null) }}
+              className={`px-4 py-1.5 rounded-lg text-sm font-display tracking-wider transition-colors
+                ${roleTab === role ? 'bg-ow-orange text-ow-dark font-bold'
+                                   : 'bg-ow-panel text-ow-muted hover:text-ow-fg border border-ow-line'}`}>
+              {role.toUpperCase()}
+            </button>
         ))}
+        </div>
+
+        {/* (v1.1.0 Phase 5) Sort toggle. Sits opposite the role tabs — same row,
+            since both narrow/order the one list below. */}
+        <div className="flex items-center gap-2">
+          <span className={labelCls}>Sort by</span>
+          <div className="flex gap-2">
+            {([['games', 'GAMES'], ['win_rate', 'WIN RATE']] as [HeroSort, string][]).map(([key, label]) => (
+              <button key={key} onClick={() => { setSortBy(key); setExpanded(null) }}
+                className={`px-4 py-1.5 rounded-lg text-sm font-display tracking-wider transition-colors
+                  ${sortBy === key ? 'bg-ow-orange text-ow-dark font-bold'
+                                   : 'bg-ow-panel text-ow-muted hover:text-ow-fg border border-ow-line'}`}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       <p className="text-sm text-ow-muted">{heroes.length} heroes · {format.toUpperCase()} · min {MIN_GAMES} games</p>

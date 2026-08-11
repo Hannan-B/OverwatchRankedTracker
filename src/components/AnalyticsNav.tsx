@@ -33,12 +33,20 @@ export interface AnalyticsGroup {
 //   1. Match-level views   2. Hero views   3. The generic Builder (alone)
 // Both the top sub-nav, the /analytics overview, and the Home block render from
 // this — so order/labels/grouping can never drift between them.
+//
+// ⚠️ (v1.1.0 Phase 6) BLURBS MUST NOT NAME A SPECIFIC FEEL FIELD BY VERSION.
+// The Feel blurb used to advertise "tilt" and "tempo" — version-1 questions
+// retired in this patch — so the menu promised two charts the page would stop
+// drawing the moment a version-2 season began. It is now worded from what the
+// page ASKS ABOUT (fun, the matchup, your own performance), which is true on
+// both scales. `seasons.question_scale_version` decides which columns render;
+// this list has no access to that and must never imply it does.
 export const ANALYTICS_GROUPS: AnalyticsGroup[] = [
   {
     label: 'Match analysis',
     tabs: [
       { href: '/analytics/outcomes', label: 'Outcomes', kind: 'curated', blurb: 'Win rate by mode, map, and role, with 5v5 vs 6v6 and your result mix.' },
-      { href: '/analytics/feel', label: 'Feel', kind: 'curated', blurb: 'How fun, match feel, tilt, and tempo line up against your results.' },
+      { href: '/analytics/feel', label: 'Feel', kind: 'curated', blurb: 'How fun, matchup feel, and your own performance ratings line up against your results.' },
       { href: '/analytics/time', label: 'Time', kind: 'curated', blurb: 'Streaks, sessions, time-of-day, and game-length patterns.' },
       { href: '/analytics/combat', label: 'Combat', kind: 'curated', blurb: 'Damage/healing share, E/A/D trends, and how stats differ in wins vs losses.' },
     ],

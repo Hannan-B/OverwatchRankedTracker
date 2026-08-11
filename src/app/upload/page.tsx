@@ -2,34 +2,56 @@
 
 import { useState, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
-import type { RoleType, MatchFeel, PerformanceFeel, StartingSide } from '@/lib/types'
+import type { RoleType, StartingSide } from '@/lib/types'
 import { detectMapFromPhotos } from '@/lib/phone-map-detect'
 import { needsStartingSide } from '@/data/reference'
 
 // ============================================================
-// MOBILE UPLOAD — one-thing-per-screen flow (Phase 2 rebuild v2)
+// MOBILE UPLOAD — one-thing-per-screen flow
 //
-// v2 changes:
-//   - Rounded buttons (reverted from angular cut)
-//   - Full words on team/enemy scales (stacked full-width rows)
-//   - Auto-advance on single-select questions (~250ms delay so the
-//     selection highlight is visible). EXCEPTIONS that keep NEXT:
-//     6v6 roles (multi), team feel, enemy feel, thoughts, photos.
-//   - Back button on every step.
+// (v1.1.0) QUESTION SET REBUILT — question scale version 2.
+// See PATCH-SPEC-v1.1.0.md §3. Summary of WHY, so nobody re-adds them:
+//
+//   RETIRED — tempo + coordination (both teams). Unanswerable by
+//   construction: a control match can have a tight first point then two
+//   collapses; an escort map a trivial first stage and a brutal last one.
+//   Any single value for a multi-round game is a lie. The owner also
+//   reported clicking through them without thought, which contaminates
+//   the answers regardless of how healthy the distribution looks.
+//
+//   RETIRED — tilt. The answer depends on a fact not yet known: "fired up"
+//   and "I should stop" are not alternatives at the end of a session, and
+//   which one applies depends on whether this is the last game. Same defect
+//   as tempo. Loss-carry-over is now DERIVED from played_at via time-lib's
+//   session/streak helpers instead, which cannot be contaminated by mood.
+//
+//   REPLACED — match_feel (3) -> matchup_feel (5). Measures TEAM STRENGTH,
+//   not result: "Behind" + victory is legitimate and interesting.
+//   REPLACED — performance_feel (3) -> performance_rating (5).
+//   REPLACED — fun_rating (1-5) -> fun_rating_6 (1-6, NO midpoint, so every
+//   answer must lean; the old 3/4 pair were interchangeable).
+//
+//   ADDED — leaver/thrower as a multi-select per team (was two toggles).
+//   ADDED — slot picks: which ally impressed, which enemy gave trouble.
+//
+// The OLD columns are frozen, not dropped. Season 3 keeps its data on the
+// old scale; the two are NEVER pooled. seasons.question_scale_version says
+// which set a season used.
 //
 // Preserves phone-side map detection + attack/defend. No default_role.
 // ============================================================
 
 const ADVANCE_DELAY = 250 // ms — lets the highlight show before moving on
 
-type Tempo = 'aggressive' | 'balanced' | 'passive'
-type Coordination = 'coordinated' | 'average' | 'chaotic'
-type TiltMood = 'tilted' | 'annoyed' | 'fine' | 'good' | 'hyped'
+// What went wrong on a team. MULTI-SELECT: a game can have both a leaver and
+// a thrower. 'none' is explicit and mutually exclusive with the rest.
+type TeamIssue = 'none' | 'left_gone' | 'left_returned' | 'thrower'
 
 type Step =
-  | 'format' | 'role' | 'vibe' | 'performance' | 'fun'
-  | 'tilt' | 'team' | 'enemy' | 'thoughts'
-  | 'photos' | 'confirm_leaver' | 'checking' | 'confirm_side' | 'uploading' | 'done'
+  | 'format' | 'role' | 'matchup' | 'performance' | 'fun'
+  | 'team' | 'enemy' | 'thoughts'
+  | 'photos' | 'confirm_leaver' | 'checking' | 'confirm_side' | 'standouts'
+  | 'uploading' | 'done'
 
 type FileStatus = 'idle' | 'uploading' | 'success' | 'error'
 interface FilePreview { file: File; preview: string; status: FileStatus }
@@ -95,56 +117,105 @@ function StepShell({
   )
 }
 
-function ScaleRow<T extends string>({
-  label, options, value, onChange, labels,
-}: { label: string; options: T[]; value: T | null; onChange: (v: T | null) => void; labels: Record<T, string> }) {
+// A scale row: big label plus the behavioural test underneath. The test is the
+// point — abstract intensity words (poor / fair / decent) are what made the old
+// 3 and 4 interchangeable. Each option must be decidable in one second.
+function ScaleOption({
+  label, test, selected, onClick,
+}: { label: string; test: string; selected: boolean; onClick: () => void }) {
   return (
-    <div>
-      <p className="text-xs font-display tracking-[0.2em] text-ow-faint uppercase mb-2">{label}</p>
-      <div className="space-y-2">
-        {options.map(opt => (
-          <button key={opt} type="button"
-            onClick={() => onChange(value === opt ? null : opt)}
-            className={`w-full py-3 rounded-xl text-sm font-display tracking-[0.12em] uppercase transition-colors
-              ${value === opt ? 'bg-ow-orange text-ow-dark font-bold'
-                : 'bg-ow-panel text-ow-muted border border-ow-line hover:text-ow-fg'}`}
-          >{labels[opt]}</button>
-        ))}
-      </div>
-    </div>
+    <button type="button" onClick={onClick}
+      className={`w-full py-3.5 px-5 rounded-xl text-left transition-colors
+        ${selected
+          ? 'bg-ow-orange text-ow-dark'
+          : 'bg-ow-panel border border-ow-line hover:border-ow-orange/40'}`}
+    >
+      <span className={`block font-display tracking-[0.15em] uppercase text-base
+        ${selected ? 'font-bold text-ow-dark' : 'text-ow-fg'}`}>{label}</span>
+      <span className={`block text-xs mt-0.5 ${selected ? 'text-ow-dark/75' : 'text-ow-faint'}`}>
+        {test}
+      </span>
+    </button>
   )
 }
 
-function TogglePill({ label, on, onToggle }: { label: string; on: boolean; onToggle: () => void }) {
+const ISSUE_OPTIONS: { v: TeamIssue; label: string; test: string }[] = [
+  { v: 'none',          label: 'NOTHING',        test: 'Normal game' },
+  { v: 'left_gone',     label: 'LEFT — GONE',    test: "Someone left and didn't come back" },
+  { v: 'left_returned', label: 'LEFT — RETURNED', test: 'Someone left and came back' },
+  { v: 'thrower',       label: 'THROWING',       test: 'Someone was throwing' },
+]
+
+// Multi-select. 'NOTHING' is mutually exclusive with the rest (see toggleIssue).
+// The left-gone / left-returned split matters structurally, not cosmetically:
+// a permanent leaver's row DISAPPEARS from the scoreboard, so the board becomes
+// asymmetric and the grid detection can no longer trust which slot is which
+// player — those games write no scoreboard at all. A returned leaver's board is
+// complete, so it is processed and filtered at read time instead.
+function IssuePicker({
+  value, onToggle,
+}: { value: TeamIssue[]; onToggle: (i: TeamIssue) => void }) {
   return (
-    <button type="button" onClick={onToggle}
-      className={`flex-1 px-4 py-3 rounded-xl text-xs font-display tracking-wider uppercase transition-colors
-        ${on ? 'bg-ow-defeat text-white font-bold' : 'bg-ow-panel text-ow-muted border border-ow-line hover:text-ow-fg'}`}
-    >{label}</button>
+    <>
+      {ISSUE_OPTIONS.map(o => (
+        <ScaleOption key={o.v} label={o.label} test={o.test}
+          selected={value.includes(o.v)} onClick={() => onToggle(o.v)} />
+      ))}
+    </>
+  )
+}
+
+// Slot buttons. Numbers only for now — the scoreboard photo is not shown here
+// yet because the phone does not classify which uploaded photo IS the
+// scoreboard. A light detector (modelled on phone-map-detect) can be added
+// later to display it above these buttons with tap-to-enlarge; this grid is the
+// documented FALLBACK and must keep working even when detection misses, so the
+// step is never blocked.
+function SlotGrid({
+  slots, selected, onToggle,
+}: { slots: number[]; selected: number[]; onToggle: (s: number) => void }) {
+  return (
+    <div className="grid grid-cols-3 gap-2">
+      {slots.map(n => (
+        <button key={n} type="button" onClick={() => onToggle(n)}
+          className={`py-4 rounded-xl font-display text-lg tracking-wider transition-colors
+            ${selected.includes(n)
+              ? 'bg-ow-orange text-ow-dark font-bold'
+              : 'bg-ow-panel text-ow-muted border border-ow-line hover:border-ow-orange/40'}`}
+        >{n}</button>
+      ))}
+    </div>
   )
 }
 
 export default function UploadPage() {
   const [step, setStep] = useState<Step>('format')
   const inputRef = useRef<HTMLInputElement>(null)
+  // Parked map/side between the side question and the upload — see proceedAfterSide.
+  const pendingMapRef = useRef<string | null | undefined>(undefined)
+  const pendingSideRef = useRef<StartingSide | null | undefined>(undefined)
 
   const [matchFormat, setMatchFormat] = useState<'5v5' | '6v6' | null>(null)
   const [role, setRole] = useState<RoleType | null>(null)
   const [rolesPlayed, setRolesPlayed] = useState<RoleType[]>([])
 
-  const [matchFeel, setMatchFeel] = useState<MatchFeel | null>(null)
-  const [perfFeel, setPerfFeel] = useState<PerformanceFeel | null>(null)
-  const [funRating, setFunRating] = useState<number | null>(null)
-  const [tiltMood, setTiltMood] = useState<TiltMood | null>(null)
-  const [teamTempo, setTeamTempo] = useState<Tempo | null>(null)
-  const [teamCoord, setTeamCoord] = useState<Coordination | null>(null)
-  const [teamLeaver, setTeamLeaver] = useState(false)
-  const [teamThrower, setTeamThrower] = useState(false)
-  const [enemyTempo, setEnemyTempo] = useState<Tempo | null>(null)
-  const [enemyCoord, setEnemyCoord] = useState<Coordination | null>(null)
-  const [enemyLeaver, setEnemyLeaver] = useState(false)
-  const [enemyThrower, setEnemyThrower] = useState(false)
+  // Scale version 2 fields. 1-5, 1-5, 1-6 respectively.
+  const [matchupFeel, setMatchupFeel] = useState<number | null>(null)
+  const [perfRating, setPerfRating] = useState<number | null>(null)
+  const [funRating6, setFunRating6] = useState<number | null>(null)
+
+  // Multi-select per team. Empty array = not answered; ['none'] = explicitly nothing.
+  const [teamIssues, setTeamIssues] = useState<TeamIssue[]>([])
+  const [enemyIssues, setEnemyIssues] = useState<TeamIssue[]>([])
   const [thoughts, setThoughts] = useState('')
+
+  // Slot picks — captured on the PHONE, seconds after the match, because that
+  // is when they are remembered. /process can run three days later, by which
+  // point the answer would be invented rather than recalled.
+  // Stored as SLOTS; resolved to hero names at save time, AFTER the hero audit
+  // (a slot's hero is not trustworthy until HeroAuditPanel has been through it).
+  const [impressedAlly, setImpressedAlly] = useState<number[]>([])
+  const [struggledEnemy, setStruggledEnemy] = useState<number[]>([])
 
   const [files, setFiles] = useState<FilePreview[]>([])
 
@@ -154,6 +225,47 @@ export default function UploadPage() {
   // Leaver games skip scoreboard processing, so a tagged leaver gets an explicit
   // confirmation before the upload commits. This tracks that the user has seen it.
   const [leaverConfirmed, setLeaverConfirmed] = useState(false)
+
+  // ---- derived from the issue multi-selects -------------------------------
+  // The booleans are still written so nothing downstream breaks on day one;
+  // the *_leaver_type columns carry the new three-state detail.
+  const teamLeaverType: 'none' | 'left' | 'returned' =
+    teamIssues.includes('left_gone') ? 'left'
+      : teamIssues.includes('left_returned') ? 'returned' : 'none'
+  const enemyLeaverType: 'none' | 'left' | 'returned' =
+    enemyIssues.includes('left_gone') ? 'left'
+      : enemyIssues.includes('left_returned') ? 'returned' : 'none'
+
+  const teamLeaver = teamLeaverType !== 'none'
+  const enemyLeaver = enemyLeaverType !== 'none'
+  const teamThrower = teamIssues.includes('thrower')
+  const enemyThrower = enemyIssues.includes('thrower')
+
+  // A PERMANENT leaver means the scoreboard is geometrically broken — a row
+  // disappears, the board becomes asymmetric (5 allies vs 6 enemies), and the
+  // VS-gap grid detection can no longer trust which slot is which player. Those
+  // games write NO scoreboard at all, so there are no slots to pick from.
+  // A RETURNED leaver still has a full board, so slot picks are fine.
+  const hasPermanentLeaver = teamLeaverType === 'left' || enemyLeaverType === 'left'
+
+  // toggle one issue, keeping 'none' mutually exclusive with everything else
+  function toggleIssue(
+    current: TeamIssue[], setter: (v: TeamIssue[]) => void, issue: TeamIssue,
+  ) {
+    if (issue === 'none') { setter(current.includes('none') ? [] : ['none']); return }
+    const without = current.filter(i => i !== 'none')
+    setter(without.includes(issue) ? without.filter(i => i !== issue) : [...without, issue])
+  }
+
+  function toggleSlot(current: number[], setter: (v: number[]) => void, slot: number) {
+    setter(current.includes(slot) ? current.filter(s => s !== slot) : [...current, slot])
+  }
+
+  // Slot ranges mirror scoreboard_players: 5v5 -> ally 1-5, enemy 6-10;
+  // 6v6 -> ally 1-6, enemy 7-12.
+  const teamSize = matchFormat === '6v6' ? 6 : 5
+  const allySlots = Array.from({ length: teamSize }, (_, i) => i + 1)
+  const enemySlots = Array.from({ length: teamSize }, (_, i) => i + 1 + teamSize)
 
   // auto-advance: set value, then move to next step after a brief beat
   function pickAndAdvance<T>(setter: (v: T) => void, value: T, next: Step) {
@@ -237,51 +349,101 @@ export default function UploadPage() {
     const needsSide = mapName ? needsStartingSide(mapName) : false
 
     if (needsSide) {
-      // Ask the question and WAIT — commitUpload runs after the user answers.
-      // (detectedMap state has settled by the time the user answers, so the
-      // side-branch commit reads it from state; pass it explicitly anyway.)
+      // Ask the question and WAIT — the flow continues after the user answers.
       setStep('confirm_side')
     } else {
-      // Map not hybrid/escort, or not detected → upload straight away. Pass the
-      // freshly-detected mapName directly: setDetectedMap above hasn't flushed
-      // yet this tick, so reading the state var here would be stale.
-      await commitUpload(mapName)
+      // Map not hybrid/escort, or not detected → carry on. Pass the freshly
+      // detected mapName directly: setDetectedMap above hasn't flushed yet this
+      // tick, so reading the state var here would be stale.
+      proceedAfterSide(mapName)
     }
   }
 
+  // PHASE 1c — between the side question and the upload sits the slot-picks
+  // step. The resolved map/side are parked in refs rather than re-read from
+  // state, for the same stale-closure reason documented on commitUpload: the
+  // values may have been set in the same tick we navigate away from.
+  //
+  // A PERMANENT-leaver game SKIPS the picks entirely — it writes no scoreboard,
+  // so there are no slots to pick from.
+  function proceedAfterSide(mapOverride?: string | null, sideOverride?: StartingSide | null) {
+    pendingMapRef.current = mapOverride
+    pendingSideRef.current = sideOverride
+    if (hasPermanentLeaver) { void commitUpload(mapOverride, sideOverride); return }
+    setStep('standouts')
+  }
+
   // PHASE 2 — actually upload photos + metadata, then show success.
-  // startingSide is whatever's in state (set by the question, or null).
   // `mapOverride` carries the just-detected map when commit runs in the same
   // tick as detection (the no-side path); otherwise the detectedMap state is
   // authoritative (the side path runs a tick later, after the user answers).
-  async function commitUpload(mapOverride?: string | null) {
+  //
+  // `sideOverride` is the SAME PATTERN for the starting side, and it is not
+  // optional politeness -- without it the value was lost on EVERY upload.
+  // The confirm_side handler calls setStartingSide(side) and then commitUpload()
+  // from a timeout, but the commitUpload it invokes is the function object from
+  // the render in which the handler was created, closing over startingSide as
+  // null. The delay does not help: the binding is captured when the handler
+  // runs, not when the timeout fires. Result: starting_side was null in
+  // metadata.json 100% of the time, and NULL on all 192 stored matches.
+  //
+  // Both overrides use an `!== undefined` sentinel rather than a truthiness or
+  // ?? check, because null is a LEGITIMATE answer here ("Not sure") and must be
+  // distinguishable from "no override passed".
+  async function commitUpload(
+    mapOverride?: string | null,
+    sideOverride?: StartingSide | null,
+  ) {
     setStep('uploading')
     const batchId = Date.now().toString()
     const updated = [...files]
     const effectiveMap = mapOverride !== undefined ? mapOverride : detectedMap
+    const effectiveSide = sideOverride !== undefined ? sideOverride : startingSide
 
     const metadata = {
       match_format: matchFormat,
       role_played: role,
       roles_played: matchFormat === '6v6' ? rolesPlayed : (role ? [role] : []),
-      match_feel: matchFeel,
-      performance_feel: perfFeel,
-      fun_rating: funRating,
-      tilt_mood: tiltMood,
-      team_tempo: teamTempo,
-      team_coordination: teamCoord,
+      // ---- question scale version 2 ----------------------------------------
+      // These map to the NEW columns: matches.matchup_feel (1-5),
+      // matches.performance_rating (1-5), matches.fun_rating_6 (1-6).
+      // The OLD columns (match_feel, performance_feel, fun_rating, tilt_mood,
+      // team_tempo, team_coordination + enemy twins) are FROZEN and are no
+      // longer written. Do NOT map these onto them — the scales are different
+      // and the two sets are never pooled.
+      question_scale_version: 2,
+      matchup_feel: matchupFeel,
+      performance_rating: perfRating,
+      fun_rating_6: funRating6,
+
+      // ---- leavers + throwers ----------------------------------------------
+      // Booleans STILL WRITTEN so nothing downstream breaks on day one; the
+      // *_leaver_type fields carry the new three-state detail.
       team_leaver: teamLeaver,
       team_thrower: teamThrower,
-      enemy_tempo: enemyTempo,
-      enemy_coordination: enemyCoord,
       enemy_leaver: enemyLeaver,
       enemy_thrower: enemyThrower,
-      // Derived convenience flag for the process page: when true, the scoreboard
-      // step is skipped (a leaver collapses the scoreboard layout, so its stats
-      // can't be read). team_leaver / enemy_leaver still carry which side(s).
-      has_leaver: teamLeaver || enemyLeaver,
+      team_leaver_type: teamLeaverType,
+      enemy_leaver_type: enemyLeaverType,
+
+      // Derived convenience flag for the process page. ONLY a PERMANENT leaver
+      // skips the scoreboard: their row disappears, so the board is asymmetric
+      // and the VS-gap grid can no longer be trusted to say which slot is which
+      // player. A RETURNED leaver's board is complete — the numbers are skewed,
+      // but the geometry is intact — so it IS processed, and excluded from
+      // scoreboard-derived surfaces at read time instead.
+      has_leaver: hasPermanentLeaver,
       personal_thoughts: thoughts || null,
-      starting_side: startingSide,
+
+      // ---- slot picks -------------------------------------------------------
+      // Slots only. hero_name is resolved at save time, AFTER the hero audit —
+      // the hero behind a slot is not trustworthy until HeroAuditPanel has been
+      // through it, and a corrected misidentification must carry through.
+      // Empty arrays = explicitly nothing stood out. Absent for permanent-leaver
+      // games (no scoreboard, so the step is skipped).
+      impressed_ally_slots: impressedAlly,
+      struggled_enemy_slots: struggledEnemy,
+      starting_side: effectiveSide,
       detected_map: effectiveMap,
       // Step 10: phone map auto-detect produced nothing. The process page reads
       // this to raise a map dropdown (+ conditional attack/defend) at review,
@@ -320,9 +482,10 @@ export default function UploadPage() {
   function resetForm() {
     setStep('format')
     setMatchFormat(null); setRole(null); setRolesPlayed([])
-    setMatchFeel(null); setPerfFeel(null); setFunRating(null); setTiltMood(null)
-    setTeamTempo(null); setTeamCoord(null); setTeamLeaver(false); setTeamThrower(false)
-    setEnemyTempo(null); setEnemyCoord(null); setEnemyLeaver(false); setEnemyThrower(false)
+    setMatchupFeel(null); setPerfRating(null); setFunRating6(null)
+    setTeamIssues([]); setEnemyIssues([])
+    setImpressedAlly([]); setStruggledEnemy([])
+    pendingMapRef.current = undefined; pendingSideRef.current = undefined
     setThoughts('')
     files.forEach(f => URL.revokeObjectURL(f.preview))
     setFiles([])
@@ -362,115 +525,120 @@ export default function UploadPage() {
         title={fivev5 ? 'Role Played' : 'Roles Played'}
         hint={fivev5 ? undefined : 'Select all roles you played (1–3)'}
         onBack={() => setStep('format')}
-        onNext={fivev5 ? undefined : () => setStep('vibe')}
+        onNext={fivev5 ? undefined : () => setStep('matchup')}
         nextDisabled={rolesPlayed.length === 0}
       >
         {(['tank', 'dps', 'support'] as RoleType[]).map(r => (
           <OptionButton key={r} label={r.toUpperCase()}
             selected={fivev5 ? role === r : rolesPlayed.includes(r)}
-            onClick={() => fivev5 ? pickAndAdvance(setRole, r, 'vibe') : toggleMulti(r)} />
+            onClick={() => fivev5 ? pickAndAdvance(setRole, r, 'matchup') : toggleMulti(r)} />
         ))}
       </StepShell>
     )
   }
 
-  // ======================== MATCH VIBE (auto-advance) ========================
-  if (step === 'vibe') {
+  // ======================== Q1 MATCH-UP (auto-advance) ========================
+  // "How did you feel your team matched up against the enemy?"
+  // KEEPS ITS MIDPOINT deliberately, unlike fun: "evenly matched" IS the signal
+  // here — it is the exact state the whole hypothesis (a tight loss is still
+  // fun) is about, so removing it would delete the thing being measured.
+  // Measures TEAM STRENGTH, not result: Behind + victory is legitimate.
+  const MATCHUP_OPTIONS: { v: number; label: string; test: string }[] = [
+    { v: 1, label: 'OUTCLASSED', test: 'Never had a chance' },
+    { v: 2, label: 'BEHIND',     test: 'They had the edge throughout' },
+    { v: 3, label: 'EVEN',       test: 'Genuinely contested' },
+    { v: 4, label: 'AHEAD',      test: 'We had the edge throughout' },
+    { v: 5, label: 'DOMINANT',   test: 'Never in doubt' },
+  ]
+  if (step === 'matchup') {
     return (
-      <StepShell title="How was the match?" onBack={() => setStep('role')} onSkip={() => setStep('performance')}>
-        {(['stomped_them', 'close_game', 'got_stomped'] as MatchFeel[]).map(v => (
-          <OptionButton key={v}
-            label={v === 'stomped_them' ? 'STOMPED THEM' : v === 'close_game' ? 'CLOSE GAME' : 'GOT STOMPED'}
-            selected={matchFeel === v}
-            onClick={() => pickAndAdvance(setMatchFeel, v, 'performance')} />
+      <StepShell title="How did your team match up?" hint="Not the result — how the sides compared"
+        onBack={() => setStep('role')} onSkip={() => setStep('performance')}>
+        {MATCHUP_OPTIONS.map(o => (
+          <ScaleOption key={o.v} label={o.label} test={o.test}
+            selected={matchupFeel === o.v}
+            onClick={() => pickAndAdvance(setMatchupFeel, o.v, 'performance')} />
         ))}
       </StepShell>
     )
   }
 
-  // ======================== PERFORMANCE (auto-advance) ========================
+  // ======================== Q2 PERFORMANCE (auto-advance) ========================
+  // ⚠️ WATCH: if "DID MY JOB" takes >40% of answers it is behaving like the old
+  // fun 3/4 pair and should be cut to four points at the next season boundary.
+  const PERF_OPTIONS: { v: number; label: string; test: string }[] = [
+    { v: 1, label: 'OFF MY GAME', test: 'I was part of the problem' },
+    { v: 2, label: 'BELOW PAR',   test: 'Not my usual standard' },
+    { v: 3, label: 'DID MY JOB',  test: 'Normal game for me' },
+    { v: 4, label: 'PLAYED WELL', test: 'Better than usual' },
+    { v: 5, label: 'CARRIED',     test: 'I was the reason we were in it' },
+  ]
   if (step === 'performance') {
     return (
-      <StepShell title="Your performance" onBack={() => setStep('vibe')} onSkip={() => setStep('fun')}>
-        {(['carried', 'did_my_job', 'struggled'] as PerformanceFeel[]).map(v => (
-          <OptionButton key={v}
-            label={v === 'did_my_job' ? 'DID MY JOB' : v.toUpperCase()}
-            selected={perfFeel === v}
-            onClick={() => pickAndAdvance(setPerfFeel, v, 'fun')} />
+      <StepShell title="How did you play?"
+        onBack={() => setStep('matchup')} onSkip={() => setStep('fun')}>
+        {PERF_OPTIONS.map(o => (
+          <ScaleOption key={o.v} label={o.label} test={o.test}
+            selected={perfRating === o.v}
+            onClick={() => pickAndAdvance(setPerfRating, o.v, 'fun')} />
         ))}
       </StepShell>
     )
   }
 
-  // ======================== FUN (stars — brief pause then auto-advance) ========================
+  // ======================== Q3 FUN (auto-advance) ========================
+  // SIX points, NO MIDPOINT — deliberately. The old 5-star scale collapsed:
+  // 3 and 4 held 128 of 192 answers and were described as interchangeable,
+  // 5 was used 3% of the time, and 1 was used MORE than 2. Six points means
+  // the centre falls BETWEEN 3 and 4, so every answer must lean. The scale is
+  // one binary question — did I enjoy this? — with two intensity steps either
+  // side, and the 3/4 boundary is the whole decision.
+  // Stars were dropped: they invite a lazy middle. Each point is anchored to a
+  // BEHAVIOURAL TEST that can be decided in a second at 11pm.
+  const FUN_OPTIONS: { v: number; label: string; test: string }[] = [
+    { v: 1, label: 'MISERABLE', test: 'I wanted to stop playing' },
+    { v: 2, label: 'BAD',       test: 'Unpleasant, but I saw it out' },
+    { v: 3, label: 'POOR',      test: "No, I didn't enjoy that" },
+    { v: 4, label: 'GOOD',      test: 'Yes, I enjoyed that' },
+    { v: 5, label: 'GREAT',     test: "I'd happily play that again" },
+    { v: 6, label: 'BRILLIANT', test: 'Memorable — the reason I play' },
+  ]
   if (step === 'fun') {
-    const pickStar = (s: number) => {
-      setFunRating(s)
-      window.setTimeout(() => setStep('tilt'), ADVANCE_DELAY)
-    }
     return (
-      <StepShell title="Fun rating" onBack={() => setStep('performance')} onSkip={() => setStep('tilt')}>
-        <div className="flex justify-center gap-2 py-2">
-          {[1, 2, 3, 4, 5].map(s => (
-            <button key={s} type="button"
-              onClick={() => pickStar(s)}
-              className={`text-4xl transition-colors ${funRating && s <= funRating ? 'text-ow-orange' : 'text-slate-700 hover:text-slate-500'}`}
-            >★</button>
-          ))}
-        </div>
-      </StepShell>
-    )
-  }
-
-  // ======================== TILT / MOOD (auto-advance) ========================
-  if (step === 'tilt') {
-    const moods: TiltMood[] = ['tilted', 'annoyed', 'fine', 'good', 'hyped']
-    return (
-      <StepShell title="How do you feel?" hint="Worst → best"
-        onBack={() => setStep('fun')} onSkip={() => setStep('team')}>
-        {moods.map(m => (
-          <OptionButton key={m} label={m.toUpperCase()}
-            selected={tiltMood === m}
-            onClick={() => pickAndAdvance(setTiltMood, m, 'team')} />
+      <StepShell title="Did you enjoy it?"
+        onBack={() => setStep('performance')} onSkip={() => setStep('team')}>
+        {FUN_OPTIONS.map(o => (
+          <ScaleOption key={o.v} label={o.label} test={o.test}
+            selected={funRating6 === o.v}
+            onClick={() => pickAndAdvance(setFunRating6, o.v, 'team')} />
         ))}
       </StepShell>
     )
   }
 
-  // ======================== TEAM (multi-input → keep NEXT) ========================
+  // ======================== TEAM ISSUES (multi → keep NEXT) ========================
+  // Replaces the old tempo/coordination scales + leaver/thrower toggles.
+  // MULTI-SELECT because a game can have both a leaver and a thrower.
+  // Ally first, then enemy — matching the slot-pick order later.
   if (step === 'team') {
     return (
-      <StepShell title="Your team" onBack={() => setStep('tilt')}
+      <StepShell title="Anything go wrong on your team?" hint="Tap all that apply"
+        onBack={() => setStep('fun')}
         onNext={() => setStep('enemy')} onSkip={() => setStep('enemy')}>
-        <ScaleRow label="Tempo" options={['aggressive', 'balanced', 'passive'] as Tempo[]}
-          value={teamTempo} onChange={setTeamTempo}
-          labels={{ aggressive: 'AGGRESSIVE', balanced: 'BALANCED', passive: 'PASSIVE' }} />
-        <ScaleRow label="Coordination" options={['coordinated', 'average', 'chaotic'] as Coordination[]}
-          value={teamCoord} onChange={setTeamCoord}
-          labels={{ coordinated: 'COORDINATED', average: 'AVERAGE', chaotic: 'CHAOTIC' }} />
-        <div className="flex gap-2 pt-1">
-          <TogglePill label="LEAVER" on={teamLeaver} onToggle={() => setTeamLeaver(v => !v)} />
-          <TogglePill label="THROWER" on={teamThrower} onToggle={() => setTeamThrower(v => !v)} />
-        </div>
+        <IssuePicker value={teamIssues}
+          onToggle={i => toggleIssue(teamIssues, setTeamIssues, i)} />
       </StepShell>
     )
   }
 
-  // ======================== ENEMY (multi-input → keep NEXT) ========================
+  // ======================== ENEMY ISSUES (multi → keep NEXT) ========================
   if (step === 'enemy') {
     return (
-      <StepShell title="Enemy team" onBack={() => setStep('team')}
+      <StepShell title="And the enemy team?" hint="Tap all that apply"
+        onBack={() => setStep('team')}
         onNext={() => setStep('thoughts')} onSkip={() => setStep('thoughts')}>
-        <ScaleRow label="Tempo" options={['aggressive', 'balanced', 'passive'] as Tempo[]}
-          value={enemyTempo} onChange={setEnemyTempo}
-          labels={{ aggressive: 'AGGRESSIVE', balanced: 'BALANCED', passive: 'PASSIVE' }} />
-        <ScaleRow label="Coordination" options={['coordinated', 'average', 'chaotic'] as Coordination[]}
-          value={enemyCoord} onChange={setEnemyCoord}
-          labels={{ coordinated: 'COORDINATED', average: 'AVERAGE', chaotic: 'CHAOTIC' }} />
-        <div className="flex gap-2 pt-1">
-          <TogglePill label="LEAVER" on={enemyLeaver} onToggle={() => setEnemyLeaver(v => !v)} />
-          <TogglePill label="THROWER" on={enemyThrower} onToggle={() => setEnemyThrower(v => !v)} />
-        </div>
+        <IssuePicker value={enemyIssues}
+          onToggle={i => toggleIssue(enemyIssues, setEnemyIssues, i)} />
       </StepShell>
     )
   }
@@ -490,6 +658,50 @@ export default function UploadPage() {
   }
 
   // ======================== UPLOADING ========================
+  // ======================== SLOT PICKS (multi → keep NEXT) ========================
+  // Captured HERE, on the phone, seconds after the match — not at /process,
+  // which can run three days later by which point the answer would be invented
+  // rather than recalled.
+  //
+  // Slots mirror scoreboard_players: 5v5 -> ally 1-5, enemy 6-10;
+  // 6v6 -> ally 1-6, enemy 7-12. Only slots are stored; hero names are resolved
+  // at save time AFTER the hero audit, so a corrected misidentification carries
+  // through to the pick.
+  //
+  // Both picks are OPTIONAL — an empty selection means nothing stood out, which
+  // is a real and common answer. NEXT is always enabled.
+  //
+  // This step is SKIPPED ENTIRELY for permanent-leaver games (see
+  // proceedAfterSide): no scoreboard is written, so there are no slots.
+  if (step === 'standouts') {
+    const finish = () => {
+      void commitUpload(pendingMapRef.current, pendingSideRef.current)
+    }
+    return (
+      <StepShell title="Anyone stand out?" hint="Optional — tap any that apply, or just carry on"
+        onBack={() => setStep('photos')}
+        onNext={finish} nextLabel="UPLOAD">
+        <div className="space-y-2">
+          <p className="text-[11px] font-display tracking-[0.15em] text-ow-muted uppercase">
+            Ally who impressed you
+          </p>
+          <SlotGrid slots={allySlots} selected={impressedAlly}
+            onToggle={n => toggleSlot(impressedAlly, setImpressedAlly, n)} />
+        </div>
+        <div className="space-y-2 pt-3">
+          <p className="text-[11px] font-display tracking-[0.15em] text-ow-muted uppercase">
+            Enemy who gave you trouble
+          </p>
+          <SlotGrid slots={enemySlots} selected={struggledEnemy}
+            onToggle={n => toggleSlot(struggledEnemy, setStruggledEnemy, n)} />
+        </div>
+        <p className="text-xs text-ow-faint pt-2">
+          Slot numbers as they appear on the scoreboard, top to bottom.
+        </p>
+      </StepShell>
+    )
+  }
+
   if (step === 'uploading') {
     const uploaded = files.filter(f => f.status === 'success').length
     return (
@@ -594,7 +806,11 @@ export default function UploadPage() {
   if (step === 'confirm_side') {
     const answer = (side: StartingSide | null) => {
       setStartingSide(side)
-      window.setTimeout(() => { commitUpload() }, ADVANCE_DELAY)
+      // Pass `side` EXPLICITLY. commitUpload closes over the startingSide from
+      // THIS render (still null); setStartingSide above has not flushed and the
+      // timeout does not change which closure was captured. Mirrors the
+      // mapOverride pattern -- see the commitUpload comment.
+      window.setTimeout(() => { proceedAfterSide(undefined, side) }, ADVANCE_DELAY)
     }
     return (
       <div className="min-h-[100dvh] flex flex-col justify-center px-5 bg-ow-dark relative overflow-hidden">

@@ -147,6 +147,33 @@ export const GAME_MODE_CONFIG: Record<GameMode, { symmetric: boolean; needsStart
 }
 
 // ============================================================
+// QUESTION SCALE VERSION
+// ============================================================
+// Which version of the post-match question set the app currently WRITES.
+//
+// THE RULE: a feel/question scale holds for an ENTIRE SEASON and changes only
+// at a season boundary. Every season carries its own version in
+// `seasons.question_scale_version`, and Settings stamps THIS constant onto
+// each newly created season. Charts then ask the season what scale it used
+// instead of hardcoding "season 4 onwards" -- which breaks silently the next
+// time the questions change, and they are expected to keep changing.
+//
+// ⚠️ WHEN YOU CHANGE THE QUESTIONS AGAIN:
+//   1. Add the new columns to `matches` (never alter the old ones).
+//   2. Bump this constant in the SAME commit as the question change, so the
+//      two cannot drift apart.
+//   3. Start the new scale at a season boundary, never mid-season.
+// Seasons created BEFORE that deploy keep their old version and stay readable
+// forever -- nothing is migrated, and the two scales are never pooled.
+export const CURRENT_QUESTION_SCALE = 2
+
+// Human-readable description of each scale, for the Settings display.
+export const QUESTION_SCALE_LABELS: Record<number, string> = {
+  1: 'Original — match feel, performance feel, fun 1–5, tilt, tempo, coordination',
+  2: 'v1.1.0 — match-up 1–5, performance 1–5, fun 1–6; tilt/tempo/coordination retired',
+}
+
+// ============================================================
 // HELPERS
 // ============================================================
 

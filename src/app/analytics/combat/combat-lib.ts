@@ -604,8 +604,27 @@ export function rowUserRole(r: CombatFactRow, heroRole: HeroRoleMap): Role | nul
 export type DrillDimension = 'mode' | 'map' | 'hero' | 'none'
 
 // Decide the drill dimension from which filters are active.
+//
+// (v1.1.0 Phase 4) A hero filter USED TO return 'none' unconditionally, so
+// picking a hero removed the damage / healing / mitigation share chart entirely.
+// That is the wrong instinct: "how does my Ana healing share vary BY MODE" is a
+// perfectly good question, and it was the one thing the chart could still answer.
+//
+// The hero branch now drills by the coarsest dimension that is NOT already
+// filtered, and returns 'none' only when nothing is left to vary across. A map
+// filter counts as pinning the mode too — a map has exactly one mode, so drilling
+// by mode under a map filter would draw a single bar.
+//
+// ⚠️ Every NON-hero path is unchanged, deliberately. The original order drills
+// DOWN from the most specific active filter (map → hero, mode → map). Rewriting
+// the whole thing as "first unfiltered dimension" would have made a map filter
+// drill by mode, i.e. that single-bar chart. Only the hero branch is new.
 export function drillDimension(modeActive: boolean, mapActive: boolean, heroActive: boolean): DrillDimension {
-  if (heroActive) return 'none'   // chart removed at hero level
+  if (heroActive) {
+    if (mapActive) return 'none'  // map pins the mode as well — nothing left to vary
+    if (modeActive) return 'map'
+    return 'mode'
+  }
   if (mapActive) return 'hero'
   if (modeActive) return 'map'
   return 'mode'
