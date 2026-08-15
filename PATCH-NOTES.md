@@ -9,6 +9,72 @@
 
 ---
 
+## v1.1.2 — released 15 August 2026
+
+Restores two Issue Log sections that were silently lost in `cf440cc` (the v1.0.2 hero-audit
+rework) and stayed missing through v1.1.0 and v1.1.1. **DB change? No** — one file.
+
+| # | Area | Symptom | Fix | DB change? |
+|---|------|---------|-----|-----------|
+| 1 | Issue Log | **Start New Season** reset absent — no way to archive and clear the log | Danger-zone section restored from `1e3a03d` | No |
+| 2 | Issue Log | **Processing failures** section absent — failed batches invisible on the page | Section restored from `1e3a03d` | No |
+
+### 1. Start New Season — a destructive action with no entry point
+
+**Symptom.** No way to archive and clear `beta_issue_log` from the app. Season 4 was started
+by emptying the table by hand in Supabase.
+
+**Root cause.** `cf440cc` replaced the page's sections for the per-slot hero audit and took
+this one with it. `clearIssueLog()` and `generateSeasonArchiveMarkdown()` **stayed exported
+the whole time with zero call sites** — the capability existed, unreachable, for two patch
+cycles.
+
+⚠️ **`grep -rn 'clearIssueLog' src/` returned one hit: the definition.** An orphaned export
+is not evidence a feature was retired — only that its entry point is gone. Nothing flagged
+this, because dead code compiles.
+
+**Why it matters more now than it did.** The season-end sweep, the tile-ceiling watch and the
+table-geometry log all assume the log covers ONE season. There is no season column and
+`match_id` cannot be joined to `matches`, so scoping depends entirely on the log being
+cleared at a season boundary. With no caller, that never happens.
+
+**Fix.** Restored from `1e3a03d` — structure, copy and two-step flow verbatim; only the
+colour classes were mapped from raw `slate-*` to the current theme tokens, since the original
+predates the theming work and would have broken light mode.
+
+**The safety order is the original's:** the archive downloads FIRST and a throw aborts before
+anything is deleted; a failed clear reports *"No rows were removed — your data is intact"*;
+step 2 tells you to verify the file on disk before confirming. The reset touches
+`beta_issue_log` and nothing else.
+
+**Files.** `src/app/issue-log/page.tsx`.
+
+### 2. Processing failures — computed, reported, never displayed
+
+**Symptom.** A batch that failed to process was invisible on the page.
+
+**Root cause.** Same commit. But unlike the reset, this one was only half-removed:
+`aggregate()` never stopped computing `totalProcessingErrors` / `processingErrors`,
+`logProcessingError()` is live and called from `/process`, and
+`generateIssueReportMarkdown()` never stopped rendering the section. **Only the on-page
+display went** — so the data was there the whole time, visible solely by downloading the .md.
+
+**Fix.** Section restored, same treatment.
+
+**Files.** `src/app/issue-log/page.tsx`.
+
+### What this one teaches
+
+v1.1.1's lesson was *two things agreed and one could not have disagreed*. This is its
+sibling: **nothing agreed, and nothing was checking.** Two exports with no callers, a
+`SeasonStats` field with no reader, and a destructive action with no button — none of it
+breaks a build, fails a test, or shows a symptom. It surfaced only because the owner went
+looking for a button he remembered.
+
+*An export with no call site is a question, not a leftover.*
+
+---
+
 ## v1.1.1 — released 15 August 2026
 
 Adds **D.Mon** (hero 53). Gathering evidence for that hero surfaced four pre-existing
