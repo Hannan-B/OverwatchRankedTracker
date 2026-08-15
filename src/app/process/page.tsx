@@ -32,12 +32,17 @@ import { getGameModeForMap, needsStartingSide, MAPS, HEROES } from '@/data/refer
 import type {
   RoleType, MatchFeel, PerformanceFeel, StartingSide, LeaverType, StandoutKind,
 } from '@/lib/types'
-import { logHeroAudit, logMatchSummary, logProcessingError } from '@/lib/beta-issue-log'
+import {
+  logHeroAudit, logMatchSummary, logProcessingError,
+  logTileCheck, countTileCheckSightings, shouldAskTileCheck,
+  logTableGeometry,
+} from '@/lib/beta-issue-log'
+import { heroesUnderTileWatch, getRetiredTile } from '@/data/hero-stat-catalog'
 // Beta confirmation is SUNSET (v1.0.2). The confidence-gated question flow
 // could measure how often a flag was right but never how many errors went
 // unflagged — 60 of 71 wrong heroes were never questioned. It is replaced by
 // a per-slot audit of every scoreboard row.
-import { HeroAuditPanel, type HeroAuditResult } from '@/app/review/HeroAuditPanel'
+import { HeroAuditPanel, type HeroAuditResult, type TileCheckPrompt } from '@/app/review/HeroAuditPanel'
 
 // ── metadata.json, as written by the phone ────────────────────────────────
 // TWO SHAPES ARRIVE HERE, and both must keep working.
@@ -245,6 +250,12 @@ export default function ProcessPage() {
   const [reviewIndex, setReviewIndex] = useState(0)
   const [reviewStep, setReviewStep] = useState<ReviewStep>('beta')
   const [reviewError, setReviewError] = useState<string | null>(null)
+  // v1.1.1 tile-ceiling watch. `heroes` is every affected hero played in this
+  // match (all of them get a log row); `ask` is the one a question is put to,
+  // or null when this sighting is not the Nth.
+  const [tileWatch, setTileWatch] = useState<{ heroes: string[]; ask: TileCheckPrompt | null }>(
+    { heroes: [], ask: null },
+  )
   // freshly re-minted signed URLs for the match currently under review
   const [liveImages, setLiveImages] = useState<{
     scoreboard?: string
@@ -622,6 +633,32 @@ export default function ProcessPage() {
 
   const current = reviewItems[reviewIndex]
 
+  // Decide the tile-ceiling question for the match now under review. Runs on
+  // the item, not on every render, so the cadence is not re-rolled mid-audit —
+  // a prompt that appeared and vanished while answering would be worse than
+  // never asking. Best-effort: a failed count simply means no question.
+  useEffect(() => {
+    let cancelled = false
+    const played = current?.result.heroes.map(h => h.name) ?? []
+    const watched = heroesUnderTileWatch(played)
+    if (watched.length === 0) {
+      setTileWatch({ heroes: [], ask: null })
+      return
+    }
+    countTileCheckSightings()
+      .then(count => {
+        if (cancelled) return
+        const hero = watched[0]
+        const retiredTile = getRetiredTile(hero)
+        setTileWatch({
+          heroes: watched,
+          ask: shouldAskTileCheck(count) && retiredTile ? { hero, retiredTile } : null,
+        })
+      })
+      .catch(() => { if (!cancelled) setTileWatch({ heroes: watched, ask: null }) })
+    return () => { cancelled = true }
+  }, [current])
+
   // Username confirmation handlers (operate on the current review item) ──
   function applyUserSlot(slot: number, method: 'ocr_confirmed' | 'manual_select') {
     setReviewItems(prev => {
@@ -733,6 +770,41 @@ export default function ProcessPage() {
         questionsAsked: audit.rows.length,
         autoPassFields: 0,
       })
+      // Table geometry: one row per scoreboard, BOTH formats. The 6v6 fix
+      // derives its x-constants from this measurement; 5v5 is still hardcoded
+      // and is logged precisely so that choice stays reviewable — a game patch
+      // widening the 5v5 table would show up here as moving numbers rather than
+      // as quietly degrading portrait scores.
+      //
+      // Skipped when the scan failed (null) rather than logged as 0: a fake
+      // measurement is worse than a missing one, because it would drag the
+      // min/max spread that the whole exercise exists to measure.
+      const det = result.scoreboard?.detection
+      if (det?.tableLeft != null && det.tableWidth != null) {
+        await logTableGeometry({
+          matchId: batch.batchId,
+          format,
+          tableLeft: det.tableLeft,
+          tableWidth: det.tableWidth,
+        })
+      }
+
+      // Tile-ceiling watch: ONE ROW PER SIGHTING, not per question. The
+      // skipped ones are the denominator — a season of "still gone" means
+      // nothing without the number of chances it had to be otherwise, and the
+      // count is also what drives the every-Nth cadence.
+      for (const hero of tileWatch.heroes) {
+        const retiredTile = getRetiredTile(hero)
+        if (!retiredTile) continue
+        const answered = audit.tileCheck?.hero === hero ? audit.tileCheck : null
+        await logTileCheck({
+          matchId: batch.batchId,
+          format,
+          hero,
+          retiredTile,
+          answer: answered ? (answered.seen ? 'seen' : 'not_seen') : 'skipped',
+        })
+      }
     } catch (err) {
       console.warn('[audit] logging failed (continuing to save):', err)
     }
@@ -1272,6 +1344,7 @@ export default function ProcessPage() {
                 heroesPlayed={item.result.heroes.map(h => h.name)}
                 knownHeroes={HEROES.map(h => ({ name: h.name, role: h.role }))}
                 scoreboardImageUrl={liveImages.scoreboard}
+                tileCheck={tileWatch.ask ?? undefined}
                 onComplete={onAuditComplete}
               />
             ) : (
@@ -1293,7 +1366,13 @@ export default function ProcessPage() {
                   )}
                 </div>
                 <button
-                  onClick={() => onAuditComplete({ rows: [], correctedSlots: [], bulkConfirmedSlots: [], reviewSeconds: 0 })}
+                  // tileCheck: null — no panel rendered here, so no question was
+                  // put. NOT the same as answering "not seen"; any affected hero
+                  // played still logs a 'skipped' sighting via onAuditComplete.
+                  onClick={() => onAuditComplete({
+                    rows: [], correctedSlots: [], bulkConfirmedSlots: [], reviewSeconds: 0,
+                    tileCheck: null,
+                  })}
                   className="w-full bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold
                              py-3 rounded-lg tracking-wider transition-colors text-sm">
                   SAVE MATCH

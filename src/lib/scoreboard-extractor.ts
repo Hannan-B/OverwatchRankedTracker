@@ -45,11 +45,11 @@ export type {
 // Hero → Role lookup: every Overwatch hero has a fixed role.
 // Used to override icon-based role classification after hero identification.
 const HERO_ROLE_MAP: Record<string, RoleType> = {
-  // Tanks (14)
-  'D.Va': 'tank', 'Doomfist': 'tank', 'Domina': 'tank', 'Hazard': 'tank',
-  'Junker Queen': 'tank', 'Mauga': 'tank', 'Orisa': 'tank', 'Ramattra': 'tank',
-  'Reinhardt': 'tank', 'Roadhog': 'tank', 'Sigma': 'tank', 'Winston': 'tank',
-  'Wrecking Ball': 'tank', 'Zarya': 'tank',
+  // Tanks (15)
+  'D.Mon': 'tank', 'D.Va': 'tank', 'Doomfist': 'tank', 'Domina': 'tank',
+  'Hazard': 'tank', 'Junker Queen': 'tank', 'Mauga': 'tank', 'Orisa': 'tank',
+  'Ramattra': 'tank', 'Reinhardt': 'tank', 'Roadhog': 'tank', 'Sigma': 'tank',
+  'Winston': 'tank', 'Wrecking Ball': 'tank', 'Zarya': 'tank',
   // DPS (24)
   'Anran': 'dps', 'Ashe': 'dps', 'Bastion': 'dps', 'Cassidy': 'dps',
   'Echo': 'dps', 'Emre': 'dps', 'Freja': 'dps', 'Genji': 'dps',
@@ -173,6 +173,9 @@ const FORMAT_5V5: FormatConfig = {
 
 const FORMAT_6V6: FormatConfig = {
   rowsPerTeam: 6,
+  // Calibration baseline: these absolute values are correct for a board whose
+  // table sits at TABLE_LEFT_BASELINE_6V6. resolveFormatConfig() shifts them by
+  // the measured delta. Do not "fix" them by nudging — nudge the baseline.
   iconXStart: 1150,
   iconXEnd: 1220,
   portraitCropX: 1215,
@@ -194,6 +197,83 @@ const FORMAT_6V6: FormatConfig = {
 
 function getFormatConfig(format: '5v5' | '6v6' | null): FormatConfig {
   return format === '6v6' ? FORMAT_6V6 : FORMAT_5V5
+}
+
+// ============================================================
+// TABLE ANCHOR (v1.1.1) — see KNOWN-FAILURE-MODES.md §14
+// ------------------------------------------------------------
+// The scoreboard table is CENTRED at x~1919.5 on every board of both formats,
+// but its WIDTH varies with content, so the left edge moves by half the width
+// change. Measured across ten boards:
+//     5v5  width 1690-1699  ->  left edge 1070-1074   (4px  — harmless)
+//     6v6  width 1462-1517  ->  left edge 1161-1188   (27px — the bug)
+//
+// Every x-constant above is absolute, so on 6v6 they all drift together. That
+// produced two separate-looking faults from one cause: the role-icon window
+// clipped the DPS glyph's third bar (5-0-1 comps on Test 9), and the portrait
+// crop variants could not reach the true origin (13.8% mean, 12/12 fragile).
+//
+// The baseline below is the table position the 6v6 constants were calibrated
+// against — Test 10, which sits exactly on them. Everything is shifted by the
+// measured delta from it, so a board at the baseline is BYTE-IDENTICAL to the
+// old behaviour and only offset boards move.
+//
+// 5v5 IS DELIBERATELY NOT DERIVED. Its edge moves 4px, its constants are exact
+// (portrait origin measured 1130 on 6 of 7 boards against a hardcoded 1130),
+// and variant 1 wins 66/70 slots. Changing geometry there would risk the one
+// format that demonstrably works. The measurement is still recorded for it, so
+// if a future game patch widens the 5v5 table the drift shows up in the log
+// rather than as silently degrading match scores.
+const TABLE_LEFT_BASELINE_6V6 = 1161
+
+/** Find the horizontal extent of the table on a given row: the first and last
+ *  strongly team-coloured pixel. A large, high-contrast feature — far more
+ *  robust than anchoring to the small role icon, whose own detection window is
+ *  itself absolute and would inherit the problem it was solving. */
+export function detectTableEdges(
+  px: Uint8ClampedArray,
+  w: number,
+  rowYs: number[],
+): { left: number; width: number } | null {
+  const lefts: number[] = []
+  const rights: number[] = []
+  for (const y of rowYs) {
+    let l = -1
+    let r = -1
+    for (let x = 600; x < 3300; x++) {
+      const [pr, pg, pb] = getPixel(px, w, x, y)
+      if (isBlue(pr, pg, pb) || isRed(pr, pg, pb)) {
+        if (l < 0) l = x
+        r = x
+      }
+    }
+    // A real table row spans well over half the screen; anything narrower is
+    // background bleed and must not drag the median.
+    if (l >= 0 && r - l > 1200) { lefts.push(l); rights.push(r) }
+  }
+  if (lefts.length === 0) return null
+  const med = (a: number[]) => a.slice().sort((x, y) => x - y)[Math.floor(a.length / 2)]
+  const left = med(lefts)
+  return { left, width: med(rights) - left }
+}
+
+/** Format config with 6v6 x-constants shifted to the measured table position.
+ *  Falls back to the unshifted config when the scan failed — never assumes 0,
+ *  which would put every crop at the left edge of the screen. */
+function resolveFormatConfig(detection: ScoreboardDetectionResult): FormatConfig {
+  const base = getFormatConfig(detection.format)
+  if (detection.format !== '6v6' || detection.tableLeft == null) return base
+  const dx = detection.tableLeft - TABLE_LEFT_BASELINE_6V6
+  if (dx === 0) return base
+  return {
+    ...base,
+    iconXStart: base.iconXStart + dx,
+    iconXEnd: base.iconXEnd + dx,
+    portraitCropX: base.portraitCropX + dx,
+    portraitCropConfigs: base.portraitCropConfigs.map(c => ({ ...c, cropX: c.cropX + dx })),
+    gamertagDisplayCropX: base.gamertagDisplayCropX + dx,
+    gamertagCropConfigs: base.gamertagCropConfigs.map(c => ({ ...c, xStart: c.xStart + dx, xEnd: c.xEnd + dx })),
+  }
 }
 
 // Gamertag OCR crop configs — measured pixel-exact from all 7 test screenshots.
@@ -261,7 +341,8 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
       confidence: 0,
       signals: [`Unexpected resolution: ${w}×${h} (expected 3840×2160)`],
       grid: null,
-      format: null,
+      format: null,  tableLeft: null,
+      tableWidth: null,
     }
   }
 
@@ -314,7 +395,8 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
       confidence,
       signals,
       grid: null,
-      format: null,
+      format: null,  tableLeft: null,
+      tableWidth: null,
     }
   }
 
@@ -381,6 +463,24 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
   const fmtCfg = getFormatConfig(detectedFormat)
   const rowsPerTeam = fmtCfg.rowsPerTeam
 
+  // Table anchor: sample three ally rows and take the median, so one row
+  // spoiled by a badge or a bright portrait cannot move it.
+  const probeRowH = (allyEndY - allyStartY) / rowsPerTeam
+  const tableEdges = detectTableEdges(px, w, [
+    Math.round(allyStartY + probeRowH * 0.5),
+    Math.round(allyStartY + probeRowH * 1.5),
+    Math.round(allyStartY + probeRowH * 2.5),
+  ])
+  let tableDesc = 'NOT DETECTED — falling back to fixed constants'
+  if (tableEdges) {
+    tableDesc = `left=${tableEdges.left} width=${tableEdges.width}`
+    if (detectedFormat === '6v6') {
+      tableDesc += ` (delta ${tableEdges.left - TABLE_LEFT_BASELINE_6V6} from baseline)`
+    }
+  }
+  signals.push(`Table: ${tableDesc}`)
+  console.log(`[scoreboard] Table geometry (${detectedFormat}): ${tableDesc}`)
+
   const allyRowH = allyHeight / rowsPerTeam
   const enemyRowH = enemyHeight / rowsPerTeam
 
@@ -426,6 +526,8 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
     signals,
     grid,
     format: detectedFormat,
+    tableLeft: tableEdges?.left ?? null,
+    tableWidth: tableEdges?.width ?? null,
   }
 }
 
@@ -585,7 +687,7 @@ export async function classifyRoles(
   }
 
   const grid = detection.grid
-  const fmtCfg = getFormatConfig(detection.format)
+  const fmtCfg = resolveFormatConfig(detection)   // v1.1.1: 6v6 x-constants follow the table
 
   const canvas = document.createElement('canvas')
   canvas.width = img.naturalWidth
@@ -691,7 +793,7 @@ export async function identifyHeroes(
 
   const portraits: PortraitCropSet[] = []
 
-  const fmtCfg = getFormatConfig(detection.format)
+  const fmtCfg = resolveFormatConfig(detection)   // v1.1.1: 6v6 x-constants follow the table
   const cropConfigs = fmtCfg.portraitCropConfigs
 
   console.log(`Step 2: Multi-crop portrait extraction (${cropConfigs.length} variants per slot)...`)
@@ -1204,7 +1306,7 @@ export async function analyzeUserIdentity(
   roles: ScoreboardRoleClassification[],
   gamertag: string,
 ): Promise<ScoreboardOcrAnalysis> {
-  const fmtCfg = getFormatConfig(detection.format)
+  const fmtCfg = resolveFormatConfig(detection)   // v1.1.1: 6v6 x-constants follow the table
   const allyCount = fmtCfg.rowsPerTeam
 
   const emptyCandidates: ScoreboardUserCandidate[] = Array.from({ length: allyCount }, (_, i) => ({

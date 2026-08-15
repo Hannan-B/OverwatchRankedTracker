@@ -26,6 +26,8 @@ import { supabase } from './supabase'
 // union never needs a migration.
 export type SignalKind =
   | 'hero_audit'          // per-slot verdict from the hero audit (the live signal)
+  | 'tile_check'          // v1.1.1 season-4 watch: did a retired ultimate tile come back?
+  | 'table_geometry'      // v1.1.1: measured scoreboard table position (not an error)
   | 'duplicate_hero'      // coherence: same hero twice on ONE team
   | 'user_hero_absent'    // coherence: user's row hero not among heroes played
   // ── Retired with beta confirmation. Kept so historical rows still type. ──
@@ -35,13 +37,15 @@ export type SignalKind =
 
 export type FieldKind =
   | 'hero_id'
+  | 'breakdown_tile'      // v1.1.1 — the 8-tile-ceiling watch (see TILE_WATCH)
+  | 'table_geometry'      // v1.1.1 — scoreboard table left edge + width
   // ── Retired with beta confirmation. Kept for historical rows. ──
   | 'scoreboard' | 'breakdown_stat' | 'summary' | 'username'
   | 'date' | 'map' | 'result' | 'side'
 
 /** Signals still written by the live pipeline. Everything else is history. */
 export const LIVE_SIGNALS: ReadonlySet<string> = new Set<SignalKind>([
-  'hero_audit', 'duplicate_hero', 'user_hero_absent',
+  'hero_audit', 'duplicate_hero', 'user_hero_absent', 'tile_check', 'table_geometry',
 ])
 
 export type IssueEvent =
@@ -51,6 +55,8 @@ export type IssueEvent =
   | 'unrecognized'
   | 'match_summary'
   | 'processing_error'   // a batch failed to process (extraction threw); files kept in pending for retry
+  | 'tile_check'         // v1.1.1 — breakdown tile-ceiling watch; NOT an error event (see below)
+  | 'table_geometry'     // v1.1.1 — scoreboard table measurement; NOT an error event
 
 // Mirrors the `beta_issue_log` table. `id` / `created_at` are DB-assigned.
 export interface IssueLogRow {
@@ -318,6 +324,111 @@ export async function logProcessingError(args: {
   })
 }
 
+// ── Tile-ceiling watch (v1.1.1) ──────────────────────────────
+//
+// WHY THIS EXISTS
+// The breakdown screen holds a hard maximum of 8 stat tiles (a 3x3 grid, less
+// the hero-info card). The season that added D.Mon added PLAYERS PROTECTED to
+// every tank; five tanks were already at 8, so the game DROPPED that hero's
+// ultimate tile to fit. That is a hypothesis about how the game behaves, not a
+// fact we control, so it needs watching rather than documenting once.
+//
+// The check asks one question — is the retired tile back? — and records the
+// answer. Crucially it records the SKIPPED occurrences too: one row per
+// sighting, not one row per question. A run of 'not_seen' only means something
+// against a known number of chances, and counting the chances is also what
+// drives the every-Nth cadence without any separate stored counter.
+//
+// These rows are deliberately NOT part of the error-rate or signal-precision
+// maths. A tile-ceiling change is a fact about the game, not a pipeline
+// mistake, and pooling it would corrupt both figures.
+
+/** Ask on every Nth sighting of an affected hero. */
+export const TILE_CHECK_EVERY = 3
+
+export type TileCheckAnswer = 'seen' | 'not_seen' | 'skipped'
+
+/** Pure cadence rule. `priorCount` = tile_check rows already logged. */
+export function shouldAskTileCheck(priorCount: number): boolean {
+  return priorCount % TILE_CHECK_EVERY === 0
+}
+
+/** How many sightings have been logged. Cheap COUNT — does not pull the log. */
+export async function countTileCheckSightings(): Promise<number> {
+  const { count, error } = await supabase
+    .from('beta_issue_log')
+    .select('id', { count: 'exact', head: true })
+    .eq('event', 'tile_check')
+  if (error) {
+    console.warn('[beta-log] tile-check count failed', error)
+    return 0
+  }
+  return count ?? 0
+}
+
+/** Record one sighting of an affected hero's breakdown.
+ *  `answer: 'skipped'` for the sightings we did not ask about — they are the
+ *  denominator, and dropping them would make a later 'seen' uninterpretable. */
+export async function logTileCheck(args: {
+  matchId: string
+  format: '5v5' | '6v6'
+  hero: string
+  retiredTile: string
+  answer: TileCheckAnswer
+}): Promise<{ error: unknown }> {
+  return logIssueEvent({
+    match_id: args.matchId,
+    event: 'tile_check',
+    field: 'breakdown_tile',
+    field_detail: args.hero,
+    signal: 'tile_check',
+    read_value: args.retiredTile,
+    corrected_value: args.answer,
+    format: args.format,
+  })
+}
+
+// ── Table geometry (v1.1.1) ──────────────────────────────────
+//
+// WHY THIS EXISTS
+// The scoreboard table is CENTRED at x~1919.5 but its WIDTH varies with
+// content, so the left edge moves and every absolute x-constant in
+// scoreboard-extractor.ts drifts with it. On 6v6 that reached 27px and broke
+// role-icon classification and portrait cropping at the same time; on 5v5 it
+// stayed within 4px and nothing showed.
+//
+// The FIX derives the 6v6 constants from the measured edge. This LOG is the
+// separate half: it records what was measured on every scoreboard, both
+// formats, so the question "how much does it actually vary" stops depending on
+// how many screenshots someone remembered to keep. Three saved boards is not a
+// range; a season of matches is.
+//
+// 5v5 is logged even though it is deliberately NOT derived. Leaving 5v5 on
+// hardcoded constants is only defensible if we would notice it drifting — this
+// is how we would notice. A game patch that widens the 5v5 table shows up as
+// moving numbers rather than as quietly degrading match scores.
+//
+// NOT an error event: excluded from error-rate and signal-precision maths, for
+// the same reason as tile_check. A layout measurement is a fact about the game.
+
+export async function logTableGeometry(args: {
+  matchId: string
+  format: '5v5' | '6v6'
+  tableLeft: number
+  tableWidth: number
+}): Promise<{ error: unknown }> {
+  return logIssueEvent({
+    match_id: args.matchId,
+    event: 'table_geometry',
+    field: 'table_geometry',
+    field_detail: `left=${args.tableLeft} width=${args.tableWidth}`,
+    signal: 'table_geometry',
+    read_value: String(args.tableLeft),
+    corrected_value: String(args.tableWidth),
+    format: args.format,
+  })
+}
+
 // ── Reader ───────────────────────────────────────────────────
 
 export async function fetchIssueLog(): Promise<IssueLogRow[]> {
@@ -370,6 +481,23 @@ export interface SeasonStats {
   unrecognizedLedger: Array<{ fieldDetail: string; value: string; matchId: string }>
   /** processing failures, with the captured reason. */
   processingErrors: Array<{ matchId: string; message: string }>
+  /** v1.1.1 tile-ceiling watch. Sightings = every occurrence incl. skipped;
+   *  asked = the ones a question was put to. `anomalies` are the ones that
+   *  answered 'seen', i.e. a retired tile reappeared and the catalog is stale. */
+  tileCheck: {
+    sightings: number
+    asked: number
+    notSeen: number
+    anomalies: Array<{ hero: string; tile: string; matchId: string; at: string | null }>
+    byHero: Record<string, { sightings: number; asked: number; seen: number }>
+  }
+  /** v1.1.1 table-geometry watch, per format. `spread` is the whole point:
+   *  5v5 measured 4px and 6v6 27px over the boards that exposed this. */
+  tableGeometry: Record<string, {
+    n: number
+    leftMin: number; leftMax: number
+    widthMin: number; widthMax: number
+  }>
 }
 
 export function aggregate(rows: IssueLogRow[]): SeasonStats {
@@ -386,6 +514,8 @@ export function aggregate(rows: IssueLogRow[]): SeasonStats {
     precisionBySignal: {},
     unrecognizedLedger: [],
     processingErrors: [],
+    tileCheck: { sightings: 0, asked: 0, notSeen: 0, anomalies: [], byHero: {} },
+    tableGeometry: {},
   }
 
   for (const r of rows) {
@@ -412,6 +542,54 @@ export function aggregate(rows: IssueLogRow[]): SeasonStats {
         matchId: r.match_id,
         message: r.read_value ?? '(no detail)',
       })
+      continue
+    }
+
+    // Table geometry. Like tile_check, `continue`d out before the error maths:
+    // a layout measurement is not a pipeline mistake and would corrupt both the
+    // error rate and signal precision if pooled.
+    if (r.event === 'table_geometry') {
+      const left = Number(r.read_value)
+      const width = Number(r.corrected_value)
+      if (Number.isFinite(left) && Number.isFinite(width)) {
+        const f = r.format ?? 'unknown'
+        const g = (stats.tableGeometry[f] ??= {
+          n: 0,
+          leftMin: left, leftMax: left,
+          widthMin: width, widthMax: width,
+        })
+        g.n += 1
+        g.leftMin = Math.min(g.leftMin, left)
+        g.leftMax = Math.max(g.leftMax, left)
+        g.widthMin = Math.min(g.widthMin, width)
+        g.widthMax = Math.max(g.widthMax, width)
+      }
+      continue
+    }
+
+    // Tile-ceiling watch. Handled BEFORE the corrected/confirmed maths and
+    // `continue`d out of it — see the note on logTileCheck: these are not
+    // pipeline errors and must not enter error-rate or precision.
+    if (r.event === 'tile_check') {
+      const hero = r.field_detail ?? 'unknown'
+      const answer = (r.corrected_value ?? 'skipped') as TileCheckAnswer
+      const h = (stats.tileCheck.byHero[hero] ??= { sightings: 0, asked: 0, seen: 0 })
+      stats.tileCheck.sightings += 1
+      h.sightings += 1
+      if (answer !== 'skipped') {
+        stats.tileCheck.asked += 1
+        h.asked += 1
+      }
+      if (answer === 'not_seen') stats.tileCheck.notSeen += 1
+      if (answer === 'seen') {
+        h.seen += 1
+        stats.tileCheck.anomalies.push({
+          hero,
+          tile: r.read_value ?? '(unknown tile)',
+          matchId: r.match_id,
+          at: r.created_at ?? null,
+        })
+      }
       continue
     }
 
@@ -547,6 +725,59 @@ export function generateIssueReportMarkdown(rows: IssueLogRow[]): string {
     }
     lines.push('')
     lines.push('> Each row is a heads-up to add a catalog/reference entry.')
+  }
+  lines.push('')
+
+  lines.push('## Table geometry (v1.1.1)')
+  lines.push('')
+  const geo = Object.entries(s.tableGeometry).sort()
+  if (geo.length === 0) {
+    lines.push('_No scoreboards measured yet._')
+  } else {
+    lines.push('| Format | Boards | Left edge | Spread | Width | Spread |')
+    lines.push('|---|---|---|---|---|---|')
+    for (const [f, g] of geo) {
+      lines.push(
+        `| ${f} | ${g.n} | ${g.leftMin}-${g.leftMax} | ${g.leftMax - g.leftMin}px ` +
+        `| ${g.widthMin}-${g.widthMax} | ${g.widthMax - g.widthMin}px |`,
+      )
+    }
+    lines.push('')
+    lines.push('> The table is centred, so the left edge moves by half the width change.')
+    lines.push('> 6v6 x-constants are DERIVED from the left edge; 5v5 are still hardcoded.')
+    lines.push('> A growing 5v5 spread is the signal to derive that format too.')
+  }
+  lines.push('')
+
+  lines.push('## Tile-ceiling watch (v1.1.1)')
+  lines.push('')
+  if (s.tileCheck.sightings === 0) {
+    lines.push('_No affected heroes played yet._')
+  } else {
+    lines.push(
+      `${s.tileCheck.sightings} sightings · ${s.tileCheck.asked} checked ` +
+      `(every ${TILE_CHECK_EVERY}th) · ${s.tileCheck.notSeen} confirmed still absent.`,
+    )
+    lines.push('')
+    lines.push('| Hero | Sightings | Checked | Retired tile seen |')
+    lines.push('|---|---|---|---|')
+    for (const [hero, h] of Object.entries(s.tileCheck.byHero).sort()) {
+      lines.push(`| ${hero} | ${h.sightings} | ${h.asked} | ${h.seen} |`)
+    }
+    lines.push('')
+    if (s.tileCheck.anomalies.length === 0) {
+      lines.push('> No retired tile has reappeared. The 8-tile ceiling held all season.')
+      lines.push('> If `Checked` is 0 across the board, nothing was actually verified —')
+      lines.push('> that is not the same result.')
+    } else {
+      lines.push('> ⚠️ A retired tile came back. The catalog is stale for these heroes.')
+      lines.push('')
+      lines.push('| Hero | Tile | Match | When |')
+      lines.push('|---|---|---|---|')
+      for (const a of s.tileCheck.anomalies) {
+        lines.push(`| ${a.hero} | \`${a.tile}\` | ${a.matchId} | ${a.at ?? '—'} |`)
+      }
+    }
   }
   lines.push('')
 

@@ -22,7 +22,7 @@ export interface GameMap {
 export type GameMode = 'escort' | 'control' | 'hybrid' | 'push' | 'flashpoint'
 
 // ============================================================
-// HEROES (52)
+// HEROES (53)
 // ============================================================
 
 export const HEROES: Hero[] = [
@@ -37,7 +37,8 @@ export const HEROES: Hero[] = [
   { name: 'Orisa', role: 'tank', subRole: 'bruiser' },
   { name: 'Roadhog', role: 'tank', subRole: 'bruiser' },
   { name: 'Zarya', role: 'tank', subRole: 'bruiser' },
-  // Tank — Stalwart (5)
+  // Tank — Stalwart (6)
+  { name: 'D.Mon', role: 'tank', subRole: 'stalwart' },
   { name: 'Domina', role: 'tank', subRole: 'stalwart' },
   { name: 'Junker Queen', role: 'tank', subRole: 'stalwart' },
   { name: 'Ramattra', role: 'tank', subRole: 'stalwart' },

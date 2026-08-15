@@ -9,6 +9,215 @@
 
 ---
 
+## v1.1.1 — released 15 August 2026
+
+Adds **D.Mon** (hero 53). Gathering evidence for that hero surfaced four pre-existing
+defects, none of which were caused by the hero addition; all are fixed here. **DB change?
+Yes** — two view rebuilds (`hero_role_ref`, `hero_stats_normalised`), no tables or columns.
+
+⚠️ **Two heroes' worth of stats stop accruing.** The season that added D.Mon also added a
+`PLAYERS PROTECTED` tile to every tank, and the breakdown screen holds a hard maximum of
+eight tiles. Five tanks were already at eight, so the game **dropped their ultimate tile**
+to fit: Domina `PANOPTICON HITS`, Junker Queen `RAMPAGE KILLS`, Reinhardt `EARTHSHATTER
+KILLS`, Sigma `GRAVITIC FLUX KILLS`, Wrecking Ball `MINEFIELD KILLS`. Historical values
+remain readable — those charts simply flatten from this season onward. **This is not a
+regression.**
+
+⚠️ **`PLAYERS PROTECTED` is blank on all 192 historical matches, permanently.** The tile
+did not exist before ~31 July 2026 and no backfill is possible.
+
+| # | Area | Symptom | Fix | DB change? |
+|---|------|---------|-----|-----------|
+| 1 | New hero | D.Mon absent everywhere | Added across reference, role map, portrait, stat-meta, catalog, and both hardcoded views | **Yes** (2 views) |
+| 2 | New role tile | `PLAYERS PROTECTED` on every tank's screen, nowhere in the app | Registered on all 15 tanks + both Heroes pages; five tanks swapped an ultimate tile for it | **Yes** (view) |
+| 3 | Stat folding | `FINAL BLOW(S)`, `SOLO KILL(S)`, `PLAYER(S) SAVED` unregistered in code — every foldable ROLE tile | Four pairs added to `STAT_NORMALISE`; the SQL view already had them | No |
+| 4 | Match result | Two of ten test matches stored as a LOSS when the banner read VICTORY | Deleted a duplicate score-derived rule that overrode the banner | No |
+| 5 | 6v6 scoreboard | Roles read 5-0-1 on both teams; portrait scores 13.8% with 12/12 rows flagged | Root cause: the table is centred and its width varies, so every fixed x-coordinate drifts. 6v6 coordinates now derived from the measured table edge | No |
+| 6 | Stat catalog | A hero's stat order is positional and eight tank entries were out of order | Reordered to true screen order; a mis-ordered entry silently mislabels a recovered tile | No |
+| 7 | Matchups | Only surface still opening on All Time now that a second season exists | Seeds the current season once, like every other season-aware page | No |
+| 8 | Monitoring | Two hypotheses now under watch with no way to confirm them | Tile-ceiling check every 3rd sighting; table geometry logged on every scoreboard | No |
+
+### 1. D.Mon — hero 53
+
+`D.Mon` / tank / stalwart. Plain-ASCII plus a dot, so one portrait file and no
+`HERO_FILENAME_MAP` entry — the same class as `D.Va`. Five breakdown stats: Fusion Repeater
+Accuracy (percent, per-10 shown), Fusion Repeater Kills, Knockback Kills, Limit Break Kills,
+Damage Amplified.
+
+`FUSION REPEATER KILL(S)` and `LIMIT BREAK KILL(S)` are new stat names and are registered in
+both fold layers. `FUSION REPEATER ACCURACY` needs no fold — percentages have no plural.
+
+**Files.** `src/data/reference.ts`, `src/lib/scoreboard-extractor.ts`,
+`public/heroes/D.Mon.png` (128×128), `src/data/stat-meta.ts`,
+`src/data/hero-stat-catalog.ts`. **DB:** `hero_role_ref` + `hero_stats_normalised`.
+
+### 2. `PLAYERS PROTECTED` — a new tank role tile
+
+**Symptom.** Visible on every tank's breakdown screen; absent from `STAT_NORMALISE`, from
+every format set, and from all 14 tank catalog entries.
+
+**Root cause.** Not an extraction fault. Tank breakdowns captured **exactly** their expected
+tile counts on 31 July — Winston 5, Zarya 6, Orisa 7, Sigma 8, Domina 8 — and Sigma and
+Domina proved an eight-tile capture was possible. The tile simply did not exist yet; it
+arrived between 31 July and 12 August.
+
+**Fix.** Added to all 15 tanks and to the role-stat list on both Heroes pages. Nine tanks had
+room and went +1; five were at the eight-tile ceiling and swapped out their ultimate tile.
+
+⚠️ **The five retired tiles stay in `HERO_BREAKDOWN_ORDER` and `STAT_NORMALISE` on purpose.**
+Historical matches hold their values and must stay readable.
+
+**Files.** `src/data/hero-stat-catalog.ts`, `src/data/stat-meta.ts`,
+`src/app/analytics/heroes/page.tsx`, `src/app/analytics/heroes/[name]/page.tsx`. **DB:**
+`hero_stats_normalised`.
+
+### 3. Role tiles were never folded in code
+
+**Symptom.** Of 161 distinct stat names in `hero_stats`, 34 appear in more than one spelling.
+Thirty-one are correctly folded. The three that are not are **exactly the foldable role
+tiles**: `FINAL BLOW`/`FINAL BLOWS` (25/115 rows), `SOLO KILL`/`SOLO KILLS` (45/96),
+`PLAYER SAVED`/`PLAYERS SAVED` (12/89).
+
+**Root cause.** `STAT_NORMALISE` was generated from the per-hero stat list, and role tiles are
+deliberately excluded from `HERO_BREAKDOWN_ORDER` — so they were never in the source. The
+correlation is total in both directions.
+
+⚠️ **Analytics were never wrong.** `hero_stats_normalised` folded all three correctly the
+whole time; only the code map had drifted. The one live consequence was
+`new-content-readiness.ts`, which folds raw OCR rather than view output and so reported role
+tiles as unrecognised new stats on `/testing`.
+
+**Fix.** Four pairs added, including `PLAYER(S) PROTECTED` pre-emptively. The game pluralises
+on **value** — singular at exactly 1, plural otherwise including 0 — proven by a clean
+partition: all 12 `PLAYER SAVED` rows sit at value 1 and none of the 89 plural rows do. OCR
+also drops trailing characters independently, so both spellings are required regardless.
+
+**Files.** `src/data/stat-meta.ts`, with a header warning that a regenerate will drop these
+again.
+
+### 4. The score overrode the VICTORY banner
+
+**Symptom.** Test 1 (a win) stored as `DEFEAT`. Two of ten test matches affected — precisely
+the two where banner and score disagreed.
+
+**Root cause.** `image-processor.ts` re-derived the result from the score and used the banner
+only as a fallback, inverting the rule `ocr-extractor.ts` documents and applies. It was a
+**second implementation of the same rule**, and the copies disagreed.
+
+The score cannot decide this: Test 1 is a VICTORY at 0-2 and Test 8 a DEFEAT at 0-2.
+
+**Fix.** Deleted `resultFromScore()` and its call site. `ocrSummaryPage()` already resolves
+banner-then-score internally, so the assignment is now a straight copy. The conflict flag
+still fires for confirmation.
+
+**Files.** `src/lib/image-processor.ts`.
+
+### 5. ⭐ The scoreboard table is centred and its width varies
+
+**Symptom.** Two faults that looked unrelated. Test 9's roles read **5-0-1 on both teams**
+against a real 1-3-2 / 2-2-2, which role-filtered every ally slot against tanks only. And
+6v6 portrait scores sat at 13.8–16.9% against 36–42% on 5v5, with **12 of 12 rows flagged
+fragile** on two boards.
+
+**Root cause — one cause, both faults.** The table is centred at x≈1919.5 on every board of
+both formats, but its **width varies with content**, so the left edge moves by half the
+change and every absolute x-coordinate drifts with it.
+
+| | table width | left edge | drift |
+|---|---|---|---|
+| 5v5 (7 boards) | 1690–1699 | 1070–1074 | **4px** — invisible |
+| 6v6 (3 boards) | 1462–1517 | 1161–1188 | **27px** — breaks two things at once |
+
+The role-icon window clipped the DPS glyph's third bar, so `classifyRoleIcon` saw two bright
+segments instead of three and returned `tank`. The portrait crop variants spanned 15px and
+could not reach an origin 25px away.
+
+⚠️ **Tests 8 and 10 had been "passing" by about one pixel.** Nothing was ever robust.
+
+**Fix.** `detectTableEdges()` finds the table's extent on three sampled rows and takes the
+median. All 6v6 x-coordinates — icon window, portrait origin, all four crop variants, and the
+gamertag crops — are shifted by the measured delta from a calibration baseline.
+
+**5v5 is deliberately NOT derived.** Its edge moves 4px, its constants are exact (portrait
+origin measured 1130 on six of seven boards against a hardcoded 1130), and variant 1 wins
+66/70 slots. Changing geometry there would risk the one format that demonstrably works.
+
+**Verified:** all seven 5v5 boards came back **byte-identical** — same heroes, same scores to
+one decimal, same fragile counts. That is guaranteed by construction, not by luck: the
+resolver returns early unless the format is 6v6.
+
+| | before | after |
+|---|---|---|
+| Test 8 | 16.9%, 12 fragile | **39.5%, 2 fragile** |
+| Test 9 | 13.8%, 12 fragile | **29.6%, 7 fragile** |
+| Test 10 | 38.8%, 3 fragile | **40.2%, 2 fragile** |
+| Whole set | 43 fragile | **27 fragile** |
+
+**Files.** `src/lib/types.ts`, `src/lib/scoreboard-extractor.ts`.
+
+### 6. Catalog stat order is positional
+
+**Symptom.** Ramattra returned 7/8 stats with `UNKNOWN_TILE_R3C2`, and its `PUMMEL ACCURACY`
+tile was labelled `PUMMEL KILLS`.
+
+**Root cause.** When a tile's label fails OCR, `breakdown-ocr` falls back to `catalog[index]`
+by grid position. Echo's entry happens to be in true screen order so its tiles resolve
+correctly; eight tank entries were not, so the recovery mechanism supplied the wrong name.
+A mis-ordered entry **fails silently rather than loudly**.
+
+**Fix.** Eight tank entries reordered to screen order, verified against screenshots, with a
+header stating that the order is positional.
+
+⚠️ **The other 44 heroes have not been verified.** The old ordering looks like a consistent
+rotation, so more entries are likely affected. Latent — it only bites on an OCR failure.
+
+**Files.** `src/data/hero-stat-catalog.ts`.
+
+### 7. Matchups defaulted to All Time
+
+**Symptom.** With Season 4 created, Matchups became the only season-aware surface still
+opening on pooled seasons. Logged in v1.1.0 Phase 2 as "revisit when Season 4 starts".
+
+**Fix.** Seeds the current season once via a `seasonDefaulted` ref, matching every other
+page. The seeding is guarded on a **successful** seasons read, not just the ref — the read is
+deliberately non-fatal, and seeding from a failed one would silently mean All Time forever
+with the ref blocking any correction.
+
+**Files.** `src/app/analytics/matchups/page.tsx`.
+
+### 8. Two hypotheses put under watch
+
+Both of these are claims about how the *game* behaves, not about our code, so they are
+monitored rather than assumed.
+
+**Tile-ceiling check.** Every third time one of the five affected tanks appears on a
+breakdown, `/process` asks whether the retired tile has come back. **Every sighting is
+logged, including the ones not asked about** — a season of "still gone" means nothing without
+the number of chances it had to be otherwise, and the sighting count also drives the cadence.
+
+**Table geometry.** Every scoreboard logs its measured left edge and width, **both formats**.
+5v5 is logged precisely because it is *not* derived: leaving it on hardcoded constants is only
+defensible if drift would be noticed. The Issue Log flags 5v5 red past a 15px spread and names
+the fix.
+
+Neither is an error event — both are excluded from error-rate and signal-precision maths. A
+fact about the game is not a pipeline mistake.
+
+**Files.** `src/lib/beta-issue-log.ts`, `src/app/review/HeroAuditPanel.tsx`,
+`src/app/process/page.tsx`, `src/app/issue-log/page.tsx`, `src/data/hero-stat-catalog.ts`.
+
+### What this patch keeps teaching
+
+Every fault above hid the same way: **two things agreed, and one of them was incapable of
+disagreeing.** Catalog tile counts matched captured counts — both predated the new tile. Code
+and database "mirrored" each other — the correct side was the only one being read. Two 6v6
+boards passed the role-icon check — by one pixel. The 5v5 constants look verified — they are
+verified, but only against boards whose width never moved.
+
+*Where two things agree, ask whether they were capable of disagreeing.*
+
+---
+
 ## v1.1.0 — released 11 August 2026
 
 The "mega patch". Six phases, one push. A redesigned feel-question set on new columns, a

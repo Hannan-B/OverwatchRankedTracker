@@ -17,28 +17,36 @@ your screenshots using client-side image recognition:
    the per-hero breakdown(s), and the scoreboard — and upload them through the app.
 2. **Process (laptop).** The app reads each screenshot: it identifies the heroes by
    matching their portraits, reads the scoreboard and stat numbers with OCR, detects the
-   map, and works out the result. You get a quick confirmation pass to fix anything the
-   read got wrong, then it saves to the database.
+   map, and works out the result. You then audit every scoreboard row against the image
+   before saving, and answer a short set of questions about how the match felt.
 3. **Analyse (any device).** Browse your dashboard, hero analytics, matchups, and trends
    from anywhere.
 
-All image recognition runs **in the browser** — screenshots are processed client-side
-and aren't kept after a match is saved.
+All image recognition runs **in the browser** — no image is ever sent to a recognition
+service. Screenshots are held in your own Supabase Storage between the phone upload and
+the laptop processing step, and are deleted once the match is saved; unprocessed uploads
+are cleared automatically after 21 days.
 
 ## Features
 
 - **Automatic extraction** from post-match screenshots — heroes, scoreboard stats,
   per-hero breakdown stats, map, result, and team compositions, with no manual entry.
-- **Confirmation pass** that surfaces only the low-confidence reads for a quick check,
-  showing the exact region of the screenshot each value came from.
+- **Per-slot audit** before saving: every scoreboard row is shown for review, in the same
+  order as the screenshot, with the region each value was read from. Low-confidence reads
+  are flagged, but nothing is hidden — an earlier version only surfaced suspected errors,
+  which meant the ones it was confident and wrong about went unchecked.
 - **Hero analytics** — per-hero win rates, play time, eliminations/assists/deaths,
   damage/healing/mitigation shares, and detailed per-hero breakdown stats.
-- **Matchup analysis** — how you perform with a given hero against specific enemy heroes.
+- **Matchup analysis** — how you perform with a given hero against specific enemy heroes,
+  plus which heroes you pair well with and side-by-side hero comparison.
 - **Combat, outcomes, feel, and time analytics** — trends across your match history,
   including how a match *felt* alongside how it went.
+- **Standout picks** — mark the hero that stood out after a match, and see which heroes
+  stand out most often relative to how often you could have picked them.
 - **Chart builder** — a flexible lab for plotting your own combinations of metrics.
-- **5v5 and 6v6 support**, season tracking, and a "leaver game" mode that handles
-  matches cut short.
+- **5v5 and 6v6 support**, season tracking, and leaver handling that distinguishes a
+  player who left permanently from one who reconnected — the scoreboard is unusable in
+  the first case and fine in the second.
 - **Light / dark / system theming**, and installable as a PWA on phone and desktop.
 
 ## Tech stack

@@ -19,24 +19,51 @@ export interface HeroStatCatalogEntry {
 
 export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
   // ============================================================
-  // TANK (14 heroes)
+  // ⚠️ ORDER IS POSITIONAL — it is the on-screen reading order of the tiles:
+  //     R1C2, R1C3, R2C1, R2C2, R2C3, R3C1, R3C2, R3C3   (R1C1 is the hero card)
+  // breakdown-ocr.ts pairs each grid position with stats[index]; when a tile's
+  // label fails OCR it falls back to that name. A mis-ordered entry therefore
+  // silently mislabels the recovered tile rather than failing loudly — this is
+  // how Test 9 gave Ramattra's PUMMEL ACCURACY tile the name PUMMEL KILLS.
+  // Heroes below marked (screen-verified) were checked against a screenshot.
+  // TANK (15 heroes)
+  // v1.1.1 — the season that added D.Mon also added PLAYERS PROTECTED to every tank.
+  // Where a tank was already at the 8-tile screen maximum, the game DROPPED that hero's
+  // ultimate-ability tile to make room: Domina PANOPTICON HITS, Junker Queen RAMPAGE
+  // KILLS, Reinhardt EARTHSHATTER KILLS, Sigma GRAVITIC FLUX KILLS, Wrecking Ball
+  // MINEFIELD KILLS. Those five remain in stat-meta.ts HERO_BREAKDOWN_ORDER on purpose —
+  // historical matches still hold their data. They simply stop accruing new values.
   // ============================================================
   {
-    hero: 'D.Va',
+    hero: 'D.Mon',
     tileCount: 7,
     stats: [
-      { name: 'MICRO MISSILE KILL', hasAvgPer10: true },
-      { name: 'CALL MECH KILLS' },
+      { name: 'FUSION REPEATER ACCURACY', hasAvgPer10: true },
+      { name: 'LIMIT BREAK KILL', hasAvgPer10: true },
       { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
-      { name: 'KNOCKBACK KILL', hasAvgPer10: true },
-      { name: 'SELF-DESTRUCT KILLS' },
+      { name: 'FUSION REPEATER KILLS', hasAvgPer10: true },
+      { name: 'DAMAGE AMPLIFIED', hasAvgPer10: true },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'KNOCKBACK KILLS', hasAvgPer10: true },
+    ],
+  },
+  {
+    hero: 'D.Va',
+    tileCount: 8,
+    stats: [
       { name: 'WEAPON ACCURACY' },
       { name: 'ULTIMATES NEGATED' },
+      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
+      { name: 'MICRO MISSILE KILL', hasAvgPer10: true },
+      { name: 'CALL MECH KILLS' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'KNOCKBACK KILL', hasAvgPer10: true },
+      { name: 'SELF-DESTRUCT KILLS' },
     ],
   },
   {
     hero: 'Doomfist',
-    tileCount: 6,
+    tileCount: 7,
     stats: [
       { name: 'ROCKET PUNCH KILL', hasAvgPer10: true },
       { name: 'METEOR STRIKE KILLS' },
@@ -44,25 +71,26 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
       { name: 'SEISMIC SLAM KILLS', hasAvgPer10: true },
       { name: 'WEAPON ACCURACY' },
       { name: 'OVERHEALTH CREATED', hasAvgPer10: true },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Domina',
     tileCount: 8,
     stats: [
-      { name: 'WEAPON SHOT ACCURACY' },
-      { name: 'CRYSTAL CHARGE DAMAGE' },
-      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
-      { name: 'KNOCKBACK KILL', hasAvgPer10: true },
-      { name: 'SELF HEALING', hasAvgPer10: true },
       { name: 'WEAPON BEAM ACCURACY' },
       { name: 'ENVIRONMENTAL KILLS' },
-      { name: 'PANOPTICON HITS' },
+      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
+      { name: 'WEAPON SHOT ACCURACY' },
+      { name: 'CRYSTAL CHARGE DAMAGE' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'KNOCKBACK KILL', hasAvgPer10: true },
+      { name: 'SELF HEALING', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Hazard',
-    tileCount: 6,
+    tileCount: 7,
     stats: [
       { name: 'DOWNPOUR KILLS' },
       { name: 'ENVIRONMENTAL KILLS' },
@@ -70,25 +98,26 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
       { name: 'VIOLENT LEAP DAMAGE DONE' },
       { name: 'WEAPON ACCURACY' },
       { name: 'SPIKE GUARD DAMAGE DONE' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Junker Queen',
     tileCount: 8,
     stats: [
-      { name: 'JAGGED BLADE KILLS', hasAvgPer10: true },
-      { name: 'WOUND UPTIME PERCENTAGE' },
-      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
-      { name: 'JAGGED BLADE ACCURACY' },
-      { name: 'SELF HEALING', hasAvgPer10: true },
       { name: 'WEAPON ACCURACY' },
       { name: 'CARNAGE KILL', hasAvgPer10: true },
-      { name: 'RAMPAGE KILLS' },
+      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
+      { name: 'JAGGED BLADE KILLS', hasAvgPer10: true },
+      { name: 'WOUND UPTIME PERCENTAGE' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'JAGGED BLADE ACCURACY' },
+      { name: 'SELF HEALING', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Mauga',
-    tileCount: 7,
+    tileCount: 8,
     stats: [
       { name: 'CRITICAL HIT DAMAGE', hasAvgPer10: true },
       { name: 'OVERHEALTH CREATED', hasAvgPer10: true },
@@ -97,11 +126,12 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
       { name: 'CAGE FIGHT KILLS' },
       { name: 'WEAPON ACCURACY' },
       { name: 'SELF HEALING', hasAvgPer10: true },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Orisa',
-    tileCount: 7,
+    tileCount: 8,
     stats: [
       { name: 'ENERGY JAVELIN KILLS', hasAvgPer10: true },
       { name: 'ULTIMATES NEGATED', hasAvgPer10: true },
@@ -110,38 +140,40 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
       { name: 'TERRA SURGE KILLS', hasAvgPer10: true },
       { name: 'WEAPON ACCURACY', hasAvgPer10: true },
       { name: 'JAVELIN SPIN KILLS', hasAvgPer10: true },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Ramattra',
-    tileCount: 7,
+    tileCount: 8,
     stats: [
-      { name: 'PUMMEL ACCURACY' },
-      { name: 'ANNIHILATION EFFICIENCY' },
-      { name: 'OBJ CONTEST TIME' },
-      { name: 'PUMMEL KILLS', hasAvgPer10: true },
-      { name: 'ANNIHILATION KILLS' },
       { name: 'WEAPON ACCURACY' },
       { name: 'RAVENOUS VORTEX KILLS' },
+      { name: 'OBJ CONTEST TIME' },
+      { name: 'PUMMEL ACCURACY' },
+      { name: 'ANNIHILATION EFFICIENCY' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'PUMMEL KILLS', hasAvgPer10: true },
+      { name: 'ANNIHILATION KILLS' },
     ],
   },
   {
     hero: 'Reinhardt',
     tileCount: 8,
     stats: [
-      { name: 'FIRE STRIKE KILL', hasAvgPer10: true },
-      { name: 'EARTHSHATTER DIRECT HITS' },
-      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
-      { name: 'FIRE STRIKE ACCURACY' },
-      { name: 'EARTHSHATTER STUNS' },
       { name: 'CHARGE KILLS' },
       { name: 'KNOCKBACK KILLS' },
-      { name: 'EARTHSHATTER KILLS' },
+      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
+      { name: 'FIRE STRIKE KILL', hasAvgPer10: true },
+      { name: 'EARTHSHATTER DIRECT HITS' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'FIRE STRIKE ACCURACY' },
+      { name: 'EARTHSHATTER STUNS' },
     ],
   },
   {
     hero: 'Roadhog',
-    tileCount: 6,
+    tileCount: 7,
     stats: [
       { name: 'CHAIN HOOK KILLS', hasAvgPer10: true },
       { name: 'WHOLE HOG KILLS', hasAvgPer10: true },
@@ -149,50 +181,52 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
       { name: 'CHAIN HOOK ACCURACY' },
       { name: 'WEAPON ACCURACY' },
       { name: 'SELF HEALING', hasAvgPer10: true },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Sigma',
     tileCount: 8,
     stats: [
-      { name: 'DIRECT HIT ACCURACY' },
-      { name: 'OVERHEALTH CREATED' },
-      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
-      { name: 'ACCRETION KILLS' },
-      { name: 'ULTIMATES NEGATED' },
       { name: 'WEAPON ACCURACY' },
       { name: 'ACCRETION ACCURACY' },
-      { name: 'GRAVITIC FLUX KILLS' },
+      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
+      { name: 'DIRECT HIT ACCURACY' },
+      { name: 'OVERHEALTH CREATED' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'ACCRETION KILLS' },
+      { name: 'ULTIMATES NEGATED' },
     ],
   },
   {
     hero: 'Winston',
-    tileCount: 5,
+    tileCount: 6,
     stats: [
-      { name: 'SECONDARY FIRE ACCURACY' },
-      { name: 'OBJ CONTEST TIME' },
-      { name: 'JUMP PACK KILLS', hasAvgPer10: true },
       { name: 'PRIMARY FIRE ACCURACY' },
       { name: 'PRIMAL RAGE KILLS' },
+      { name: 'OBJ CONTEST TIME' },
+      { name: 'SECONDARY FIRE ACCURACY' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'JUMP PACK KILLS', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Wrecking Ball',
     tileCount: 8,
     stats: [
-      { name: 'CRITICAL HIT ACCURACY' },
-      { name: 'PILEDRIVER KILLS', hasAvgPer10: true },
-      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
-      { name: 'GRAPPLING CLAW KILL', hasAvgPer10: true },
-      { name: 'KNOCKBACK KILLS', hasAvgPer10: true },
       { name: 'WEAPON ACCURACY' },
       { name: 'ADAPTIVE SHIELDING CREATED', hasAvgPer10: true },
-      { name: 'MINEFIELD KILLS', hasAvgPer10: true },
+      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
+      { name: 'CRITICAL HIT ACCURACY' },
+      { name: 'PILEDRIVER KILLS', hasAvgPer10: true },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'GRAPPLING CLAW KILL', hasAvgPer10: true },
+      { name: 'KNOCKBACK KILLS', hasAvgPer10: true },
     ],
   },
   {
     hero: 'Zarya',
-    tileCount: 6,
+    tileCount: 7,
     stats: [
       { name: 'SECONDARY FIRE ACCURACY' },
       { name: 'GRAVITON SURGE KILLS' },
@@ -200,6 +234,7 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
       { name: 'HIGH ENERGY KILLS' },
       { name: 'PRIMARY FIRE ACCURACY' },
       { name: 'AVERAGE ENERGY' },
+      { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
     ],
   },
 
@@ -731,4 +766,45 @@ export function getExpectedStats(heroName: string): string[] {
 export function getExpectedTileCount(heroName: string): number {
   const entry = HERO_STAT_LOOKUP.get(heroName)
   return entry ? entry.tileCount : 0
+}
+
+// ============================================================
+// TILE-CEILING WATCH (v1.1.1)
+// ------------------------------------------------------------
+// The breakdown screen holds a hard maximum of EIGHT stat tiles: a 3x3 grid
+// less the hero-info card in row 1, column 1.
+//
+// The season that added D.Mon added PLAYERS PROTECTED to every tank. Nine
+// tanks had room. These five were already at eight, so the game dropped that
+// hero's ULTIMATE tile to fit. D.Va and Winston, both under the ceiling, kept
+// theirs — which is what makes this a rule rather than a coincidence.
+//
+// This is a hypothesis about how the game behaves, not something we control,
+// so it is watched rather than documented once. See beta-issue-log.ts
+// (logTileCheck / TILE_CHECK_EVERY) and KNOWN-FAILURE-MODES.md §13.
+//
+// ⚠️ The retired tiles are STILL in stat-meta.ts HERO_BREAKDOWN_ORDER and
+//    STAT_NORMALISE, deliberately. Historical matches hold their values and
+//    must stay readable. They simply stop accruing. Do not "tidy" them away.
+// ============================================================
+
+export const TILE_CEILING = 8
+
+/** Tanks that lost a tile to PLAYERS PROTECTED, and which tile went. */
+export const RETIRED_TILE_BY_HERO: Readonly<Record<string, string>> = {
+  'Domina':        'PANOPTICON HITS',
+  'Junker Queen':  'RAMPAGE KILLS',
+  'Reinhardt':     'EARTHSHATTER KILLS',
+  'Sigma':         'GRAVITIC FLUX KILLS',
+  'Wrecking Ball': 'MINEFIELD KILLS',
+}
+
+/** The retired tile for a hero, or null if that hero was never affected. */
+export function getRetiredTile(heroName: string): string | null {
+  return RETIRED_TILE_BY_HERO[heroName] ?? null
+}
+
+/** Which of a match's played heroes are under the tile-ceiling watch. */
+export function heroesUnderTileWatch(heroesPlayed: string[]): string[] {
+  return heroesPlayed.filter(h => h in RETIRED_TILE_BY_HERO)
 }

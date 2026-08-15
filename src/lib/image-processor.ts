@@ -449,20 +449,10 @@ export type ProcessingStatus =
   | { stage: 'reading_scoreboard'; progress: number }
   | { stage: 'complete'; progress: 100 }
 
-// ============================================================
-// RESULT FROM SCORE
-// ============================================================
-
-function resultFromScore(score: string | null): 'victory' | 'defeat' | 'draw' | null {
-  if (!score) return null
-  const match = score.match(/^(\d+)-(\d+)$/)
-  if (!match) return null
-  const playerScore = parseInt(match[1])
-  const opponentScore = parseInt(match[2])
-  if (playerScore > opponentScore) return 'victory'
-  if (playerScore < opponentScore) return 'defeat'
-  return 'draw'
-}
+// (v1.1.1) `resultFromScore()` DELETED. It re-derived win/loss from the score
+// and overrode the VICTORY/DEFEAT banner, which is backwards — and it was a
+// SECOND implementation of a rule ocr-extractor.ts already applies, so the two
+// could disagree, and did. See the Step 5 assignment below.
 
 // ============================================================
 // ASSIGNMENT BY ELIMINATION
@@ -675,12 +665,18 @@ export async function processMatchPhotos(
       result.deaths = summaryOcr.deaths
       result.ocrRaw = summaryOcr.raw
 
-      const scoreResult = resultFromScore(result.score)
-      if (scoreResult) {
-        result.result = scoreResult
-      } else {
-        result.result = summaryOcr.result
-      }
+      // The banner is authoritative. ocrSummaryPage() has ALREADY resolved this:
+      // it returns the banner when the VICTORY/DEFEAT text was readable and
+      // falls back to the score only when it was not, recording which in
+      // `raw.resultSource` and raising `raw.resultConflict` when they disagree.
+      // So this is a straight copy — re-deriving here can only contradict it.
+      //
+      // What it used to do: `resultFromScore(score) ?? summaryOcr.result`, i.e.
+      // the score won whenever it parsed, which is always. The score does NOT
+      // reliably order [player, opponent]: Test 1 is a VICTORY at 0-2 and Test 8
+      // a DEFEAT at 0-2. Same scoreline, opposite outcomes — so no rule over the
+      // score alone can be right, and Test 1 was stored as a loss.
+      result.result = summaryOcr.result
     } catch (e) {
       console.warn('Summary OCR failed:', e)
     }

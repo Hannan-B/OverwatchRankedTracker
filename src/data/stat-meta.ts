@@ -6,6 +6,13 @@
 // Generated from the marked-up stat list; edit there and regenerate.
 // ============================================================
 
+// ⚠️ ROLE TILES ARE NOT IN THE GENERATION SOURCE — DO NOT LOSE THEM ON REGENERATE.
+//    FINAL BLOW(S), SOLO KILL(S), PLAYER(S) SAVED and PLAYER(S) PROTECTED are ROLE
+//    tiles. Role tiles are excluded from HERO_BREAKDOWN_ORDER by design, so the
+//    marked-up stat list never contained them and a regenerate will DROP their fold
+//    rules. Re-add by hand, and add a fold for any NEW role tile.
+//    (v1.1.1: this gap left all four unfolded. hero_stats_normalised had them, the
+//    code did not, so /testing false-flagged them as new stats.)
 export const STAT_NORMALISE: Record<string, string> = {
   "ACCRETION KILL": "ACCRETION KILLS",
   "ACCRETION KILLS": "ACCRETION KILLS",
@@ -99,12 +106,16 @@ export const STAT_NORMALISE: Record<string, string> = {
   "ENERGY JAVELIN KILLS": "ENERGY JAVELIN KILLS",
   "ENVIRONMENTAL KILL": "ENVIRONMENTAL KILLS",
   "ENVIRONMENTAL KILLS": "ENVIRONMENTAL KILLS",
+  "FINAL BLOW": "FINAL BLOWS",
+  "FINAL BLOWS": "FINAL BLOWS",
   "FIRE STRIKE KILL": "FIRE STRIKE KILLS",
   "FIRE STRIKE KILLS": "FIRE STRIKE KILLS",
   "FLASHBANG KILL": "FLASHBANG KILLS",
   "FLASHBANG KILLS": "FLASHBANG KILLS",
   "FOCUSING BEAM KILL": "FOCUSING BEAM KILLS",
   "FOCUSING BEAM KILLS": "FOCUSING BEAM KILLS",
+  "FUSION REPEATER KILL": "FUSION REPEATER KILLS",
+  "FUSION REPEATER KILLS": "FUSION REPEATER KILLS",
   "GRAPPLING CLAW KILL": "GRAPPLING CLAW KILLS",
   "GRAPPLING CLAW KILLS": "GRAPPLING CLAW KILLS",
   "GRAVITIC FLUX KILL": "GRAVITIC FLUX KILLS",
@@ -133,6 +144,8 @@ export const STAT_NORMALISE: Record<string, string> = {
   "KUNAI KILL": "KUNAI KILLS",
   "KUNAI KILLS": "KUNAI KILLS",
   "LIFE GRIP DEATHS PREVENTED": "LIFE GRIP DEATHS PREVENTED",
+  "LIMIT BREAK KILL": "LIMIT BREAK KILLS",
+  "LIMIT BREAK KILLS": "LIMIT BREAK KILLS",
   "LONG RANGE FINAL BLOW": "LONG RANGE FINAL BLOWS",
   "LONG RANGE FINAL BLOWS": "LONG RANGE FINAL BLOWS",
   "LOW HEALTH RECALL": "LOW HEALTH RECALLS",
@@ -163,10 +176,14 @@ export const STAT_NORMALISE: Record<string, string> = {
   "PILEDRIVER KILL": "PILEDRIVER KILLS",
   "PILEDRIVER KILLS": "PILEDRIVER KILLS",
   "PLAYER KNOCKED BACK": "PLAYERS KNOCKED BACK",
+  "PLAYER PROTECTED": "PLAYERS PROTECTED",
   "PLAYER RESURRECTED": "PLAYERS RESURRECTED",
+  "PLAYER SAVED": "PLAYERS SAVED",
   "PLAYER TELEPORTED": "PLAYERS TELEPORTED",
   "PLAYERS KNOCKED BACK": "PLAYERS KNOCKED BACK",
+  "PLAYERS PROTECTED": "PLAYERS PROTECTED",
   "PLAYERS RESURRECTED": "PLAYERS RESURRECTED",
+  "PLAYERS SAVED": "PLAYERS SAVED",
   "PLAYERS TELEPORTED": "PLAYERS TELEPORTED",
   "PRIMAL RAGE KILL": "PRIMAL RAGE KILLS",
   "PRIMAL RAGE KILLS": "PRIMAL RAGE KILLS",
@@ -200,6 +217,8 @@ export const STAT_NORMALISE: Record<string, string> = {
   "SENTRY TURRET KILLS": "SENTRY TURRET KILLS",
   "SHIELD CREATED": "SHIELDS CREATED",
   "SHIELDS CREATED": "SHIELDS CREATED",
+  "SOLO KILL": "SOLO KILLS",
+  "SOLO KILLS": "SOLO KILLS",
   "SOUND BARRIERS PROVIDED": "SOUND BARRIERS PROVIDED",
   "STICKY BOMB KILL": "STICKY BOMB KILLS",
   "STICKY BOMB KILLS": "STICKY BOMB KILLS",
@@ -269,6 +288,7 @@ const PERCENT_STATS = new Set<string>([
   "FAN THE FLAMES ACCURACY",
   "FIRE STRIKE ACCURACY",
   "FOCUSING BEAM ACCURACY",
+  "FUSION REPEATER ACCURACY",
   "HEALING ACCURACY",
   "HEALING BEAM USAGE",
   "HEALING BOOST USAGE",
@@ -394,6 +414,13 @@ export const HERO_BREAKDOWN_ORDER: Record<string, BreakdownStat[]> = {
     { label: "Critical Hit Kills", canonical: "CRITICAL HIT KILLS", fmt: "number", hasPer10: true },
     { label: "Flashbang Kills", canonical: "FLASHBANG KILLS", fmt: "number", hasPer10: true },
     { label: "Deadeye Kills", canonical: "DEADEYE KILLS", fmt: "number", hasPer10: true },
+  ],
+  "D.Mon": [
+    { label: "Fusion Repeater Accuracy", canonical: "FUSION REPEATER ACCURACY", fmt: "percent", hasPer10: true },
+    { label: "Fusion Repeater Kills", canonical: "FUSION REPEATER KILLS", fmt: "number", hasPer10: true },
+    { label: "Knockback Kills", canonical: "KNOCKBACK KILLS", fmt: "number", hasPer10: true },
+    { label: "Limit Break Kills", canonical: "LIMIT BREAK KILLS", fmt: "number", hasPer10: true },
+    { label: "Damage Amplified", canonical: "DAMAGE AMPLIFIED", fmt: "number", hasPer10: true },
   ],
   "D.Va": [
     { label: "Weapon Accuracy", canonical: "WEAPON ACCURACY", fmt: "percent", hasPer10: true },

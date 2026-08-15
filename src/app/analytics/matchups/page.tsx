@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { supabase } from '@/lib/supabase'
 import Select from '@/components/Select'
 import { keepVisible } from '@/lib/alpha'
@@ -11,6 +11,7 @@ import AnalyticsFilters, {
   type SeasonOption,
 } from '@/components/AnalyticsFilters'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
+import { defaultSeasonSelection } from '@/lib/season-util'
 import { HEROES, getHeroesByRole } from '@/data/reference'
 import {
   aggregateSingles,
@@ -86,8 +87,17 @@ function toMatchupFilters(
   }
 }
 
+/** Seasons row as read here: `SeasonOption` (id + name) for the dropdown, plus
+ *  the dates `defaultSeasonSelection` needs to find the current season. */
+type SeasonRow = SeasonOption & { start_date: string; end_date: string }
+
 export default function MatchupsPage() {
   const [filters, setFilters] = useState<AnalyticsFilterState>(DEFAULT_FILTERS)
+  // (v1.1.1) Seed the current season once, matching every other season-aware
+  // page. Until Season 4 this page deliberately opened on All Time because with
+  // one season it made no difference; with two it would be the only surface
+  // showing pooled seasons by default.
+  const seasonDefaulted = useRef(false)
 
   // surface controls
   const [anchorMode, setAnchorMode] = useState<'hero' | 'general'>('hero')
@@ -141,7 +151,7 @@ export default function MatchupsPage() {
         const [pairRes, setRes, seasonRes, standoutRes] = await Promise.all([
           supabase.from('matchup_pairs').select('*'),
           supabase.from('matchup_team_sets').select('*'),
-          supabase.from('seasons').select('id, name').order('start_date', { ascending: false }),
+          supabase.from('seasons').select('id, name, start_date, end_date').order('start_date', { ascending: false }),
           supabase.from('match_standouts').select('match_id, kind, slot, hero_name'),
         ])
         if (pairRes.error) throw pairRes.error
@@ -156,7 +166,19 @@ export default function MatchupsPage() {
         // A failed seasons read is NOT fatal: the control hides itself when the
         // list is empty, and every other panel on the page still works. Throwing
         // here would blank the whole surface over a filter that is optional.
-        if (!seasonRes.error) setSeasonOptions((seasonRes.data ?? []) as SeasonOption[])
+        if (!seasonRes.error) {
+          const seasonRows = (seasonRes.data ?? []) as SeasonRow[]
+          setSeasonOptions(seasonRows)
+          // Guarded on a SUCCESSFUL read, not just the ref. The seasons query is
+          // deliberately non-fatal here, so on failure `seasonRows` would be []
+          // and defaultSeasonSelection would return [] — indistinguishable from
+          // "no current season". Seeding from a failed read would silently mean
+          // All Time forever, with the ref then blocking a later correction.
+          if (!seasonDefaulted.current) {
+            seasonDefaulted.current = true
+            setFilters(f => ({ ...f, seasons: defaultSeasonSelection(seasonRows) }))
+          }
+        }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load matchup data')
       } finally {

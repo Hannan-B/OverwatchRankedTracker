@@ -34,8 +34,8 @@ as you play — the analytics views group your match data dynamically. There are
 | New thing | Needs a database change? | What |
 |---|---|---|
 | **New map** | ❌ **No** | `map_analytics` and every map surface group dynamically from your matches. Just play on it; it appears. |
-| **New hero** | ✅ **Yes — one view** | `hero_role_ref` hardcodes the 52 heroes→role list. Add the hero here or Matchups won't know its role. |
-| **New STAT name** (a stat no existing hero has) | ✅ **Yes — one view** | `hero_stats_normalised` hardcodes ~121 stat-name fold rules. Add the new stat or its value won't normalise in the DB. |
+| **New hero** | ✅ **Yes — one view** | `hero_role_ref` hardcodes the 53 heroes→role list. Add the hero here or Matchups won't know its role. |
+| **New STAT name** (a stat no existing hero has) | ✅ **Yes — one view** | `hero_stats_normalised` hardcodes 125 stat-name fold rules. Add the new stat or its value won't normalise in the DB. |
 
 Everything else (win rates, play time, E/A/D, damage shares, breakdown aggregates,
 season splits, role splits, map splits) is **dynamic** — no DB edit needed.
@@ -337,20 +337,45 @@ the `_with_alpha` twin **keeps** them (localhost only).
 
 ## ⭐ The two hardcoded views (update for new content)
 
-### ⭐ `hero_role_ref` — HARDCODED 52-hero → role list
+### ⭐ `hero_role_ref` — HARDCODED 53-hero → role list
 A standalone lookup built from an inlined `VALUES` table:
-`('D.Va','tank'), ('Doomfist','tank'), … ('Wuyang','support')` — all 52 heroes.
+`('D.Va','tank'), ('Doomfist','tank'), … ('D.Mon','tank')` — all 53 heroes.
+Columns: `hero_name`, `role`. New entries are APPENDED to the end of the `VALUES` list
+(`Shion`, then `D.Mon` in v1.1.1); the list is not alphabetical and order is irrelevant.
 **Read by `matchup_rows`** (and through it, the whole Matchups feature) to attach a
 role to each scoreboard hero. **A new hero MUST be added here**, or Matchups treats it
 as having an unknown role. → New Season Runbook, hero step.
 
-### ⭐ `hero_stats_normalised` — HARDCODED stat-name folding (~121 rules)
+### ⭐ `hero_stats_normalised` — HARDCODED stat-name folding (125 rules)
 Reads raw `hero_stats` and, via a big `CASE`, folds each stat's singular/plural OCR
 variants to one canonical name (e.g. `'FINAL BLOW'`/`'FINAL BLOWS'` → `FINAL BLOWS`).
-This **mirrors `STAT_NORMALISE` in `src/data/stat-meta.ts`** — the code file's comment
-says to keep them in sync. **A brand-new stat name MUST be added here too**, or its
-value won't normalise on the DB side. Read by `hero_match_facts`, `hero_stat_facts`,
-`hero_breakdown_stats` (+ alpha twin). → New Season Runbook, stat step.
+**A brand-new stat name MUST be added here too**, or its value won't normalise on the DB
+side. Read by `hero_match_facts`, `hero_stat_facts`, `hero_breakdown_stats` (+ alpha twin).
+→ New Season Runbook, stat step.
+
+**Output columns** (previously undocumented — assuming `stat_name` here costs a failed
+query): `id`, `hero_performance_id`, **`stat_canonical`** (the folded name — this is what
+every downstream view and page reads), **`stat_name_raw`** (the untouched OCR text),
+`stat_value`, `avg_per_10_min`, `stat_num`.
+
+**Clause shape** — a new fold is one `WHEN` inside the `CASE`, listing every spelling:
+```sql
+when upper(trim(both from stat_name)) = any (array['LIMIT BREAK KILL','LIMIT BREAK KILLS'])
+     then 'LIMIT BREAK KILLS'
+```
+
+⚠️ **This does NOT mirror `STAT_NORMALISE` in `src/data/stat-meta.ts` — it is AHEAD of it.**
+The code file's comment says to keep them in sync, and until v1.1.1 they were not: the view
+folded `FINAL BLOW(S)`, `SOLO KILL(S)` and `PLAYER(S) SAVED` correctly the whole time while
+the code map had no rule for any of them. **The database was right and the code was the side
+that had drifted**, so analytics were never wrong — the only live consumer of the code map is
+`new-content-readiness.ts` (raw OCR, not view output), which false-flagged them on `/testing`.
+Those three were exactly the foldable ROLE tiles, which are excluded from the code map's
+generation source by design. **When adding a role tile, add the fold in BOTH places.**
+
+**(v1.1.1)** +4 rules: `FUSION REPEATER KILL(S)`, `LIMIT BREAK KILL(S)`,
+`PLAYER(S) PROTECTED`, and `PLAYER(S) SAVED` on the code side. Percentages need no rule —
+they have no plural, so they pass through the `ELSE` unchanged.
 
 ## Foundation views (read by many others)
 

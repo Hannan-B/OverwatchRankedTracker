@@ -341,6 +341,24 @@ export interface ScoreboardDetectionResult {
   signals: string[]
   grid: ScoreboardGrid | null
   format: '5v5' | '6v6' | null  // Derived from row count auto-detection
+  // ── Table geometry (v1.1.1) ──
+  // The scoreboard table is CENTRED at x~1919.5 on every board of both formats,
+  // but its WIDTH varies with content, so the left edge moves by half the width
+  // change. Measured over ten boards: 5v5 width 1690-1699 (edge moves 4px, which
+  // is why its hardcoded constants have always worked); 6v6 width 1462-1517
+  // (edge moves 27px, which is why they have not).
+  //
+  // Everything inside the table sits at a FIXED offset from this edge — the role
+  // icon at +10/11, the portrait at +52/54 — so `tableLeft` is the anchor every
+  // x-constant should be derived from. Carried here rather than passed as an
+  // argument because classifyRoles / identifyHeroes / extractStats already
+  // receive the detection result, so no signature changes.
+  //
+  // Optional: null when the scan fails or the image is not a scoreboard. A
+  // consumer MUST fall back to its hardcoded constant rather than assume 0.
+  // See KNOWN-FAILURE-MODES.md §14.
+  tableLeft?: number | null
+  tableWidth?: number | null
 }
 
 /** Step 2 — Which hero is in each row? */

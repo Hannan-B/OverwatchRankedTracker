@@ -70,7 +70,7 @@ function sideLabel(side: string | null): string | null {
 }
 
 const ROLE_STAT: Record<Role, string[]> = {
-  tank: ['OBJ CONTEST TIME'], dps: ['FINAL BLOWS', 'SOLO KILLS'], support: ['PLAYERS SAVED'],
+  tank: ['OBJ CONTEST TIME', 'PLAYERS PROTECTED'], dps: ['FINAL BLOWS', 'SOLO KILLS'], support: ['PLAYERS SAVED'],
 }
 
 interface StatFact {

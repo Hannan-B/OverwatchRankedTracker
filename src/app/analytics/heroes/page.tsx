@@ -100,13 +100,14 @@ interface StatFactRow {
 interface SeasonRow { id: number; name: string; start_date: string; end_date: string }
 
 const ROLE_BREAKDOWN: Record<'tank' | 'dps' | 'support', string[]> = {
-  tank: ['OBJ CONTEST TIME'],
+  tank: ['OBJ CONTEST TIME', 'PLAYERS PROTECTED'],
   dps: ['FINAL BLOWS', 'SOLO KILLS'],
   support: ['PLAYERS SAVED'],
 }
 const STAT_LABEL: Record<string, string> = {
   'OBJ CONTEST TIME': 'Obj Contest', 'FINAL BLOWS': 'Final Blows',
   'SOLO KILLS': 'Solo Kills', 'PLAYERS SAVED': 'Players Saved',
+  'PLAYERS PROTECTED': 'Players Protected',
 }
 const ROLE_LABEL: Record<string, string> = { tank: 'TANK', dps: 'DPS', support: 'SUPPORT' }
 

@@ -60,6 +60,15 @@ export interface HeroAuditRow {
   bulk: boolean
 }
 
+/** v1.1.1 tile-ceiling watch. The caller decides WHETHER to ask (every Nth
+ *  sighting — see beta-issue-log.ts) and does the logging; the panel only
+ *  renders the question. Keeps this component free of Supabase, as it is. */
+export interface TileCheckPrompt {
+  hero: string
+  /** The ultimate tile the game dropped when PLAYERS PROTECTED arrived. */
+  retiredTile: string
+}
+
 export interface HeroAuditResult {
   rows: HeroAuditRow[]
   correctedSlots: number[]
@@ -67,6 +76,10 @@ export interface HeroAuditResult {
   /** Seconds from mount to submit, so a run of two-second confirmations is
    *  identifiable afterwards rather than silently trusted. */
   reviewSeconds: number
+  /** Answer to the tile-ceiling question, when one was asked. `null` when the
+   *  caller did not ask — which is NOT the same as 'not_seen' and must not be
+   *  logged as one. */
+  tileCheck: { hero: string; retiredTile: string; seen: boolean } | null
 }
 
 /** Deterministic coherence checks — facts about the game a correct read cannot
@@ -323,7 +336,7 @@ function RowCard({
 // ── Panel ────────────────────────────────────────────────────
 
 export function HeroAuditPanel({
-  heroes, stats, heroesPlayed, knownHeroes, scoreboardImageUrl, onComplete,
+  heroes, stats, heroesPlayed, knownHeroes, scoreboardImageUrl, tileCheck, onComplete,
 }: {
   heroes: ScoreboardHeroIdentification[]
   stats: ScoreboardPlayerStats[]
@@ -331,11 +344,17 @@ export function HeroAuditPanel({
   heroesPlayed: string[]
   knownHeroes: { name: string; role: 'tank' | 'dps' | 'support' }[]
   scoreboardImageUrl?: string
+  /** Set to ask the tile-ceiling question after the slots are resolved.
+   *  Omit to skip it entirely. */
+  tileCheck?: TileCheckPrompt
   onComplete: (result: HeroAuditResult) => void
 }) {
   const [rows, setRows] = useState<HeroAuditRow[]>(() => buildAuditRows(heroes, stats, heroesPlayed))
   const [startedAt] = useState(() => Date.now())
   const [lightbox, setLightbox] = useState<string | null>(null)
+  // Starts null, exactly like a row's 'pending' verdict — an unanswered
+  // question must never record as an answer.
+  const [tileSeen, setTileSeen] = useState<boolean | null>(null)
 
   const allHeroes = useMemo(
     () => knownHeroes.map(h => h.name).sort((a, b) => a.localeCompare(b)),
@@ -345,7 +364,8 @@ export function HeroAuditPanel({
   const pending = rows.filter(r => r.verdict === 'pending')
   const flaggedPending = rows.filter(r => r.flag && r.verdict === 'pending')
   const correctedCount = rows.filter(r => r.verdict === 'corrected').length
-  const allResolved = pending.length === 0
+  const tileAnswered = !tileCheck || tileSeen !== null
+  const allResolved = pending.length === 0 && tileAnswered
 
   function confirm(slot: number) {
     setRows(prev => prev.map(r =>
@@ -379,6 +399,9 @@ export function HeroAuditPanel({
       correctedSlots: rows.filter(r => r.verdict === 'corrected').map(r => r.slot),
       bulkConfirmedSlots: rows.filter(r => r.bulk).map(r => r.slot),
       reviewSeconds: Math.round((Date.now() - startedAt) / 1000),
+      tileCheck: tileCheck && tileSeen !== null
+        ? { hero: tileCheck.hero, retiredTile: tileCheck.retiredTile, seen: tileSeen }
+        : null,
     })
   }
 
@@ -426,6 +449,36 @@ export function HeroAuditPanel({
         ))}
       </div>
 
+      {tileCheck && (
+        <div className="pt-3 border-t border-ow-line">
+          <h3 className="text-sm font-display tracking-wider text-ow-muted">CHECK THE BREAKDOWN</h3>
+          <p className="text-xs text-ow-faint mt-0.5">
+            On {tileCheck.hero}{"\u2019"}s breakdown screen, is{' '}
+            <span className="text-ow-fg font-mono">{tileCheck.retiredTile}</span> showing?
+          </p>
+          <p className="text-[11px] text-ow-faint mt-1">
+            It should not be {'\u2014'} the game dropped it for PLAYERS PROTECTED. Answering
+            yes means the catalog is out of date.
+          </p>
+          <div className="grid grid-cols-2 gap-2 mt-2">
+            <button type="button" onClick={() => setTileSeen(false)}
+              className={`font-display py-3 rounded text-sm tracking-wider border transition-colors
+                ${tileSeen === false
+                  ? 'bg-ow-victory/20 text-ow-victory border-ow-victory/30'
+                  : 'bg-ow-dark text-ow-muted border-ow-line hover:bg-white/5'}`}>
+              NOT SHOWING
+            </button>
+            <button type="button" onClick={() => setTileSeen(true)}
+              className={`font-display py-3 rounded text-sm tracking-wider border transition-colors
+                ${tileSeen === true
+                  ? 'bg-ow-defeat/20 text-ow-defeat border-ow-defeat/30'
+                  : 'bg-ow-dark text-ow-muted border-ow-line hover:bg-white/5'}`}>
+              IT{"\u2019"}S SHOWING
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="pt-3 border-t border-ow-line space-y-2">
         {pending.length > 0 && (
           <>
@@ -447,11 +500,13 @@ export function HeroAuditPanel({
           className="w-full bg-ow-victory/20 hover:bg-ow-victory/30 disabled:opacity-40
                      disabled:cursor-not-allowed text-ow-victory border border-ow-victory/30
                      font-display font-bold py-4 rounded text-sm tracking-wider transition-colors">
-          {!allResolved
+          {pending.length > 0
             ? `${pending.length} ROW${pending.length === 1 ? '' : 'S'} LEFT TO CHECK`
-            : correctedCount > 0
-              ? `SAVE WITH ${correctedCount} CORRECTION${correctedCount === 1 ? '' : 'S'}`
-              : 'ALL CORRECT \u2014 SAVE'}
+            : !tileAnswered
+              ? 'ANSWER THE BREAKDOWN CHECK'
+              : correctedCount > 0
+                ? `SAVE WITH ${correctedCount} CORRECTION${correctedCount === 1 ? '' : 'S'}`
+                : 'ALL CORRECT \u2014 SAVE'}
         </button>
       </div>
 
