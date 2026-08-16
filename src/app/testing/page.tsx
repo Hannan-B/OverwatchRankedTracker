@@ -143,12 +143,27 @@ interface OrbHealth {
   disabled: boolean
 }
 
+/** (v1.1.3) Icon-classifier accuracy for one match.
+ *
+ *  overrideRolesFromHeroes() rewrites every role to the identified hero's own
+ *  role, so by the time anything downstream looks, role and hero agree BY
+ *  CONSTRUCTION and the agreement means nothing. This is the only place the
+ *  icon classifier's real hit-rate is visible. */
+interface IconRoleAccuracy {
+  agreed: number
+  total: number
+  overridden: number
+  noIcon: number
+}
+
 interface ParsedConfidence {
   scoreboard: ScoreboardPortraitConfidence[]
   summary: SummaryPortraitConfidence[]
   breakdown: BreakdownPortraitConfidence[]
   /** null when the match produced no Pass-2 block at all. */
   orbHealth: OrbHealth | null
+  /** null on builds before v1.1.3, which did not emit the line. */
+  iconRole: IconRoleAccuracy | null
 }
 
 // --- Scoreboard Pass 1 ---
@@ -167,6 +182,11 @@ const ROLE_CORRECTED_RE = /ROLE CORRECTED\s*(?:→|->)\s*(\w+)/
 //   Step 2 Pass 2 complete: ORB HEALTH ok=1204 failed=0 fallbacks=0 restarts=0 disabled=false
 const ORB_HEALTH_RE =
   /ORB HEALTH\s+ok=(\d+)\s+failed=(\d+)\s+fallbacks=(\d+)\s+restarts=(\d+)\s+disabled=(true|false)/
+
+// --- Icon role accuracy (v1.1.3, emitted once per match) ---
+//   ICON ROLE ACCURACY: 8/10 agreed, 2 overridden, 0 no-icon
+const ICON_ROLE_RE =
+  /ICON ROLE ACCURACY:\s+(\d+)\/(\d+)\s+agreed,\s+(\d+)\s+overridden,\s+(\d+)\s+no-icon/
 
 // --- Summary portrait ---
 //   Summary slot 0 @(355,720): Reinhardt (score 0.4821, ring px=1632)
@@ -188,6 +208,7 @@ function parseConfidence(lines: CapturedLine[]): ParsedConfidence {
   const breakdownBest = new Map<string, BreakdownPortraitConfidence>()
   const assignedHeroes = new Set<string>()
   let orbHealth: OrbHealth | null = null
+  let iconRole: IconRoleAccuracy | null = null
 
   for (const { text } of lines) {
     // Scoreboard Pass 1
@@ -237,6 +258,18 @@ function parseConfidence(lines: CapturedLine[]): ParsedConfidence {
         orbApplied: true,
       }
       scoreboard.set(slot, merged)
+      continue
+    }
+
+    // Icon role accuracy
+    const ir = text.match(ICON_ROLE_RE)
+    if (ir) {
+      iconRole = {
+        agreed: parseInt(ir[1], 10),
+        total: parseInt(ir[2], 10),
+        overridden: parseInt(ir[3], 10),
+        noIcon: parseInt(ir[4], 10),
+      }
       continue
     }
 
@@ -311,6 +344,7 @@ function parseConfidence(lines: CapturedLine[]): ParsedConfidence {
       (a, b) => b.score - a.score,
     ),
     orbHealth,
+    iconRole,
   }
 }
 
@@ -557,6 +591,18 @@ const fmtPct = (v: number) => `${(v * 100).toFixed(1)}%`
 const fmt4 = (v: number | null) => (v === null ? '—' : v.toFixed(4))
 
 /** A correct-looking but fragile match: identified but low margin/score. */
+/** ⚠️ (v1.1.3) THE 0.35 THRESHOLD IS CALIBRATED ON THE PASS-1 SCALE ONLY.
+ *
+ *  Pass-2 rows carry an ORB-scale score, and this applies the same number to
+ *  both. So an ORB row at 0.36 counts as healthy while a Pass-1 row at 0.34
+ *  counts as fragile, and the two are not comparable quantities.
+ *
+ *  Left UNCHANGED on purpose. Picking a second threshold would mean inventing a
+ *  number with nothing to calibrate it against, which is how AUTO_CORRECT_MIN_LEAD
+ *  went in at 0.05 and had to be re-derived from 87 logged decisions. The
+ *  Overall table now reports the two populations separately so the mixture is at
+ *  least visible; calibrate an ORB threshold from logged data before changing
+ *  anything here. */
 function isFragile(score: number, margin: number | null): boolean {
   if (score < 0.35) return true
   if (margin !== null && margin < 0.05) return true
@@ -596,9 +642,38 @@ function generateReport(
   const allSb = results.flatMap((r) => r.confidence.scoreboard)
   const fragileSb = allSb.filter((p) => isFragile(p.score, p.margin)).length
   const disagreeSb = allSb.filter((p) => p.phase1Agrees === false).length
+  // (v1.1.3) Split by scale. A single mean over both is meaningless, and the
+  // fragile count silently mixes them too — see the isFragile note below.
+  const p1 = allSb.filter((p) => !p.orbApplied)
+  const orb = allSb.filter((p) => p.orbApplied)
+  const meanOf = (xs: ScoreboardPortraitConfidence[]) =>
+    xs.length === 0 ? '—' : `${((xs.reduce((a, x) => a + x.score, 0) / xs.length) * 100).toFixed(1)}%`
   md += `| Scoreboard portraits | ${allSb.length} |\n`
+  md += `| — scored on Pass-1 scale | ${p1.length} (mean ${meanOf(p1)}) |\n`
+  md += `| — scored on ORB scale | ${orb.length} (mean ${meanOf(orb)}) |\n`
   md += `| — fragile (low score/margin) | ${fragileSb} |\n`
   md += `| — Phase-1 ≠ Pass-1 crop pick | ${disagreeSb} |\n\n`
+
+  // ---- Icon-classifier accuracy (v1.1.3) ----
+  const irs = results.map((r) => r.confidence.iconRole).filter((x): x is IconRoleAccuracy => x != null)
+  if (irs.length > 0) {
+    const tot = irs.reduce((a, x) => a + x.total, 0)
+    const agreed = irs.reduce((a, x) => a + x.agreed, 0)
+    const over = irs.reduce((a, x) => a + x.overridden, 0)
+    const none = irs.reduce((a, x) => a + x.noIcon, 0)
+    md += `| Icon role agreed with hero | ${agreed}/${tot} (${((agreed / Math.max(tot, 1)) * 100).toFixed(1)}%) |\n`
+    md += `| — overridden by hero lookup | ${over} |\n`
+    md += `| — no icon found | ${none} |\n\n`
+    md += `> Icon accuracy is otherwise INVISIBLE: overrideRolesFromHeroes() rewrites\n`
+    md += `> every role to the identified hero's own role, after which role and hero\n`
+    md += `> agree by construction. An override is the icon classifier being wrong OR\n`
+    md += `> the portrait matcher being wrong — it cannot distinguish them, but a\n`
+    md += `> rising count means one of the two is degrading.\n\n`
+  } else {
+    md += `> ⚠️ No ICON ROLE ACCURACY lines found. Either this build predates v1.1.3\n`
+    md += `> or the log line stopped being emitted — the same failure that left the\n`
+    md += `> ORB counters reading 0 on every run until v1.1.3.\n\n`
+  }
 
   // ---- ORB health roll-up ----
   // A run where ORB died partway through is two different algorithms reported
@@ -732,8 +807,20 @@ function generateReport(
     if (r.confidence.scoreboard.length === 0) {
       md += `_No scoreboard portraits parsed from logs._\n\n`
     } else {
-      md += `| Slot | Team | Hero | Score | Margin | Runner-up | Crop | Phase-1 | Agree? | ORB | Flag |\n`
-      md += `|------|------|------|-------|--------|-----------|------|---------|--------|-----|------|\n`
+      // ⚠️ (v1.1.3) SCALE is not decoration. Pass 1 scores on
+      // 0.6*structural + 0.4*colour; Pass 2 rescores the same slot on
+      // 0.5*orb + 0.3*structural + 0.2*colour and OVERWRITES confidence and
+      // margin with it. scoreboard-extractor says outright that the two must
+      // never be pooled — and until now this table put them in one column with
+      // only a ✓ to tell them apart.
+      //
+      // That is not hypothetical. Between test runs #1 and #2 three slots
+      // appeared to collapse (margin 0.29 -> 0.06, 0.29 -> 0.07, 0.23 -> 0.03).
+      // Nothing had degraded: a 1px table shift nudged each one's Pass-1 score
+      // just over ORB_THRESHOLD, so it skipped Pass 2 and was printed on the
+      // other ruler. Same hero, different scale, and an evening lost to it.
+      md += `| Slot | Team | Hero | Scale | Score | Margin | Runner-up | Crop | Phase-1 | Agree? | Flag |\n`
+      md += `|------|------|------|-------|-------|--------|-----------|------|---------|--------|------|\n`
       for (const p of r.confidence.scoreboard) {
         const phase1 =
           p.phase1Hero != null
@@ -745,9 +832,14 @@ function generateReport(
         if (isFragile(p.score, p.margin)) flags.push('fragile')
         if (p.phase1Agrees === false) flags.push('crop-disagree')
         if (p.roleCorrected) flags.push(`role→${p.roleCorrected}`)
-        md += `| ${p.slot} | ${p.team ?? '—'} | ${p.hero} | ${fmtPct(p.score)} | ${fmt4(p.margin)} | ${p.runnerUp ?? '—'} | ${p.crop ?? '—'} | ${phase1} | ${agree} | ${p.orbApplied ? '✓' : '—'} | ${flags.join(', ')} |\n`
+        const scale = p.orbApplied ? 'ORB' : 'P1'
+        md += `| ${p.slot} | ${p.team ?? '—'} | ${p.hero} | ${scale} | ${fmtPct(p.score)} | ${fmt4(p.margin)} | ${p.runnerUp ?? '—'} | ${p.crop ?? '—'} | ${phase1} | ${agree} | ${flags.join(', ')} |\n`
       }
       md += `\n`
+      md += `> **Scale column:** \`P1\` and \`ORB\` rows are scored by DIFFERENT formulas.\n`
+      md += `> Never average, sort, threshold or compare Score/Margin across the two.\n`
+      md += `> A slot moving between scales between runs changes its number by ~10 points\n`
+      md += `> with nothing whatsoever wrong.\n\n`
     }
 
     // ---- Full scoreboard stats (mirrors MATCH SAVED) ----

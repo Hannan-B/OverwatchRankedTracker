@@ -53,6 +53,11 @@ export interface HeroAuditRow {
   cropIndex: number | null
   phase1Hero: string | null
   phase1Score: number | null
+  /** (v1.1.3) Pre-override icon classification, for the record only. NOT
+   *  displayed, per the diagnostics policy above. `role` is hero-derived after
+   *  overrideRolesFromHeroes(), so role and hero agree by construction; this is
+   *  the only field that can show the icon classifier disagreed. */
+  iconRole: 'tank' | 'dps' | 'support' | null
   flag: 'duplicate' | 'not_played' | null
   verdict: 'pending' | 'confirmed' | 'corrected'
   /** Confirmed via the bulk button rather than individually. Recorded so bulk
@@ -67,6 +72,18 @@ export interface TileCheckPrompt {
   hero: string
   /** The ultimate tile the game dropped when PLAYERS PROTECTED arrived. */
   retiredTile: string
+  /** (v1.1.3) Signed URL of THIS hero's breakdown screenshot.
+   *
+   *  This field did not exist. The panel asked "is <tile> showing on <hero>'s
+   *  breakdown screen?" and then showed no breakdown screen, so the only way to
+   *  answer was from memory of a screenshot taken minutes earlier. /process
+   *  already builds `liveImages.byHero[heroName]` for exactly this image and
+   *  simply never passed it.
+   *
+   *  ⚠️ When this is null the caller MUST NOT ask the question at all. Recording
+   *  "not seen" because the screen was unavailable poisons the observation log
+   *  that the tile-ceiling decision depends on (KNOWN-FAILURE-MODES §13). */
+  breakdownImageUrl?: string | null
 }
 
 export interface HeroAuditResult {
@@ -109,6 +126,48 @@ export function flagRows(rows: HeroAuditRow[], heroesPlayed: string[]): HeroAudi
   })
 }
 
+/** (v1.1.3) 5v5 role-shape check — a WARNING, deliberately not a row flag.
+ *
+ *  Competitive 5v5 is role queue: every team is exactly 1 tank / 2 DPS / 2
+ *  support, without exception. Anything else means a hero is misidentified.
+ *
+ *  ⚠️ Why this is not part of flagRows(). A row `flag` disables the bulk-confirm
+ *  button until it is resolved (see `flaggedPending`). Role shape is a property
+ *  of a TEAM, not a row — there is no way to know which of the five is wrong —
+ *  so flagging all five would block the entire audit on a five-way guess.
+ *
+ *  ⚠️ EXPECTED FALSE POSITIVE. Quick-play and open-queue 5v5 boards are legal at
+ *  other shapes, and at least one is in the test corpus: 5v5 Test 8 is a genuine
+ *  1-3-1 on BOTH teams (Domina/Hanzo/Sojourn/Shion/Juno vs
+ *  Sigma/Sombra/Shion/Sojourn/Mercy — verified against the board's own role
+ *  icons). It will warn on every run. Do not chase it, and do not "fix" it by
+ *  loosening the rule: the rule is right for competitive, which is all that
+ *  reaches the database.
+ *
+ *  6v6 is exempt — open queue, so 2-3-1 and 2-0-4 are both legal and a shape
+ *  rule there would manufacture errors. Same reasoning as flagRows().
+ *
+ *  Note this tests the FINAL roles, which are hero-derived after
+ *  overrideRolesFromHeroes(). So a violation indicts the HERO, not the icon. */
+export function roleShapeWarnings(rows: HeroAuditRow[]): string[] {
+  if (rows.length !== 10) return []   // 5v5 only; 12 rows = 6v6 = open queue
+  const out: string[] = []
+  for (const team of ['ally', 'enemy'] as const) {
+    const side = rows.filter(r => r.team === team)
+    if (side.length !== 5 || side.some(r => !r.confirmedHero || !r.role)) continue
+    const n = { tank: 0, dps: 0, support: 0 }
+    for (const r of side) n[r.role!]++
+    if (n.tank === 1 && n.dps === 2 && n.support === 2) continue
+    out.push(
+      `${team === 'ally' ? 'Your team' : 'The enemy team'} reads ` +
+      `${n.tank}-${n.dps}-${n.support} (tank-dps-support). Competitive 5v5 is ` +
+      `always 1-2-2, so one of these heroes is likely wrong: ` +
+      side.map(r => `${r.slot} ${r.confirmedHero}`).join(', ') + '.'
+    )
+  }
+  return out
+}
+
 export function buildAuditRows(
   heroes: ScoreboardHeroIdentification[],
   stats: ScoreboardPlayerStats[],
@@ -122,6 +181,7 @@ export function buildAuditRows(
         slot: h.slot,
         team: h.team,
         role: st?.role ?? null,
+        iconRole: st?.iconRole ?? null,
         isUser: st?.isUser ?? false,
         readHero: h.heroName,
         confirmedHero: h.heroName,
@@ -363,6 +423,9 @@ export function HeroAuditPanel({
 
   const pending = rows.filter(r => r.verdict === 'pending')
   const flaggedPending = rows.filter(r => r.flag && r.verdict === 'pending')
+  // Recomputed as rows are corrected, so the warning clears the moment the
+  // shape becomes legal. Cheap — ten rows.
+  const shapeWarnings = roleShapeWarnings(rows)
   const correctedCount = rows.filter(r => r.verdict === 'corrected').length
   const tileAnswered = !tileCheck || tileSeen !== null
   const allResolved = pending.length === 0 && tileAnswered
@@ -431,6 +494,19 @@ export function HeroAuditPanel({
         </button>
       )}
 
+      {shapeWarnings.length > 0 && (
+        <div className="bg-ow-orange/10 border border-ow-orange/30 rounded-lg p-3 space-y-1">
+          <p className="text-sm text-ow-orange font-display tracking-wider">ROLE SHAPE LOOKS WRONG</p>
+          {shapeWarnings.map((w, i) => (
+            <p key={i} className="text-xs text-ow-orange/80">{w}</p>
+          ))}
+          <p className="text-[11px] text-ow-faint pt-0.5">
+            Quick play and open queue are not 1-2-2, so this is expected on a
+            non-competitive board. It does not block saving.
+          </p>
+        </div>
+      )}
+
       {flaggedPending.length > 0 && (
         <div className="bg-ow-defeat/10 border border-ow-defeat/30 rounded-lg p-3">
           <p className="text-sm text-ow-defeat font-display tracking-wider">
@@ -456,6 +532,19 @@ export function HeroAuditPanel({
             On {tileCheck.hero}{"\u2019"}s breakdown screen, is{' '}
             <span className="text-ow-fg font-mono">{tileCheck.retiredTile}</span> showing?
           </p>
+
+          {/* (v1.1.3) The screen the question is about. Same tap-to-enlarge as
+              the scoreboard above — the tile is small text and the answer is
+              worthless if it is guessed from memory. */}
+          {tileCheck.breakdownImageUrl && (
+            <button type="button" onClick={() => setLightbox(tileCheck.breakdownImageUrl!)}
+              aria-label={`Enlarge ${tileCheck.hero} breakdown`} title="Tap to enlarge"
+              className="block w-full rounded border border-ow-line overflow-hidden cursor-zoom-in mt-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={tileCheck.breakdownImageUrl} alt={`${tileCheck.hero} breakdown`}
+                className="w-full object-contain max-h-80" />
+            </button>
+          )}
           <p className="text-[11px] text-ow-faint mt-1">
             It should not be {'\u2014'} the game dropped it for PLAYERS PROTECTED. Answering
             yes means the catalog is out of date.

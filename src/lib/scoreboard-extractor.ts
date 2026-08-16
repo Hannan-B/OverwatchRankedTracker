@@ -13,8 +13,8 @@
 // All pixel coordinates calibrated for 3840×2160 (PS5 screenshots).
 // ============================================================
 
-import { loadHeroBank, matchHero, scoreCropAgainstAllHeroes } from '@/lib/hero-matcher'
-import { initOpenCV } from '@/lib/opencv-loader'
+import { loadHeroBank, matchHero, scoreCropAgainstAllHeroes, resetOrbFailureCount, getOrbFailureCount } from '@/lib/hero-matcher'
+import { initOpenCV, getOpenCVHealth } from '@/lib/opencv-loader'
 import type { RoleType } from '@/lib/types'
 import type {
   ScoreboardGrid,
@@ -90,8 +90,71 @@ export function overrideRolesFromHeroes(
       }
     }
   }
+
+  // (v1.1.3) One line per run so icon accuracy is visible at all.
+  //
+  // ⚠️ This override does NOT make roles "correct regardless of icon classifier
+  // accuracy", which is what the caller's comment used to claim. identifyHeroes
+  // is role-FILTERED: a wrong icon role restricts the candidate pool to the
+  // wrong ~15 heroes, the matcher returns the best wrong hero, and this
+  // function then rewrites the role to match it. The outcome is
+  // self-consistent and wrong. The count below is the ONLY signal that the icon
+  // classifier disagreed — without it, `role` and the hero's role agree by
+  // construction and their agreement proves nothing.
+  const iconMissing = roles.filter(r => r.iconRole === null).length
+  console.log(
+    `ICON ROLE ACCURACY: ${roles.length - overrideCount - iconMissing}/${roles.length} agreed, ` +
+    `${overrideCount} overridden, ${iconMissing} no-icon`
+  )
+
   return overrideCount
 }
+
+// ============================================================
+// GEOMETRY EXPERIMENTS (v1.1.3) — DEFAULT OFF
+// ------------------------------------------------------------
+// Three changes in this patch alter the pixels fed to the matcher on boards
+// that are ALREADY CORRECT. Everything else here only moves crops that are
+// currently landing in the wrong place, so a board at the calibration baseline
+// comes out byte-identical.
+//
+// These three do not have that property, so they ship behind independent
+// switches. Flip ONE, re-run /testing, compare. Flipping two at once means a
+// regression cannot be attributed — KNOWN-FAILURE-MODES §6, rule 1:
+// "before accepting any comparison, ask what differs between the two sides
+// besides the thing being tested." Runs 1–4 of the original investigation were
+// lost to exactly that.
+//
+// ⚠️ The 5v5 test corpus spans ONE pixel of table position (see the anchor note
+// below). A flag that shows "no change" against it has not been tested. The
+// narrow-table boards must be in the corpus first.
+const EXPERIMENTS = {
+  /** Widen + anchor the role-icon window to tableLeft +5..+50.
+   *  Currently 5v5 = +12..+39 and 6v6 = -11..+59; the 6v6 window OVERLAPS the
+   *  portrait (ends +59, portrait starts +54), so findIconBounds can take
+   *  top/bottom — and therefore midY, which drives the whole classification —
+   *  from portrait pixels. Glyph measured at +9..+13 (left) and +40..+48
+   *  (right) over 294 rows on 25 boards. +5..+50 contains it on both formats
+   *  and clears the portrait by 4px (6v6) / 10px (5v5). */
+  ICON_WINDOW_V2: false,
+
+  /** Use ONE row pitch for both teams, taken from the ally block.
+   *  Today each block's height is divided by rowsPerTeam independently, and the
+   *  two disagree by up to 10.2px on the same board (IMG_2910: ally 132.2,
+   *  enemy 142.4). The sign is not consistent across boards, so at least one
+   *  block's measured extent is wrong — the tables are physically identical.
+   *  Cause not yet isolated; this flag is the instrument for isolating it. */
+  UNIFY_ROW_PITCH: false,
+
+  /** Crop the portrait SQUARE instead of cropW × (rowHeight - 8).
+   *  The scoreboard portrait is 122x122px (KNOWN-FAILURE-MODES §5d) and
+   *  FORMAT_5V5.portraitCropW is already 122 — so cropW is right and cropH is
+   *  wrong. Today Test_3 produces 122x128 ally crops and 122x135 enemy crops,
+   *  both squashed into a 128x128 square against a square hero bank: two
+   *  different distortions on one board depending on which half a slot is in.
+   *  structuralMatch() is a pixel-wise correlation and is directly sensitive. */
+  SQUARE_PORTRAIT_CROP: false,
+} as const
 
 // ============================================================
 // CONSTANTS — Fixed column X positions (3840×2160)
@@ -127,9 +190,21 @@ function getScoreboardColumns(format: '5v5' | '6v6' | null): ScoreboardGrid['col
   return format === '6v6' ? SCOREBOARD_COLUMNS_6V6 : SCOREBOARD_COLUMNS
 }
 
-// Role icon detection bounds
-const ICON_X_START = 1082
-const ICON_X_END = 1109
+// Role icon detection bounds.
+//
+// (v1.1.3) The module-level ICON_X_START / ICON_X_END constants that used to
+// live here were DELETED. They duplicated FORMAT_5V5.iconXStart/iconXEnd and
+// served as default arguments on findIconBounds() and classifyRoleIcon(), so a
+// caller that forgot to pass got 5v5 constants applied to a 6v6 board with no
+// error. Both functions now REQUIRE the window to be passed. Do not reinstate
+// them.
+//
+// ⚠️ The window bounds findIconBounds() ONLY — the search for the glyph's left
+// edge. classifyRoleIcon() then scans iconBounds.left .. left+34 against the
+// RAW pixel buffer, so it is not clipped by the window and reaches roughly
+// tableLeft+46. Widening the window does NOT widen the classification scan; it
+// changes which pixels can set top/bottom/midY. Getting this backwards was a
+// real diagnostic error during v1.1.3 — see PATCH-SPEC-v1_1_3.md §1.2a.
 
 // ── Format-specific pixel calibration ──
 // 5v5 and 6v6 scoreboards have different X positions for icons, portraits, and gamertags.
@@ -174,7 +249,7 @@ const FORMAT_5V5: FormatConfig = {
 const FORMAT_6V6: FormatConfig = {
   rowsPerTeam: 6,
   // Calibration baseline: these absolute values are correct for a board whose
-  // table sits at TABLE_LEFT_BASELINE_6V6. resolveFormatConfig() shifts them by
+  // table sits at TABLE_LEFT_BASELINE.6v6. resolveFormatConfig() shifts them by
   // the measured delta. Do not "fix" them by nudging — nudge the baseline.
   iconXStart: 1150,
   iconXEnd: 1220,
@@ -205,7 +280,7 @@ function getFormatConfig(format: '5v5' | '6v6' | null): FormatConfig {
 // The scoreboard table is CENTRED at x~1919.5 on every board of both formats,
 // but its WIDTH varies with content, so the left edge moves by half the width
 // change. Measured across ten boards:
-//     5v5  width 1690-1699  ->  left edge 1070-1074   (4px  — harmless)
+//     5v5  width 1690-1699  ->  left edge 1070-1074   (4px  — WRONG, see below)
 //     6v6  width 1462-1517  ->  left edge 1161-1188   (27px — the bug)
 //
 // Every x-constant above is absolute, so on 6v6 they all drift together. That
@@ -213,18 +288,38 @@ function getFormatConfig(format: '5v5' | '6v6' | null): FormatConfig {
 // clipped the DPS glyph's third bar (5-0-1 comps on Test 9), and the portrait
 // crop variants could not reach the true origin (13.8% mean, 12/12 fragile).
 //
-// The baseline below is the table position the 6v6 constants were calibrated
-// against — Test 10, which sits exactly on them. Everything is shifted by the
-// measured delta from it, so a board at the baseline is BYTE-IDENTICAL to the
-// old behaviour and only offset boards move.
+// The baselines below are the table positions each format's constants were
+// calibrated against. Everything is shifted by the measured delta from them, so
+// a board sitting ON its baseline is BYTE-IDENTICAL to the old behaviour and
+// only offset boards move.
 //
-// 5v5 IS DELIBERATELY NOT DERIVED. Its edge moves 4px, its constants are exact
-// (portrait origin measured 1130 on 6 of 7 boards against a hardcoded 1130),
-// and variant 1 wins 66/70 slots. Changing geometry there would risk the one
-// format that demonstrably works. The measurement is still recorded for it, so
-// if a future game patch widens the 5v5 table the drift shows up in the log
-// rather than as silently degrading match scores.
-const TABLE_LEFT_BASELINE_6V6 = 1161
+// ⚠️ (v1.1.3) 5v5 IS NOW DERIVED TOO. The paragraph that used to sit here said
+// it was "deliberately not derived" because its edge moves only 4px and
+// "changing geometry there would risk the one format that demonstrably works."
+// That was measured on seven boards which ALL had long gamertags, therefore
+// wide tables, therefore a left edge sitting exactly on 1070. The sample was
+// incapable of disagreeing with the constants it was validating.
+//
+// Re-measured across 25 boards:
+//     5v5 test corpus (10)  left edge 1070-1071  (1px  — the old sample)
+//     5v5 REAL matches (3)  left edge 1071-1108  (37px — the bug)
+//     6v6 all (12)          left edge 1138-1188  (50px, was recorded as 27px)
+//
+// A 5v5 board at left=1108 puts the portrait ~36px right of the hardcoded
+// cropX=1130, so the crop eats the role-icon box and clips the face. Verified
+// by reproducing the exact crop rectangles from IMG_2912 — they are pixel-
+// identical to the thumbnails in that match's hero audit.
+//
+// The v1.1.1 verification recorded all seven 5v5 boards coming back
+// byte-identical, "guaranteed by construction, not by luck: the resolver
+// returns early unless the format is 6v6." Both halves are true. But a no-op
+// verified against the same boards that set the constants can only ever return
+// byte-identical — it tested that nothing changed, not that the constants were
+// right. Do not treat a no-diff run on the 5v5 corpus as validation.
+const TABLE_LEFT_BASELINE: Record<'5v5' | '6v6', number> = {
+  '5v5': 1070,
+  '6v6': 1161,
+}
 
 /** Find the horizontal extent of the table on a given row: the first and last
  *  strongly team-coloured pixel. A large, high-contrast feature — far more
@@ -257,18 +352,38 @@ export function detectTableEdges(
   return { left, width: med(rights) - left }
 }
 
-/** Format config with 6v6 x-constants shifted to the measured table position.
+/** Format config with x-constants shifted to the measured table position.
  *  Falls back to the unshifted config when the scan failed — never assumes 0,
- *  which would put every crop at the left edge of the screen. */
+ *  which would put every crop at the left edge of the screen.
+ *
+ *  (v1.1.3) Applies to BOTH formats. `base + (tableLeft - baseline)` is
+ *  identical arithmetic to `tableLeft + (base - baseline)`, i.e. to storing the
+ *  constants as offsets — but it keeps the byte-identical property for boards
+ *  sitting on their baseline, which is what makes a /testing diff readable. */
 function resolveFormatConfig(detection: ScoreboardDetectionResult): FormatConfig {
   const base = getFormatConfig(detection.format)
-  if (detection.format !== '6v6' || detection.tableLeft == null) return base
-  const dx = detection.tableLeft - TABLE_LEFT_BASELINE_6V6
-  if (dx === 0) return base
+  const fmt = detection.format
+  if (fmt !== '5v5' && fmt !== '6v6') return base
+  if (detection.tableLeft == null) return base
+
+  const dx = detection.tableLeft - TABLE_LEFT_BASELINE[fmt]
+
+  // The icon window is the one constant whose WIDTH changes, not just its
+  // origin — so it is computed from the anchor directly rather than shifted.
+  // See the EXPERIMENTS.ICON_WINDOW_V2 note for the measurements.
+  const iconXStart = EXPERIMENTS.ICON_WINDOW_V2
+    ? detection.tableLeft + 5
+    : base.iconXStart + dx
+  const iconXEnd = EXPERIMENTS.ICON_WINDOW_V2
+    ? detection.tableLeft + 50
+    : base.iconXEnd + dx
+
+  if (dx === 0 && !EXPERIMENTS.ICON_WINDOW_V2) return base
+
   return {
     ...base,
-    iconXStart: base.iconXStart + dx,
-    iconXEnd: base.iconXEnd + dx,
+    iconXStart,
+    iconXEnd,
     portraitCropX: base.portraitCropX + dx,
     portraitCropConfigs: base.portraitCropConfigs.map(c => ({ ...c, cropX: c.cropX + dx })),
     gamertagDisplayCropX: base.gamertagDisplayCropX + dx,
@@ -453,13 +568,26 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
   if (enemyEndY === 0) enemyEndY = 1980
   signals.push(`Enemy section ends at y=${enemyEndY}`)
 
-  // Detect format via VS gap height:
-  // 5v5 gap = 185–186px, 6v6 gap = 162–168px, threshold at 175px
+  // Detect format via VS gap height.
+  //
+  // (v1.1.3) Threshold moved 175 -> 173. Re-measured across 25 boards:
+  //     5v5 test corpus (10)   185-186
+  //     5v5 REAL matches (3)   177-185   <- IMG_2912 is the 177
+  //     6v6 all (12)           159-170
+  // The populations are 7px apart and 175 was not in the middle of the gap: it
+  // left 5px of margin on the 6v6 side and only 2px on the 5v5 side. 173 gives
+  // 3 and 4.
+  //
+  // ⚠️ This is the highest-blast-radius single decision in the pipeline — a
+  // misread changes rowsPerTeam AND every x-constant at once — and it still
+  // rests on one subtraction of two single-column pixel scans. A second,
+  // independent signal (row count, or block-height ratio) is still owed. See
+  // PATCH-SPEC-v1_1_3.md §1.6.
   const allyHeight = allyEndY - allyStartY
   const enemyHeight = enemyEndY - enemyStartY
   const vsGapHeight = enemyStartY - allyEndY
 
-  const detectedFormat: '5v5' | '6v6' = vsGapHeight <= 175 ? '6v6' : '5v5'
+  const detectedFormat: '5v5' | '6v6' = vsGapHeight <= 173 ? '6v6' : '5v5'
   const fmtCfg = getFormatConfig(detectedFormat)
   const rowsPerTeam = fmtCfg.rowsPerTeam
 
@@ -473,20 +601,54 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
   ])
   let tableDesc = 'NOT DETECTED — falling back to fixed constants'
   if (tableEdges) {
-    tableDesc = `left=${tableEdges.left} width=${tableEdges.width}`
-    if (detectedFormat === '6v6') {
-      tableDesc += ` (delta ${tableEdges.left - TABLE_LEFT_BASELINE_6V6} from baseline)`
+    // (v1.1.3) Both formats now report their delta — 5v5 used to be silent
+    // here, which is part of why a 37px drift went unnoticed.
+    const delta = tableEdges.left - TABLE_LEFT_BASELINE[detectedFormat]
+    tableDesc = `left=${tableEdges.left} width=${tableEdges.width} (delta ${delta} from baseline)`
+
+    // ⚠️ STAT-COLUMN HEADROOM WATCH (v1.1.3).
+    // The E/A/D/DMG/H/MIT cells are the one consumer NOT anchored to the table
+    // — extractStats reads grid.columns, which comes from the unshifted
+    // getScoreboardColumns(). That was left alone deliberately: measured on the
+    // widest (1698) and narrowest (1623) 5v5 boards, every digit group still
+    // falls inside its cell, worst-case clearance 27px on the H column.
+    //
+    // But the clearance is finite. The table is centre-anchored, so as it
+    // narrows the right-hand columns march LEFT by half the width change —
+    // 27px of margin is used up by a further ~54px of narrowing, i.e. a 5v5
+    // width around 1569. Observed minimum so far is 1623.
+    //
+    // This warns 30px before that, so the exemption fails loudly instead of
+    // silently clipping a digit. The 6v6 floor is NOT set: its cells and widths
+    // differ and it has not been measured. Do not guess one.
+    if (detectedFormat === '5v5' && tableEdges.width < 1600) {
+      console.warn(
+        `[scoreboard] ⚠️ 5v5 table width ${tableEdges.width} is below the 1600 ` +
+        `watch floor. Stat columns are NOT anchored to the table; they clip at ` +
+        `roughly 1569. Re-measure the stat-cell headroom before trusting this ` +
+        `board's numbers. See PATCH-SPEC-v1_1_3.md §1.9 / §1.10.`
+      )
     }
   }
   signals.push(`Table: ${tableDesc}`)
   console.log(`[scoreboard] Table geometry (${detectedFormat}): ${tableDesc}`)
 
   const allyRowH = allyHeight / rowsPerTeam
-  const enemyRowH = enemyHeight / rowsPerTeam
+  // (v1.1.3) The two blocks are physically identical in the game UI, yet their
+  // measured heights disagree by up to 10.2px on the same board (IMG_2910: ally
+  // 132.2, enemy 142.4) and the sign flips between boards — so at least one
+  // block's detected extent is wrong. Cause not isolated; see
+  // EXPERIMENTS.UNIFY_ROW_PITCH.
+  const enemyRowH = EXPERIMENTS.UNIFY_ROW_PITCH
+    ? allyRowH
+    : enemyHeight / rowsPerTeam
 
   signals.push(`VS gap: ${vsGapHeight}px → format=${detectedFormat}`)
   signals.push(`Ally rows: ${allyHeight}px total, ${rowsPerTeam} rows, ~${allyRowH.toFixed(1)}px/row`)
-  signals.push(`Enemy rows: ${enemyHeight}px total, ${rowsPerTeam} rows, ~${enemyRowH.toFixed(1)}px/row`)
+  signals.push(
+    `Enemy rows: ${enemyHeight}px total, ${rowsPerTeam} rows, ~${enemyRowH.toFixed(1)}px/row` +
+    (EXPERIMENTS.UNIFY_ROW_PITCH ? ` (UNIFY_ROW_PITCH on — pitch taken from ally block)` : '')
+  )
 
   const rows: ScoreboardGridRow[] = []
   for (let i = 0; i < rowsPerTeam; i++) {
@@ -561,8 +723,8 @@ function findIconBounds(
   px: Uint8ClampedArray,
   w: number,
   rowCenterY: number,
-  iconXStart: number = ICON_X_START,
-  iconXEnd: number = ICON_X_END,
+  iconXStart: number,
+  iconXEnd: number,
 ): { top: number; bottom: number; midY: number; left: number; right: number } | null {
   const brightRows: number[] = []
 
@@ -602,8 +764,12 @@ function classifyRoleIcon(
   px: Uint8ClampedArray,
   w: number,
   iconBounds: { top: number; bottom: number; midY: number; left: number; right: number },
-  iconXStart: number = ICON_X_START,
 ): 'tank' | 'dps' | 'support' {
+  // (v1.1.3) The `iconXStart` parameter was REMOVED. It was never read: the
+  // scan below runs from iconBounds.left to left+34 against the raw pixel
+  // buffer, so the detection window has no bearing on it. Its presence
+  // implied otherwise and produced a wrong diagnosis during v1.1.3 — the
+  // 27px window was blamed for clipping DPS glyphs it never touched.
   const cx = iconBounds.midY
   const lx = iconBounds.left
   const rx = Math.min(lx + 34, iconBounds.right + 1)
@@ -706,15 +872,20 @@ export async function classifyRoles(
     const iconBounds = findIconBounds(px, w, row.centerY, fmtCfg.iconXStart, fmtCfg.iconXEnd)
 
     if (!iconBounds) {
-      console.warn(`  Slot ${row.slot}: no icon found at centerY=${row.centerY}`)
+      console.warn(
+        `  Slot ${row.slot}: NO ICON FOUND at centerY=${row.centerY} ` +
+        `(window x=${fmtCfg.iconXStart}-${fmtCfg.iconXEnd}) — role will be ` +
+        `supplied by the hero lookup, so this failure leaves no other trace`
+      )
       results.push({
         slot: row.slot, team: row.team,
         heroName: null, role: null, source: null,
+        iconRole: null,
       })
       continue
     }
 
-    const role = classifyRoleIcon(px, w, iconBounds, fmtCfg.iconXStart)
+    const role = classifyRoleIcon(px, w, iconBounds)
 
     console.log(
       `  Slot ${row.slot} (${row.team}): ${role} ` +
@@ -727,6 +898,8 @@ export async function classifyRoles(
       heroName: null, // populated after Step 2
       role,
       source: 'icon_detection',
+      // (v1.1.3) Kept so overrideRolesFromHeroes() cannot erase the evidence.
+      iconRole: role,
     })
   }
 
@@ -740,7 +913,7 @@ export async function classifyRoles(
 // ============================================================
 // STEP 2: HERO IDENTIFICATION (role-filtered)
 // Receives roles from Step 4 and passes roleFilter to matchHero()
-// reducing candidates from 51 to ~14 per slot.
+// reducing candidates from 53 to ~15 per slot.
 // Two-pass approach: no-ORB first, ORB for low confidence.
 // ============================================================
 
@@ -796,16 +969,33 @@ export async function identifyHeroes(
   const fmtCfg = resolveFormatConfig(detection)   // v1.1.1: 6v6 x-constants follow the table
   const cropConfigs = fmtCfg.portraitCropConfigs
 
+  // (v1.1.3) Per-match reset. `fallbacks` counts times combinedScore() silently
+  // dropped to structural+colour because ORB threw; it must be per-match so the
+  // /testing roll-up can sum it. ok/failed/restarts are session-cumulative and
+  // are deliberately NOT reset here.
+  resetOrbFailureCount()
+
   console.log(`Step 2: Multi-crop portrait extraction (${cropConfigs.length} variants per slot)...`)
 
   for (const row of grid.rows) {
-    const cropY = row.topY + 4
-    const cropH = (row.bottomY - row.topY) - 8
+    // (v1.1.3) cropH is per-variant now, because SQUARE_PORTRAIT_CROP ties it
+    // to cropW and cropW differs between variants. The legacy path is
+    // unchanged: rowHeight - 8, identical for every variant on the row.
+    const legacyCropY = row.topY + 4
+    const legacyCropH = (row.bottomY - row.topY) - 8
     const variants: CropVariant[] = []
     let portraitDataUrl = ''
 
     for (let ci = 0; ci < cropConfigs.length; ci++) {
       const { cropX, cropW } = cropConfigs[ci]
+
+      // Square: the scoreboard portrait is 122x122 (KNOWN-FAILURE-MODES §5d)
+      // and cropW is already 122 on 5v5, so cropW is the correct side length
+      // and rowHeight-8 was never the right height. Centre it on the row.
+      const cropH = EXPERIMENTS.SQUARE_PORTRAIT_CROP ? cropW : legacyCropH
+      const cropY = EXPERIMENTS.SQUARE_PORTRAIT_CROP
+        ? Math.round(row.centerY - cropW / 2)
+        : legacyCropY
 
       const cropCanvas = document.createElement('canvas')
       cropCanvas.width = cropW
@@ -841,10 +1031,10 @@ export async function identifyHeroes(
 
   // ── Phase 1 (Step 6b) — cheap crop selection ──
   // For a slot, score every crop variant with structural+color ONLY against
-  // ALL 51 heroes (no role filter, no ORB), and return the index of the
+  // ALL 53 heroes (no role filter, no ORB), and return the index of the
   // "cleanest" crop — the one whose best all-hero match scores highest.
   //
-  // Why all-51 and not role-filtered: the role icon classifier is the weakest
+  // Why all-53 and not role-filtered: the role icon classifier is the weakest
   // input in the pipeline. Restricting Phase 1 to the role subset risks the
   // correct hero being absent from the comparison when the icon role is wrong,
   // which would make the selected crop optimal for the WRONG target. Scoring
@@ -895,7 +1085,7 @@ export async function identifyHeroes(
   }
 
   // ── PASS 1 (Step 6b two-phase): select cleanest crop, then ONE full match ──
-  // Phase 1: rank crops (cheap, all-51 structural+color).
+  // Phase 1: rank crops (cheap, all-53 structural+color).
   // Phase 2: run the full role-filtered matchHero() pipeline on the winner only.
   // This replaces the previous "full matchHero × every crop" approach
   // (4 full pipelines per slot → 1 full pipeline + 4 cheap scores per slot).
@@ -924,7 +1114,7 @@ export async function identifyHeroes(
   const results: ScoreboardHeroIdentification[] = []
   const lowConfidenceIndices: number[] = []
 
-  console.log('Step 2 Pass 1: two-phase crop selection (Phase 1: cheap all-51 crop rank; Phase 2: role-filtered full match on winner)...')
+  console.log('Step 2 Pass 1: two-phase crop selection (Phase 1: cheap all-53 crop rank; Phase 2: role-filtered full match on winner)...')
 
   for (let i = 0; i < portraits.length; i++) {
     const p = portraits[i]
@@ -1044,8 +1234,35 @@ export async function identifyHeroes(
     console.log('Step 2 Pass 2: skipped — all portraits above confidence threshold')
   }
 
-  // Override icon-detected roles with the identified hero's known role.
-  // This ensures roles are always correct regardless of icon classifier accuracy.
+  // ── ORB HEALTH (v1.1.3) ─────────────────────────────────────
+  // ⚠️ THIS LINE DID NOT EXIST. FILE-MAP.md:1362 stated that this function
+  // "emits the ORB HEALTH summary line after Pass 2 and calls
+  // resetOrbFailureCount()". Neither was true. Nothing in the codebase emitted
+  // it, so /testing's ORB_HEALTH_RE never matched, `orbHealth` was always null,
+  // and the Overall table reported 0 calls / 0 fallbacks / 0 restarts on every
+  // run — healthy or dead.
+  //
+  // That is not a cosmetic gap. KNOWN-FAILURE-MODES §7a makes "is ORB running
+  // at all?" the FIRST check when accuracy degrades and points at that table. A
+  // counter frozen at zero reads identically on a good run and on the
+  // heap-exhaustion failure that cost four test runs and produced an 11.67%
+  // error rate against 0.98%. The diagnostic was worse than useless: it always
+  // said "dead".
+  //
+  // Format is fixed by the parser in /testing — do not reword it.
+  const h = getOpenCVHealth()
+  console.log(
+    `Step 2 Pass 2 complete: ORB HEALTH ok=${h.orbSuccessCount} ` +
+    `failed=${h.orbFailureCount} fallbacks=${getOrbFailureCount()} ` +
+    `restarts=${h.workerRestartCount} disabled=${h.orbDisabled}`
+  )
+
+  // Rewrite each icon-detected role to the identified hero's known role.
+  //
+  // ⚠️ This makes roles CONSISTENT with the hero, not correct — see the note
+  // inside overrideRolesFromHeroes(). The pre-override value survives on
+  // `iconRole` precisely because this step would otherwise destroy the only
+  // evidence that the icon classifier failed.
   overrideRolesFromHeroes(roles, results)
 
   return results
@@ -1847,6 +2064,7 @@ export async function extractStats(
     return players.map(p => ({
       slot: p.slot, team: p.team, heroName: p.heroName,
       role: roles.find(r => r.slot === p.slot)?.role ?? null,
+      iconRole: roles.find(r => r.slot === p.slot)?.iconRole ?? null,
       isUser: p.isUser,
       eliminations: null, assists: null, deaths: null,
       damage: null, healing: null, mitigation: null,
@@ -1874,6 +2092,12 @@ export async function extractStats(
       team: row.team,
       heroName: hero?.heroName ?? null,
       role: role?.role ?? null,
+      // (v1.1.3) `role` above is post-overrideRolesFromHeroes(), i.e. derived
+      // from the identified hero — so it agrees with the hero by construction
+      // and can never show the icon classifier was wrong. This carries the
+      // pre-override value onto the object the audit panel and saveMatch
+      // actually receive; `roles` itself does not reach them.
+      iconRole: role?.iconRole ?? null,
       isUser: player?.isUser ?? false,
       eliminations: null,
       assists: null,

@@ -4,6 +4,7 @@ import { useState, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
 import type { RoleType, StartingSide } from '@/lib/types'
 import { detectMapFromPhotos } from '@/lib/phone-map-detect'
+import { detectScoreboardCrops, type ScoreboardCrops } from '@/lib/phone-scoreboard-detect'
 import { needsStartingSide } from '@/data/reference'
 
 // ============================================================
@@ -50,7 +51,8 @@ type TeamIssue = 'none' | 'left_gone' | 'left_returned' | 'thrower'
 type Step =
   | 'format' | 'role' | 'matchup' | 'performance' | 'fun'
   | 'team' | 'enemy' | 'thoughts'
-  | 'photos' | 'confirm_leaver' | 'checking' | 'confirm_side' | 'standouts'
+  | 'photos' | 'confirm_leaver' | 'checking' | 'confirm_side'
+  | 'standout_ally' | 'standout_enemy'
   | 'uploading' | 'done'
 
 type FileStatus = 'idle' | 'uploading' | 'success' | 'error'
@@ -70,6 +72,17 @@ function OptionButton({
           : 'bg-ow-panel text-ow-muted border border-ow-line hover:border-ow-orange/40 hover:text-ow-fg'}`}
     >
       {label}
+    </button>
+  )
+}
+
+/** Full-screen view of a crop. Tap anywhere to dismiss. */
+function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
+  return (
+    <button type="button" onClick={onClose} aria-label="Close"
+      className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-3 cursor-zoom-out">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={src} alt="" className="max-w-full max-h-full object-contain" />
     </button>
   )
 }
@@ -171,20 +184,40 @@ function IssuePicker({
 // later to display it above these buttons with tap-to-enlarge; this grid is the
 // documented FALLBACK and must keep working even when detection misses, so the
 // step is never blocked.
-function SlotGrid({
-  slots, selected, onToggle,
-}: { slots: number[]; selected: number[]; onToggle: (s: number) => void }) {
+/** Single-select slot picker (v1.1.3, replaces the multi-select SlotGrid).
+ *
+ *  Buttons READ 1..N on both screens because that is how a human counts a team
+ *  down the scoreboard. The value returned is the real slot number, so the
+ *  enemy screen displays 1..5 and returns 6..10 — matching scoreboard_players
+ *  and the DB's 1-12 CHECK. Do not "fix" the labels to match the stored value:
+ *  the mismatch is the point. */
+function SlotPicker({
+  slots, selected, onPick,
+}: { slots: number[]; selected: number | null; onPick: (s: number) => void }) {
   return (
     <div className="grid grid-cols-3 gap-2">
-      {slots.map(n => (
-        <button key={n} type="button" onClick={() => onToggle(n)}
+      {slots.map((n, i) => (
+        <button key={n} type="button" onClick={() => onPick(n)}
           className={`py-4 rounded-xl font-display text-lg tracking-wider transition-colors
-            ${selected.includes(n)
+            ${selected === n
               ? 'bg-ow-orange text-ow-dark font-bold'
               : 'bg-ow-panel text-ow-muted border border-ow-line hover:border-ow-orange/40'}`}
-        >{n}</button>
+        >{i + 1}</button>
       ))}
     </div>
+  )
+}
+
+/** The team block from the scoreboard photo, above the buttons. Tap to enlarge
+ *  — at phone width a 1750px-wide crop renders about 390px across, which is
+ *  enough to tell heroes apart but not to read a gamertag. */
+function CropStrip({ src, alt, onEnlarge }: { src: string; alt: string; onEnlarge: (s: string) => void }) {
+  return (
+    <button type="button" onClick={() => onEnlarge(src)} title="Tap to enlarge"
+      className="block w-full rounded-xl border border-ow-line overflow-hidden cursor-zoom-in">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={src} alt={alt} className="w-full object-contain" />
+    </button>
   )
 }
 
@@ -214,8 +247,18 @@ export default function UploadPage() {
   // point the answer would be invented rather than recalled.
   // Stored as SLOTS; resolved to hero names at save time, AFTER the hero audit
   // (a slot's hero is not trustworthy until HeroAuditPanel has been through it).
-  const [impressedAlly, setImpressedAlly] = useState<number[]>([])
-  const [struggledEnemy, setStruggledEnemy] = useState<number[]>([])
+  // ONE pick per kind (v1.1.3). Was number[] with a multi-select grid, which
+  // is incompatible with tap-to-advance and was never what the question meant:
+  // "the standout", not "everyone who did well". Still written to metadata as
+  // an ARRAY of at most one, because /process reads number[] and dedupes — so
+  // the wire format is unchanged and any batch already sitting in pending/
+  // stays readable.
+  const [impressedAlly, setImpressedAlly] = useState<number | null>(null)
+  const [struggledEnemy, setStruggledEnemy] = useState<number | null>(null)
+  /** Ally + enemy crops of the scoreboard photo, for the standout screens.
+   *  null = not found; the screens fall back to the bare number grid. */
+  const [sbCrops, setSbCrops] = useState<ScoreboardCrops | null>(null)
+  const [lightbox, setLightbox] = useState<string | null>(null)
 
   const [files, setFiles] = useState<FilePreview[]>([])
 
@@ -249,16 +292,34 @@ export default function UploadPage() {
   const hasPermanentLeaver = teamLeaverType === 'left' || enemyLeaverType === 'left'
 
   // toggle one issue, keeping 'none' mutually exclusive with everything else
+  // (v1.1.3) "NOTHING WENT WRONG" advances on its own; a real issue does not.
+  //
+  // Most matches have nothing wrong, so the common path becomes a single tap.
+  // When something DID go wrong the deliberate NEXT press is the feature: it is
+  // the moment to think twice, and it is also what keeps IssuePicker
+  // multi-select — a match can have both a leaver and a thrower, and
+  // auto-advancing on those would make that combination unrecordable.
+  //
+  // ⚠️ Advances only when SELECTING 'none', never when deselecting it.
+  // `current` is the value this render was built from, so `current.includes`
+  // reads the pre-tap state — which is exactly the question being asked. The
+  // tapped value is passed in rather than read back after the setter, for the
+  // same reason as sideOverride.
+  //
+  // 'none' writes an EMPTY array (see toggleIssue), not a 'none' member, so
+  // nothing downstream of team_issues sees a new value.
+  function autoAdvanceIssues(current: TeamIssue[], tapped: TeamIssue, next: Step) {
+    if (tapped !== 'none') return
+    if (current.includes('none')) return   // deselecting — stay put
+    window.setTimeout(() => { setStep(next) }, ADVANCE_DELAY)
+  }
+
   function toggleIssue(
     current: TeamIssue[], setter: (v: TeamIssue[]) => void, issue: TeamIssue,
   ) {
     if (issue === 'none') { setter(current.includes('none') ? [] : ['none']); return }
     const without = current.filter(i => i !== 'none')
     setter(without.includes(issue) ? without.filter(i => i !== issue) : [...without, issue])
-  }
-
-  function toggleSlot(current: number[], setter: (v: number[]) => void, slot: number) {
-    setter(current.includes(slot) ? current.filter(s => s !== slot) : [...current, slot])
   }
 
   // Slot ranges mirror scoreboard_players: 5v5 -> ally 1-5, enemy 6-10;
@@ -346,6 +407,29 @@ export default function UploadPage() {
       mapName = null
     }
     setDetectedMap(mapName)
+
+    // (v1.1.3) Find the scoreboard photo and cut the two team blocks, while the
+    // spinner is already up. Nine pixel reads plus two JPEG encodes — trivial
+    // next to the Tesseract pass above, and doing it here means the standout
+    // screens have their image the moment they render instead of popping it in
+    // a beat later.
+    //
+    // Skipped for a permanent leaver: that game writes no scoreboard and the
+    // standout step never runs. Failure is not an error — the screens fall back
+    // to bare numbers, exactly as they behaved before this patch.
+    if (!hasPermanentLeaver) {
+      try {
+        const crops = await detectScoreboardCrops(
+          files.map(f => f.preview),
+          matchFormat === '6v6' ? '6v6' : '5v5',
+        )
+        setSbCrops(crops)
+        if (!crops) console.log('[standouts] no scoreboard photo found — showing numbers only')
+      } catch (e) {
+        console.warn('[standouts] crop detection failed, showing numbers only', e)
+        setSbCrops(null)
+      }
+    }
     const needsSide = mapName ? needsStartingSide(mapName) : false
 
     if (needsSide) {
@@ -370,7 +454,16 @@ export default function UploadPage() {
     pendingMapRef.current = mapOverride
     pendingSideRef.current = sideOverride
     if (hasPermanentLeaver) { void commitUpload(mapOverride, sideOverride); return }
-    setStep('standouts')
+    setStep('standout_ally')
+  }
+
+  // PHASE 1d — the enemy pick is made and the upload starts in the SAME tick,
+  // so the pick is handed over explicitly rather than read back from state.
+  // Identical reasoning to sideOverride: setStruggledEnemy has not flushed, and
+  // commitUpload closes over the value from the render that created the
+  // handler. The ally pick needs no override — it was set a full screen ago.
+  function finishStandouts(enemyPick: number | null) {
+    void commitUpload(pendingMapRef.current, pendingSideRef.current, enemyPick)
   }
 
   // PHASE 2 — actually upload photos + metadata, then show success.
@@ -393,6 +486,7 @@ export default function UploadPage() {
   async function commitUpload(
     mapOverride?: string | null,
     sideOverride?: StartingSide | null,
+    enemyPickOverride?: number | null,
   ) {
     setStep('uploading')
     const batchId = Date.now().toString()
@@ -441,8 +535,16 @@ export default function UploadPage() {
       // through it, and a corrected misidentification must carry through.
       // Empty arrays = explicitly nothing stood out. Absent for permanent-leaver
       // games (no scoreboard, so the step is skipped).
-      impressed_ally_slots: impressedAlly,
-      struggled_enemy_slots: struggledEnemy,
+      // Arrays of at most one. See the state declaration: /process resolves
+      // number[] to hero names and dedupes, so a one-element array needs no
+      // change there and old multi-pick batches still parse.
+      impressed_ally_slots: impressedAlly == null ? [] : [impressedAlly],
+      struggled_enemy_slots: (() => {
+        // `!== undefined` sentinel, not `??`: null is a legitimate answer
+        // ("NONE") and must stay distinguishable from "no override passed".
+        const pick = enemyPickOverride !== undefined ? enemyPickOverride : struggledEnemy
+        return pick == null ? [] : [pick]
+      })(),
       starting_side: effectiveSide,
       detected_map: effectiveMap,
       // Step 10: phone map auto-detect produced nothing. The process page reads
@@ -484,7 +586,12 @@ export default function UploadPage() {
     setMatchFormat(null); setRole(null); setRolesPlayed([])
     setMatchupFeel(null); setPerfRating(null); setFunRating6(null)
     setTeamIssues([]); setEnemyIssues([])
-    setImpressedAlly([]); setStruggledEnemy([])
+    setImpressedAlly(null); setStruggledEnemy(null)
+    // (v1.1.3) Must be cleared too, or the next match's standout screens open
+    // showing the PREVIOUS match's scoreboard. The crops are data URLs held in
+    // state, not object URLs, so there is nothing to revoke — but a stale image
+    // beside a fresh set of slot buttons is worse than no image at all.
+    setSbCrops(null); setLightbox(null)
     pendingMapRef.current = undefined; pendingSideRef.current = undefined
     setThoughts('')
     files.forEach(f => URL.revokeObjectURL(f.preview))
@@ -622,11 +729,12 @@ export default function UploadPage() {
   // Ally first, then enemy — matching the slot-pick order later.
   if (step === 'team') {
     return (
-      <StepShell title="Anything go wrong on your team?" hint="Tap all that apply"
+      <StepShell title="Anything go wrong on your team?"
+        hint="Tap NOTHING to move on, or pick what happened"
         onBack={() => setStep('fun')}
         onNext={() => setStep('enemy')} onSkip={() => setStep('enemy')}>
         <IssuePicker value={teamIssues}
-          onToggle={i => toggleIssue(teamIssues, setTeamIssues, i)} />
+          onToggle={i => { toggleIssue(teamIssues, setTeamIssues, i); autoAdvanceIssues(teamIssues, i, 'enemy') }} />
       </StepShell>
     )
   }
@@ -634,11 +742,12 @@ export default function UploadPage() {
   // ======================== ENEMY ISSUES (multi → keep NEXT) ========================
   if (step === 'enemy') {
     return (
-      <StepShell title="And the enemy team?" hint="Tap all that apply"
+      <StepShell title="And the enemy team?"
+        hint="Tap NOTHING to move on, or pick what happened"
         onBack={() => setStep('team')}
         onNext={() => setStep('thoughts')} onSkip={() => setStep('thoughts')}>
         <IssuePicker value={enemyIssues}
-          onToggle={i => toggleIssue(enemyIssues, setEnemyIssues, i)} />
+          onToggle={i => { toggleIssue(enemyIssues, setEnemyIssues, i); autoAdvanceIssues(enemyIssues, i, 'thoughts') }} />
       </StepShell>
     )
   }
@@ -673,31 +782,74 @@ export default function UploadPage() {
   //
   // This step is SKIPPED ENTIRELY for permanent-leaver games (see
   // proceedAfterSide): no scoreboard is written, so there are no slots.
-  if (step === 'standouts') {
-    const finish = () => {
-      void commitUpload(pendingMapRef.current, pendingSideRef.current)
+  // ======================== STANDOUTS — ALLY (1 of 2) ========================
+  // (v1.1.3) Was ONE screen with two multi-select grids, no image, and a manual
+  // UPLOAD button. Now two screens, one pick each, the relevant team's crop on
+  // top, and a tap advances.
+  //
+  // ⚠️ ONLY the team being asked about is shown. Putting both blocks on screen
+  // was the previous behaviour and it invites picking from the wrong half.
+  if (step === 'standout_ally') {
+    const pick = (slot: number | null) => {
+      setImpressedAlly(slot)
+      // Advance on the TAPPED value, never by re-reading state. setImpressedAlly
+      // has not flushed this tick, and the timeout does not change which
+      // closure was captured — the mistake that made starting_side null on all
+      // 192 stored matches. Nothing downstream needs the value here, but the
+      // pattern is kept so the next edit cannot reintroduce it.
+      window.setTimeout(() => { setStep('standout_enemy') }, ADVANCE_DELAY)
     }
     return (
-      <StepShell title="Anyone stand out?" hint="Optional — tap any that apply, or just carry on"
-        onBack={() => setStep('photos')}
-        onNext={finish} nextLabel="UPLOAD">
-        <div className="space-y-2">
-          <p className="text-[11px] font-display tracking-[0.15em] text-ow-muted uppercase">
-            Ally who impressed you
-          </p>
-          <SlotGrid slots={allySlots} selected={impressedAlly}
-            onToggle={n => toggleSlot(impressedAlly, setImpressedAlly, n)} />
+      <StepShell title="Which ally stood out?" hint="Standouts — 1 of 2"
+        onBack={() => setStep('photos')}>
+        {sbCrops
+          ? <CropStrip src={sbCrops.ally} alt="Your team" onEnlarge={setLightbox} />
+          : <p className="text-xs text-ow-faint">
+              Couldn{'\u2019'}t read the scoreboard photo {'\u2014'} slots are numbered
+              top to bottom as they appear on the board.
+            </p>}
+        <div className="pt-3">
+          <SlotPicker slots={allySlots} selected={impressedAlly} onPick={pick} />
         </div>
-        <div className="space-y-2 pt-3">
-          <p className="text-[11px] font-display tracking-[0.15em] text-ow-muted uppercase">
-            Enemy who gave you trouble
-          </p>
-          <SlotGrid slots={enemySlots} selected={struggledEnemy}
-            onToggle={n => toggleSlot(struggledEnemy, setStruggledEnemy, n)} />
+        <button type="button" onClick={() => pick(null)}
+          className="w-full mt-2 py-3 rounded-xl font-display text-sm tracking-wider
+            bg-ow-panel text-ow-muted border border-ow-line hover:border-ow-orange/40 transition-colors">
+          NONE
+        </button>
+        {lightbox && <Lightbox src={lightbox} onClose={() => setLightbox(null)} />}
+      </StepShell>
+    )
+  }
+
+  // ======================== STANDOUTS — ENEMY (2 of 2) ========================
+  if (step === 'standout_enemy') {
+    const pick = (slot: number | null) => {
+      setStruggledEnemy(slot)
+      // Pass the pick EXPLICITLY into commitUpload's caller chain. commitUpload
+      // reads impressedAlly/struggledEnemy from state, and struggledEnemy has
+      // not flushed yet — so the upload must not start until React has
+      // re-rendered with it. ADVANCE_DELAY covers that, but the safe version is
+      // to hand the value over rather than rely on timing: see finish().
+      window.setTimeout(() => { finishStandouts(slot) }, ADVANCE_DELAY)
+    }
+    return (
+      <StepShell title="Which enemy gave you trouble?" hint="Standouts — 2 of 2"
+        onBack={() => setStep('standout_ally')}>
+        {sbCrops
+          ? <CropStrip src={sbCrops.enemy} alt="Enemy team" onEnlarge={setLightbox} />
+          : <p className="text-xs text-ow-faint">
+              Couldn{'\u2019'}t read the scoreboard photo {'\u2014'} slots are numbered
+              top to bottom as they appear on the board.
+            </p>}
+        <div className="pt-3">
+          <SlotPicker slots={enemySlots} selected={struggledEnemy} onPick={pick} />
         </div>
-        <p className="text-xs text-ow-faint pt-2">
-          Slot numbers as they appear on the scoreboard, top to bottom.
-        </p>
+        <button type="button" onClick={() => pick(null)}
+          className="w-full mt-2 py-3 rounded-xl font-display text-sm tracking-wider
+            bg-ow-panel text-ow-muted border border-ow-line hover:border-ow-orange/40 transition-colors">
+          NONE
+        </button>
+        {lightbox && <Lightbox src={lightbox} onClose={() => setLightbox(null)} />}
       </StepShell>
     )
   }

@@ -341,12 +341,32 @@ export interface ScoreboardDetectionResult {
   signals: string[]
   grid: ScoreboardGrid | null
   format: '5v5' | '6v6' | null  // Derived from row count auto-detection
-  // ── Table geometry (v1.1.1) ──
+  // ── Table geometry (v1.1.1, corrected v1.1.3) ──
   // The scoreboard table is CENTRED at x~1919.5 on every board of both formats,
   // but its WIDTH varies with content, so the left edge moves by half the width
-  // change. Measured over ten boards: 5v5 width 1690-1699 (edge moves 4px, which
-  // is why its hardcoded constants have always worked); 6v6 width 1462-1517
-  // (edge moves 27px, which is why they have not).
+  // change.
+  //
+  // v1.1.1 measured ten boards and concluded: 5v5 width 1690-1699 (edge moves
+  // 4px, "which is why its hardcoded constants have always worked"); 6v6 width
+  // 1462-1517 (edge moves 27px, which is why they have not).
+  //
+  // ⚠️ THE 5v5 HALF OF THAT WAS WRONG. Re-measured v1.1.3 across 25 boards:
+  //     5v5 test corpus (10)  width 1698-1699  ->  left edge 1070-1071   (1px)
+  //     5v5 REAL matches (3)  width 1623-1698  ->  left edge 1071-1108  (37px)
+  //     6v6 all (12)          width 1462-1563  ->  left edge 1138-1188  (50px)
+  //
+  // The 4px figure was a sampling artefact: all seven original 5v5 boards had
+  // long gamertags, hence wide tables, hence a left edge sitting exactly where
+  // the constants are. The sample was incapable of disagreeing with them. Real
+  // matches with short gamertags produce narrow tables, the edge walks right by
+  // up to 37px, and the portrait crop lands on the role-icon box instead.
+  //
+  // Both formats are now derived from this anchor. See KNOWN-FAILURE-MODES §14
+  // and PATCH-SPEC-v1_1_3.md §1.
+  //
+  // ⚠️ The 5v5 test corpus still cannot reproduce this — it spans 1px. Verifying
+  // a geometry change against it proves nothing. Narrow-table boards must be in
+  // the corpus before any such change is trusted.
   //
   // Everything inside the table sits at a FIXED offset from this edge — the role
   // icon at +10/11, the portrait at +52/54 — so `tableLeft` is the anchor every
@@ -428,6 +448,28 @@ export interface ScoreboardRoleClassification {
   heroName: string | null
   role: 'tank' | 'dps' | 'support' | null
   source: 'hero_lookup' | 'icon_detection' | null
+
+  // ── v1.1.3 ──────────────────────────────────────────────────
+  // What the ICON classifier said, before overrideRolesFromHeroes()
+  // rewrote `role` to the identified hero's known role.
+  //
+  // WHY THIS EXISTS. identifyHeroes() is role-FILTERED: the icon role selects
+  // which ~15 heroes are even candidates. So a wrong icon role yields the best
+  // WRONG hero, and the override then rewrites `role` to match that hero. The
+  // result is self-consistent and wrong, with nothing left to show the icon
+  // failed. The override's comment claims it "ensures roles are always correct
+  // regardless of icon classifier accuracy" — it does not. It ensures they are
+  // always CONSISTENT, which is a different and much weaker property.
+  //
+  // Keeping the pre-override value is the only way icon accuracy can be
+  // measured at all. Without it, `role` and the hero's role agree by
+  // construction and their agreement proves nothing — the same trap as
+  // `sideLabel()` in KNOWN-FAILURE-MODES §12, where absence of a symptom was a
+  // data accident rather than a passing test.
+  //
+  // null means findIconBounds() found no icon (the window missed the glyph
+  // entirely), which is itself the signal worth seeing.
+  iconRole?: 'tank' | 'dps' | 'support' | null
 }
 
 /** Step 5 — What are the stats for each player? */
@@ -436,6 +478,10 @@ export interface ScoreboardPlayerStats {
   team: 'ally' | 'enemy'
   heroName: string | null
   role: 'tank' | 'dps' | 'support' | null
+  /** v1.1.3 — pre-override icon classification. See ScoreboardRoleClassification
+   *  for why. Carried here because this is the object the audit panel and
+   *  saveMatch actually see; `roles` does not survive into ProcessedMatch. */
+  iconRole?: 'tank' | 'dps' | 'support' | null
   isUser: boolean
   eliminations: number | null
   assists: number | null

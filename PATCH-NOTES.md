@@ -9,6 +9,360 @@
 
 ---
 
+## v1.1.3 — 16 August 2026
+
+Fixes the scoreboard extraction geometry for **5v5**, which had been drifting silently and
+had begun writing wrong heroes into saved matches. Also repairs two tile-ceiling defects,
+two `/testing` instruments that were reporting nothing, and reworks the phone's standout and
+leaver steps. **DB change? No** — one optional repair script for historical rows.
+
+| # | Area | Symptom | Fix | DB change? |
+|---|------|---------|-----|-----------|
+| 1 | Extraction | 5v5 boards with short gamertags read almost every hero wrong | Derive all x-constants from the measured table edge, both formats | No |
+| 2 | Extraction | `ORB HEALTH` counters read 0 on every run, healthy or dead | Emit the line — it never existed | No |
+| 3 | Extraction | Icon-classifier accuracy unmeasurable by construction | Capture `iconRole` before the override | No |
+| 4 | Extraction | Format threshold left 2px of margin on 5v5 | 175 → 173 | No |
+| 5 | Audit | Team comps kept describing heroes the audit had corrected | Recompute in `onAuditComplete` | Script (optional) |
+| 6 | Audit | No check that a competitive 5v5 comp is 1-2-2 | Non-blocking warning banner | No |
+| 7 | Tile check | Question fired on sightings 1, 4, 7 instead of 3, 6, 9 | Pass the sighting NUMBER, walk the watched list | No |
+| 8 | Tile check | Asked about a breakdown screen it never showed | Pass the image; withhold the question if absent | No |
+| 9 | `/testing` | Score column pooled two incompatible scales | Explicit `Scale` column, per-scale means | No |
+| 10 | Phone | Standout picks: no image, multi-select, manual UPLOAD | Two screens, one pick each, team crop shown | No |
+| 11 | Phone | Issue steps always needed NEXT | "NOTHING" auto-advances; a real issue still needs NEXT | No |
+
+---
+
+### 1. ⭐ The 5v5 table moved 37px and nothing was watching
+
+**Symptom.** Three consecutive matches at the start of Season 4 came back with the majority
+of the ten scoreboard slots misidentified — most reading as the same wrong hero. The owner
+hand-corrected ten of ten on one board.
+
+**Root cause.** The scoreboard table is centre-anchored at x≈1919.5 and its WIDTH varies with
+content, so its left edge moves. v1.1.1 established this and derived the 6v6 x-constants from
+the measured edge. It exempted 5v5, on evidence:
+
+> *"5v5's edge moves 4px, its constants are exact… deriving it would risk the one format that
+> demonstrably works. `resolveFormatConfig` returns early unless the format is 6v6, so 5v5 is
+> unaffected BY CONSTRUCTION, not by luck."*
+
+**Every sentence of that was true, and the conclusion was wrong.** The 4px figure came from
+seven boards that all happened to have long gamertags — therefore wide tables, therefore a
+left edge sitting exactly on the hardcoded constants. Re-measured over 25 boards:
+
+| set | n | table width | left edge | spread |
+|---|---|---|---|---|
+| 5v5 test corpus | 10 | 1698–1699 | 1070–1071 | **1px** |
+| **5v5 real matches** | 3 | **1623–1698** | **1071–1108** | **37px** |
+| 6v6 (all) | 12 | 1462–1563 | 1138–1188 | 50px |
+
+At `tableLeft = 1108` the portrait sits ~36px right of the hardcoded `cropX = 1130`, so the
+crop ate the role-icon box and clipped the face. Confirmed by reproducing the exact crop
+rectangles from the failing board — pixel-identical to that match's audit thumbnails.
+
+**Fix.** `TABLE_LEFT_BASELINE_6V6` → `TABLE_LEFT_BASELINE = { '5v5': 1070, '6v6': 1161 }`;
+`resolveFormatConfig` shifts both formats. Kept in delta form rather than storing offsets:
+identical arithmetic, but a board sitting ON its baseline stays byte-identical, which is what
+makes a `/testing` diff readable.
+
+**Verified.** 23 boards, flags off. Exactly three shared boards changed — precisely the three
+at `tableLeft` 1071 — and every board at 1070 was byte-identical, both formats. **Zero hero
+changes on any board that was already correct. 30/30 correct on the three that were broken.
+250/250 overall**, audited slot by slot against the images rather than trusting the report.
+
+⚠️ **The 5v5 test corpus spans ONE PIXEL and cannot reproduce this bug.** A geometry change
+verified against it returns a no-diff and proves nothing — which is exactly what v1.1.1's
+"all seven boards byte-identical" check measured. **A verification whose outcome is
+guaranteed is not a verification.** The three real boards are now in the corpus as 5v5 Test
+11–13; narrow-table boards must stay in it.
+
+**Also in this file.** `ICON_X_START`/`ICON_X_END` deleted — they duplicated the 5v5 format
+config AND served as default arguments, so a caller who forgot to pass silently got 5v5
+constants on a 6v6 board. `classifyRoleIcon`'s unused 4th parameter removed; its presence
+implied the window bounded the classification scan, which it does not, and that produced a
+wrong diagnosis during this patch. Stale "51 heroes" comments → 53. A width-floor warning
+below a 5v5 width of 1600 (see #12).
+
+**Files.** `src/lib/scoreboard-extractor.ts`, `src/lib/types.ts`.
+
+### 2. The ORB health check had never worked
+
+**Symptom.** Every `/testing` run reported `ORB calls 0 / 0`, 0 fallbacks, 0 restarts,
+0 degraded matches — on runs where ORB was demonstrably working.
+
+**Root cause.** `FILE-MAP.md` line 1362 stated that `identifyHeroes` "emits the `ORB HEALTH`
+summary line after Pass 2 and calls `resetOrbFailureCount()`". **It did neither.** Nothing in
+the codebase emitted that line, so `/testing`'s `ORB_HEALTH_RE` never matched and every
+counter defaulted to zero.
+
+**Fix.** Emitter and per-match reset added. Verified live: **13,926 ok / 0 failed.**
+
+**Files.** `src/lib/scoreboard-extractor.ts`.
+
+### 3. Icon-classifier accuracy could not be measured, by construction
+
+**Symptom.** The role classifier has been unreliable for a long time with no way to quantify
+it.
+
+**Root cause.** `overrideRolesFromHeroes()` rewrites every role to the identified hero's own
+role. Its comment claimed this "ensures roles are always correct regardless of icon
+classifier accuracy." It does not — it ensures they are always *consistent*, which is much
+weaker. `identifyHeroes` is role-FILTERED, so a wrong icon role restricts the pool to the
+wrong ~15 heroes, the matcher returns the best wrong hero, and the override rewrites the role
+to match it. Self-consistent, wrong, and no trace that the icon ever failed.
+
+This is why icon-derived and hero-derived team comps agreed on all 20 test boards: by the
+time anything reads them they are the same quantity. **The agreement is guaranteed by
+construction and proves nothing** — §12's rule again.
+
+**Fix.** `iconRole` captured before the override, carried onto `ScoreboardPlayerStats` (which
+reaches the audit and `saveMatch`; `roles` does not), and summarised as one
+`ICON ROLE ACCURACY: n/m agreed, k overridden, j no-icon` line per run, rolled up by
+`/testing`.
+
+⚠️ It cannot separate "icon wrong" from "portrait wrong" — an override means one of the two.
+But a rising count means one of them is degrading, which is more than existed before.
+
+**Files.** `src/lib/scoreboard-extractor.ts`, `src/lib/types.ts`,
+`src/app/review/HeroAuditPanel.tsx`, `src/app/testing/page.tsx`.
+
+### 4. Format threshold sat 2px from a misread
+
+**Symptom.** None observed — found while measuring.
+
+**Root cause.** `vsGapHeight <= 175 ? '6v6' : '5v5'`. Measured across 25 boards, 6v6 runs
+159–170 and 5v5 runs 177–186. The populations are 7px apart and 175 was not in the middle:
+5px of margin on the 6v6 side, **2px** on the 5v5 side. One real board came in at 177.
+
+A misread flips `rowsPerTeam` AND every x-constant at once, making it the
+highest-blast-radius single decision in the pipeline — and it rests on one subtraction of two
+single-column pixel scans.
+
+**Fix.** Threshold 173, giving 3px and 4px. ⚠️ A second independent signal (row count, or
+block-height ratio) is still owed.
+
+**Files.** `src/lib/scoreboard-extractor.ts`.
+
+### 5. Team comps kept describing the heroes you had just corrected
+
+**Symptom.** None visible — a comp string looks plausible whichever heroes produced it.
+
+**Root cause.** `allyComp` / `enemyComp` are computed in `image-processor.ts` from pre-audit
+roles and are **not** among the four scoreboard arrays `onAuditComplete` corrects.
+`saveMatch` wrote them verbatim, so every hero the audit fixed left the comp describing the
+wrong one.
+
+**Fix.** Recomputed in `onAuditComplete` from the corrected stats, before `saveMatch`. Only
+overwritten when every slot on that side resolves — a partial recount would look real while
+under-counting. No trigger or generated column is needed: the recompute runs before the
+insert, so the first value written is already correct.
+
+⚠️ **Historical rows are affected and the blast radius is probably not three matches.** The
+3 Aug 2026 repair corrected `hero_name` and `role` on 324 slots across 27 6v6 beta matches
+and noted that "everything downstream is a VIEW, so the fix propagated automatically." True
+of `matchup_pairs` and the rest — but `ally_team_comp` / `enemy_team_comp` are **text columns
+on `matches`, not views**, and nothing propagated to them.
+
+**Optional repair script** provided: a read-only diagnostic, then an idempotent UPDATE that
+rebuilds both comps from `scoreboard_players.role`. Guarded to complete boards only, so
+leaver games (zero scoreboard rows) are never overwritten with `0-0-0`.
+
+**Files.** `src/app/process/page.tsx`, `v1_1_3-team-comp-repair.sql`.
+
+### 6. A free 5v5 correctness check that did not exist
+
+**Symptom.** The first match of the season had three ally slots labelled TANK, two of them
+Reaper and Cassidy. Nothing flagged it.
+
+**Root cause.** `flagRows()` deliberately carries no role-shape rule, correctly: 6v6 is open
+queue, so 2-3-1 is legal and a shape rule would manufacture errors. But **competitive 5v5 is
+role queue and is always 1-2-2**, and that check was never added.
+
+**Fix.** New `roleShapeWarnings()`, rendered as a non-blocking orange banner.
+
+⚠️ **Deliberately NOT a row flag.** A flag disables bulk-confirm until resolved, and shape is
+a property of a TEAM — there is no way to know which of the five is wrong — so flagging all
+five would block the audit on a five-way guess.
+
+⚠️ **5v5 Test 8 in the corpus is a permanent expected warning.** It is a genuine quick-play
+1-3-1 on both teams, verified against the board's own role icons and portraits. Do not chase
+it, and do not loosen the rule to silence it.
+
+**Files.** `src/app/review/HeroAuditPanel.tsx`.
+
+### 7. The tile-ceiling question fired on the wrong sighting, twice over
+
+**Symptom.** Asked about a watched hero on the second sighting, not the third.
+
+**Root cause, part one.** `shouldAskTileCheck(n)` is `n % 3 === 0`, which is correct — it
+wants the sighting NUMBER. It was being passed `countTileCheckSightings()`, the count of
+sightings BEFORE this match, which is one less. The first sighting ever arrived as 0,
+satisfied `0 % 3 === 0`, and fired. The cadence ran 1, 4, 7.
+
+**Root cause, part two.** `logTileCheck` writes **one row per watched hero played**, but the
+caller only ever considered `watched[0]`. Playing three watched heroes in one match stepped
+the counter 0 → 3 and **jumped clean over the third sighting** without asking.
+
+**Fix.** Walk `watched` and ask about the hero whose own sighting number lands on the
+multiple. Parameter renamed `priorCount` → `sightingNumber`; the old name was the bug.
+
+⚠️ The ask loop and the `logTileCheck` loop both iterate `watched` and must stay in the same
+order, or the hero asked about and the hero counted diverge.
+
+**Files.** `src/app/process/page.tsx`, `src/lib/beta-issue-log.ts`.
+
+### 8. It asked about a screen it never showed you
+
+**Symptom.** "On Hazard's breakdown screen, is PLAYERS PROTECTED showing?" — with no
+breakdown screen on the page.
+
+**Root cause.** `TileCheckPrompt` had no image field. `/process` has built
+`liveImages.byHero[heroName]` — a fresh signed URL to exactly that screenshot — the entire
+time, and passed `scoreboardImageUrl` but not this.
+
+**Fix.** Image field added and passed, with tap-to-enlarge.
+
+⚠️ **If that hero's breakdown is not in the batch, the question is no longer asked at all.**
+A guessed "not seen" poisons the observation log the whole tile-ceiling decision rests on
+(§13). The effect now also depends on `liveImages`, because URLs are re-signed
+asynchronously after the match changes — without it the check reads the PREVIOUS match's
+images, the same stale-read shape that cost `starting_side` 100% of its data.
+
+**Files.** `src/app/review/HeroAuditPanel.tsx`, `src/app/process/page.tsx`.
+
+### 9. The Score column pooled two incompatible scales
+
+**Symptom.** Between two runs three slots appeared to collapse — margin 0.29 → 0.06,
+0.29 → 0.07, 0.23 → 0.03.
+
+**Root cause.** Nothing had degraded. Pass 1 scores `0.6*structural + 0.4*colour`; Pass 2
+rescores the same slot on `0.5*orb + 0.3*structural + 0.2*colour` and overwrites confidence
+and margin. The extractor states outright that the two must never be pooled — and the report
+put them in one column with only a ✓ to tell them apart. A 1px table shift nudged each
+slot's Pass-1 score just over `ORB_THRESHOLD`, so it skipped Pass 2 and printed on the other
+ruler.
+
+**Fix.** Explicit `Scale` column (`P1` / `ORB`), separate mean per scale in Overall, and a
+warning under the table.
+
+⚠️ **`isFragile`'s 0.35 threshold is still Pass-1-calibrated and applied to both scales**, so
+the headline fragile count remains a mixture. Left alone deliberately: inventing a second
+threshold with nothing to calibrate against is how `AUTO_CORRECT_MIN_LEAD` shipped at 0.05
+and had to be re-derived from 87 logged decisions. The mixture is now visible; calibrate from
+logged data before touching it.
+
+**Files.** `src/app/testing/page.tsx`.
+
+### 10. Standout picks — the question you could not answer
+
+**Symptom.** One screen, two multi-select grids, no image, and a manual UPLOAD button. You
+picked a slot NUMBER from memory, minutes after the match, with nothing on screen to check
+against.
+
+**Root cause.** The image was never shown because the phone could not tell which uploaded
+photo was the scoreboard — documented in the file as a known gap rather than solved.
+
+**Fix.** Two screens, one pick each, the relevant team's crop above the buttons, tap to
+advance after 250ms, back button on both, tap-to-enlarge. **Only the team being asked about
+is shown** — the old screen put both up at once and invited picking from the wrong half.
+
+New `src/lib/phone-scoreboard-detect.ts` closes the gap in **nine pixel reads**: ally rows
+blue, enemy rows red, dark VS gap between, plus a table-width check. Free next to
+`detectMapFromPhotos`, which runs a full Tesseract pass per photo.
+
+⚠️ **The wire format is unchanged** — still `impressed_ally_slots: [n]` or `[]` — because
+`/process` reads `number[]` and dedupes. No process-side change, and batches already in
+`pending/` still parse.
+
+⚠️ Buttons READ 1–5 on both screens but RETURN the real slot, so the enemy screen shows 1–5
+and stores 6–10. Intentional; do not "fix" the labels.
+
+⚠️ **Gap probes are y = 1200/1240/1290, not the extractor's 1180/1220/1260.** The first draft
+reused the extractor's and **9 of 27 boards failed** — the ally block reaches y=1184 on tall
+6v6 boards. Do not move them without re-measuring.
+
+**Files.** `src/app/upload/page.tsx`, `src/lib/phone-scoreboard-detect.ts` (new).
+
+### 11. "Nothing went wrong" still needed a NEXT press
+
+**Symptom.** Every match required a NEXT tap on both issue steps, even the majority with
+nothing to report.
+
+**Fix.** Tapping **NOTHING** auto-advances; any real issue still requires NEXT.
+
+`IssuePicker` stays multi-select — a match can have both a leaver and a thrower, and
+auto-advancing on those would make that combination unrecordable. The deliberate press is the
+feature: when something did go wrong, that is the moment to think twice. Advances only on
+SELECT, never on deselect. `'none'` still writes `[]`, not a new `TeamIssue` member.
+
+⚠️ Three stale-closure sites in this change, all handled by passing the value explicitly
+rather than reading state back: the new `enemyPickOverride` on `commitUpload` (with an
+`!== undefined` sentinel, since `null` means NONE and must stay distinct from "not passed"),
+the ally pick, and `autoAdvanceIssues`. `resetForm` must also clear `sbCrops` — without it
+the next match's standout screens open showing the previous match's scoreboard.
+
+**Files.** `src/app/upload/page.tsx`.
+
+### 12. Behind flags — default OFF, not shipped active
+
+Three changes alter boards that are **already correct**, so they ship as independent switches
+in `EXPERIMENTS`, all `false`. Flip ONE, re-run `/testing`, compare — flipping two makes a
+regression unattributable (§6, rule 1).
+
+| Flag | What it changes | Evidence |
+|---|---|---|
+| `ICON_WINDOW_V2` | Anchor + widen the icon window to `tableLeft +5..+50` | Glyph measured at +9..+13 / +40..+48 over 294 rows. The current 6v6 window ends at +59 and **overlaps the portrait** (starts +54), so `findIconBounds` can take `midY` from portrait pixels |
+| `UNIFY_ROW_PITCH` | One row pitch for both teams | Ally and enemy pitch disagree by up to 10.2px on the same board and the sign flips, so at least one block's extent is wrong |
+| `SQUARE_PORTRAIT_CROP` | `cropH = cropW` | The portrait is 122×122 (§5d) and `cropW` is already 122 — so `cropH = rowHeight − 8` was never right. Test 3 makes 122×128 ally crops and 122×135 enemy crops, two different distortions on one board |
+
+Flipping is a source edit and rebuild, deliberately: a UI toggle can be left on and silently
+change what production writes.
+
+⚠️ **A flag that shows "no change" against the 5v5 corpus has not been tested** — that corpus
+spans one pixel.
+
+**Not yet run.** The three real boards score materially worse than the corpus even with the
+anchor fixed (mean 35.4% vs 42.5%, 43% fragile vs 9%, primary crop winning 67% vs 98%), so
+something beyond the horizontal anchor is still off on them. `|cropH − 122|` correlates −0.43
+with score across 26 team-blocks. `SQUARE_PORTRAIT_CROP` is the one to try first.
+
+### 13. Also fixed
+
+- **Stat-column width floor.** `extractStats` reads `grid.columns` from unshifted constants —
+  the one consumer still not anchored. Measured on the widest (1698) and narrowest (1623)
+  5v5 boards, every digit still lands inside its cell, worst case 27px clearance on H. But
+  the table is centred, so those columns march left as it narrows and the clearance runs out
+  near width 1569. A warning now fires below 1600. The 6v6 floor is deliberately unset — its
+  cells differ and have not been measured. **Guessing one would be the same mistake this
+  patch exists to fix.**
+- **`logGeometryReport` advice corrected.** It told you to watch the 5v5 *spread* as "the
+  signal to derive that format too". Both halves are now wrong; it says watch **width**.
+- **Document corrections.** `FILE-MAP.md` had `HeroAuditPanel.tsx` under `src/components/`
+  (it is `src/app/review/`) and asserted the ORB emitter existed. `KNOWN-FAILURE-MODES.md`
+  §14.1 (5v5 spread), §14.3 (implemented, both formats), §14.4 (protocol superseded), §7a
+  (the check that always said "dead") and §5f (pooled scales) all updated.
+
+### What this one teaches
+
+v1.1.1's lesson was *two things agreed and one could not have disagreed*. v1.1.2's was
+*nothing agreed and nothing was checking*. This one is the sharper form of the first:
+
+**A verification whose outcome is guaranteed is not a verification.**
+
+v1.1.1 checked its 5v5 exemption by confirming all seven boards came back byte-identical, and
+correctly noted the result was "guaranteed by construction, not by luck." Both halves were
+true. But a no-op verified against the same boards that set the constants can only ever
+return byte-identical. It tested that nothing changed — not that the constants were right.
+The exemption survived a check that was structurally incapable of failing.
+
+The same shape appears twice more in this patch. The ORB counters "agreed" with a healthy run
+because they were hardcoded to zero. Icon roles and hero roles agree on every slot because
+one is overwritten from the other. In all three cases the instrument was reading itself.
+
+*Before trusting a check, ask what result would have made it fail.*
+
+---
+
 ## v1.1.2 — released 15 August 2026
 
 Restores two Issue Log sections that were silently lost in `cf440cc` (the v1.0.2 hero-audit
@@ -191,7 +545,7 @@ change and every absolute x-coordinate drifts with it.
 
 | | table width | left edge | drift |
 |---|---|---|---|
-| 5v5 (7 boards) | 1690–1699 | 1070–1074 | **4px** — invisible |
+| 5v5 (7 boards) | 1690–1699 | 1070–1074 | **4px** — ⚠️ SUPERSEDED, see v1.1.3 #1 |
 | 6v6 (3 boards) | 1462–1517 | 1161–1188 | **27px** — breaks two things at once |
 
 The role-icon window clipped the DPS glyph's third bar, so `classifyRoleIcon` saw two bright
@@ -211,6 +565,17 @@ origin measured 1130 on six of seven boards against a hardcoded 1130), and varia
 **Verified:** all seven 5v5 boards came back **byte-identical** — same heroes, same scores to
 one decimal, same fragile counts. That is guaranteed by construction, not by luck: the
 resolver returns early unless the format is 6v6.
+
+> ⚠️ **SUPERSEDED BY v1.1.3 #1 — READ THIS BEFORE CITING THE TWO PARAGRAPHS ABOVE.**
+> The 4px figure was a sampling artefact: all seven boards had long gamertags, hence wide
+> tables, hence a left edge sitting exactly on the constants. Real 5v5 matches span
+> **1071–1108 (37px)** and the exemption was actively writing wrong heroes. Both formats
+> derive as of v1.1.3.
+>
+> The byte-identical verification is the sharper lesson. Every word of it is accurate —
+> and a no-op verified against the same boards that set the constants can only ever return
+> byte-identical. It tested that nothing changed, not that the constants were right.
+> **A verification whose outcome is guaranteed is not a verification.**
 
 | | before | after |
 |---|---|---|

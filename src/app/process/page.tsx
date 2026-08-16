@@ -646,18 +646,63 @@ export default function ProcessPage() {
       return
     }
     countTileCheckSightings()
-      .then(count => {
+      .then(priorCount => {
         if (cancelled) return
-        const hero = watched[0]
-        const retiredTile = getRetiredTile(hero)
+
+        // ── (v1.1.3) CADENCE FIX ────────────────────────────────
+        // This asked on sightings 1, 4, 7 instead of 3, 6, 9.
+        //
+        // shouldAskTileCheck(n) is `n % 3 === 0`, which is correct — it wants
+        // the SIGHTING NUMBER. It was being handed `priorCount`, the number of
+        // sightings BEFORE this match, which is one less. So the very first
+        // sighting ever (priorCount 0) satisfied 0 % 3 === 0 and fired.
+        //
+        // Second, subtler bug: this match can contain SEVERAL sightings, one
+        // per watched hero played, because logTileCheck writes a row for each.
+        // The old code only ever considered watched[0], so playing three
+        // watched heroes stepped the counter 0 -> 3 and jumped clean over the
+        // third sighting without asking. Walking the list finds the hero whose
+        // own sighting number lands on the multiple, which is the one the
+        // question is actually about.
+        //
+        // ⚠️ The order here must match the order logTileCheck() writes rows in
+        // onAuditComplete — both iterate `watched` — or the hero asked about
+        // and the hero counted diverge.
+        let hero: string | null = null
+        let retiredTile: string | null = null
+        for (let i = 0; i < watched.length; i++) {
+          if (!shouldAskTileCheck(priorCount + i + 1)) continue
+          const tile = getRetiredTile(watched[i])
+          if (!tile) continue
+          hero = watched[i]
+          retiredTile = tile
+          break
+        }
+
+        // The screen the question is about. Without it the question is
+        // unanswerable except from memory, so if the breakdown for THIS hero
+        // is not in the batch we do not ask at all — a guessed "not seen" is
+        // worse than a missing observation (KNOWN-FAILURE-MODES §13).
+        const breakdownImageUrl = hero ? liveImages.byHero[hero] ?? null : null
+        if (hero && !breakdownImageUrl) {
+          console.log(`[tile-check] skipping ${hero}: no breakdown screenshot in this batch`)
+        }
+
         setTileWatch({
           heroes: watched,
-          ask: shouldAskTileCheck(count) && retiredTile ? { hero, retiredTile } : null,
+          ask: hero && retiredTile && breakdownImageUrl
+            ? { hero, retiredTile, breakdownImageUrl }
+            : null,
         })
       })
       .catch(() => { if (!cancelled) setTileWatch({ heroes: watched, ask: null }) })
     return () => { cancelled = true }
-  }, [current])
+    // liveImages is a dependency because the question is withheld when this
+    // hero's breakdown is missing, and the URLs are re-signed asynchronously
+    // after `current` changes. Without it the check would run against the
+    // PREVIOUS match's images — the stale-read shape that cost starting_side
+    // 100% of its data.
+  }, [current, liveImages])
 
   // Username confirmation handlers (operate on the current review item) ──
   function applyUserSlot(slot: number, method: 'ocr_confirmed' | 'manual_select') {
@@ -734,6 +779,42 @@ export default function ProcessPage() {
         if (row.isUser) result.correctedRole = hero.role
         console.log(`[audit] slot ${row.slot}: ${row.readHero} -> ${hero.name} (${hero.role})`)
       }
+
+      // ── (v1.1.3) RECOMPUTE THE TEAM COMPS ─────────────────────
+      // allyComp / enemyComp are built in image-processor.ts from the
+      // PRE-AUDIT roles and are NOT among the four arrays corrected above.
+      // saveMatch writes them verbatim, so every hero the audit fixed left the
+      // comp still describing the wrong hero. Silent, because a comp is a
+      // plausible-looking string either way.
+      //
+      // Rebuilt from the corrected stats rather than patched in place — the
+      // same reason role is re-derived rather than carried.
+      const shape = (team: 'ally' | 'enemy') => {
+        const n = { tank: 0, dps: 0, support: 0 }
+        let known = 0
+        for (const st of sb.stats) {
+          if (st.team !== team || !st.heroName) continue
+          const h = HEROES.find(x => x.name === st.heroName)
+          if (!h) continue
+          n[h.role]++
+          known++
+        }
+        // Only overwrite when every slot on the side resolved. A partial
+        // recount would look like a real comp while quietly under-counting.
+        return known === sb.stats.filter(st => st.team === team).length
+          ? `${n.tank}-${n.dps}-${n.support}`
+          : null
+      }
+      const ally = shape('ally')
+      const enemy = shape('enemy')
+      if (ally && ally !== result.allyComp) {
+        console.log(`[audit] ally comp ${result.allyComp} -> ${ally}`)
+        result.allyComp = ally
+      }
+      if (enemy && enemy !== result.enemyComp) {
+        console.log(`[audit] enemy comp ${result.enemyComp} -> ${enemy}`)
+        result.enemyComp = enemy
+      }
     }
 
     // ---- 2. logging ----
@@ -770,11 +851,21 @@ export default function ProcessPage() {
         questionsAsked: audit.rows.length,
         autoPassFields: 0,
       })
-      // Table geometry: one row per scoreboard, BOTH formats. The 6v6 fix
-      // derives its x-constants from this measurement; 5v5 is still hardcoded
-      // and is logged precisely so that choice stays reviewable — a game patch
-      // widening the 5v5 table would show up here as moving numbers rather than
-      // as quietly degrading portrait scores.
+      // Table geometry: one row per scoreboard, BOTH formats.
+      //
+      // ⚠️ (v1.1.3) The reason changed. This used to say 6v6 derives its
+      // x-constants from the measurement "and 5v5 is still hardcoded". BOTH
+      // formats now derive (scoreboard-extractor resolveFormatConfig), so that
+      // is no longer why this log exists.
+      //
+      // It exists now for the ONE consumer still not anchored: the stat
+      // columns. extractStats reads grid.columns from the unshifted
+      // getScoreboardColumns(). Measured on the widest (1698) and narrowest
+      // (1623) 5v5 boards every digit still lands inside its cell, worst-case
+      // clearance 27px on H — but the table is centre-anchored, so the columns
+      // march left as it narrows and that clearance runs out at a width around
+      // 1569. tableWidth is the only signal that day is approaching. The
+      // extractor warns below 1600; this row is the history behind the warning.
       //
       // Skipped when the scan failed (null) rather than logged as 0: a fake
       // measurement is worse than a missing one, because it would drag the

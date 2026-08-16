@@ -348,12 +348,34 @@ export const TILE_CHECK_EVERY = 3
 
 export type TileCheckAnswer = 'seen' | 'not_seen' | 'skipped'
 
-/** Pure cadence rule. `priorCount` = tile_check rows already logged. */
-export function shouldAskTileCheck(priorCount: number): boolean {
-  return priorCount % TILE_CHECK_EVERY === 0
+/** Pure cadence rule: ask when this sighting's NUMBER is a multiple of N.
+ *
+ *  ⚠️ (v1.1.3) The argument is the SIGHTING NUMBER — 1 for the first sighting
+ *  ever, 2 for the second, and so on. It is NOT the count of prior rows.
+ *
+ *  The body was always correct. The caller in /process was passing
+ *  `countTileCheckSightings()`, i.e. the number of sightings BEFORE this one,
+ *  which is one less. The first sighting ever therefore arrived as 0, satisfied
+ *  `0 % 3 === 0`, and the question fired on sightings 1, 4, 7 instead of 3, 6,
+ *  9. Nothing here changed except this comment and the parameter name; the fix
+ *  is at the call site.
+ *
+ *  ⚠️ A single match can contain SEVERAL sightings — logTileCheck() writes one
+ *  row per watched hero played, so playing three of them advances the counter by
+ *  three. The caller must therefore evaluate this per hero, as
+ *  `shouldAskTileCheck(priorCount + i + 1)` for the i-th watched hero, or a
+ *  match that steps the counter 0 -> 3 jumps clean over the third sighting and
+ *  never asks. Do not "simplify" it back to one call per match. */
+export function shouldAskTileCheck(sightingNumber: number): boolean {
+  return sightingNumber % TILE_CHECK_EVERY === 0
 }
 
-/** How many sightings have been logged. Cheap COUNT — does not pull the log. */
+/** How many sightings have been logged. Cheap COUNT — does not pull the log.
+ *
+ *  Group-wide across ALL watched heroes, which is intended: the cadence is
+ *  "every third sighting of any affected hero", not every third sighting of
+ *  each one. Returns the count BEFORE this match, so the first sighting of this
+ *  match is `count + 1` — see shouldAskTileCheck(). */
 export async function countTileCheckSightings(): Promise<number> {
   const { count, error } = await supabase
     .from('beta_issue_log')
@@ -394,19 +416,30 @@ export async function logTileCheck(args: {
 // The scoreboard table is CENTRED at x~1919.5 but its WIDTH varies with
 // content, so the left edge moves and every absolute x-constant in
 // scoreboard-extractor.ts drifts with it. On 6v6 that reached 27px and broke
-// role-icon classification and portrait cropping at the same time; on 5v5 it
-// stayed within 4px and nothing showed.
+// role-icon classification and portrait cropping at the same time. 5v5 was
+// recorded as staying within 4px — see the correction below, it does not.
 //
-// The FIX derives the 6v6 constants from the measured edge. This LOG is the
-// separate half: it records what was measured on every scoreboard, both
-// formats, so the question "how much does it actually vary" stops depending on
-// how many screenshots someone remembered to keep. Three saved boards is not a
-// range; a season of matches is.
+// ⚠️ (v1.1.3) THE 5v5 PARAGRAPH THAT USED TO BE HERE WAS WRONG, and the "stayed
+// within 4px" figure above with it. That was measured on seven boards which all
+// happened to have long gamertags, therefore wide tables, therefore a left edge
+// sitting exactly on the hardcoded constants. The sample could not have
+// disagreed with them. Re-measured over 25 boards, real 5v5 matches span
+// 1071-1108 — a 37px drift, larger than the 6v6 one this log was built for. It
+// put the portrait crop on the role-icon box and every hero on those boards read
+// as the same wrong hero.
 //
-// 5v5 is logged even though it is deliberately NOT derived. Leaving 5v5 on
-// hardcoded constants is only defensible if we would notice it drifting — this
-// is how we would notice. A game patch that widens the 5v5 table shows up as
-// moving numbers rather than as quietly degrading match scores.
+// BOTH formats are now derived from the measured edge. This LOG is the separate
+// half: it records what was measured on every scoreboard so "how much does it
+// actually vary" stops depending on how many screenshots someone kept. Three
+// saved boards is not a range; a season of matches is.
+//
+// The log now has ONE remaining consumer-facing job: the stat columns
+// (E/A/D/DMG/H/MIT) are still read from unshifted constants. Measured on the
+// widest (1698) and narrowest (1623) 5v5 boards every digit still lands inside
+// its cell, worst case 27px of clearance — but the table is centred, so those
+// columns march left as it narrows and the clearance runs out around width 1569.
+// `width` here is the only advance warning. scoreboard-extractor warns below
+// 1600; these rows are the history behind that warning.
 //
 // NOT an error event: excluded from error-rate and signal-precision maths, for
 // the same reason as tile_check. A layout measurement is a fact about the game.
@@ -744,8 +777,9 @@ export function generateIssueReportMarkdown(rows: IssueLogRow[]): string {
     }
     lines.push('')
     lines.push('> The table is centred, so the left edge moves by half the width change.')
-    lines.push('> 6v6 x-constants are DERIVED from the left edge; 5v5 are still hardcoded.')
-    lines.push('> A growing 5v5 spread is the signal to derive that format too.')
+    lines.push('> BOTH formats derive their x-constants from the left edge (v1.1.3).')
+    lines.push('> Watch WIDTH, not spread: the stat columns are still unanchored and')
+    lines.push('> start clipping around a 5v5 width of 1569. Observed minimum so far 1623.')
   }
   lines.push('')
 
