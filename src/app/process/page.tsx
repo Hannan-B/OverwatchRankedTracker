@@ -530,7 +530,35 @@ export default function ProcessPage() {
         // Null the scoreboard rather than omitting the key: ProcessedMatch
         // declares it required-nullable, so omission is not valid under
         // exactOptionalPropertyTypes.
-        const result = isLeaverGame ? { ...rawResult, scoreboard: null } : rawResult
+        //
+        // ── (v1.1.4) THE DISCARD MUST COVER THE BOARD'S SIBLINGS ──────────
+        // allyComp, enemyComp and matchFormat are declared alongside
+        // `scoreboard` on ProcessedMatch, NOT inside it — but all three are
+        // assigned in the same Step 8 block that builds the board
+        // (image-processor.ts), from the same pixels this line has just
+        // declared untrustworthy. Nulling `scoreboard` alone left all three
+        // to survive the spread and be written verbatim by saveMatch.
+        //
+        // Observed: five permanent-leaver matches stored impossible comps
+        // (296 enemy 0-3-3, 224/213/160 enemy 0-3-2). computeTeamComp counts
+        // only slots whose role classified, so a tankless full-size team means
+        // the leaver's row was still ON the board and its role icon failed.
+        // Faithful derivation from a board that should never have been read.
+        //
+        // matchFormat falls back to the PHONE selection rather than null:
+        // saveMatch reads `processed.matchFormat || meta.match_format`, so
+        // detection outranked the user on exactly the games where the board is
+        // asymmetric and the VS-gap discriminator cannot be trusted. Carrying
+        // the metadata value across also keeps the review card's format chip.
+        const result = isLeaverGame
+          ? {
+              ...rawResult,
+              scoreboard: null,
+              allyComp: null,
+              enemyComp: null,
+              matchFormat: batch.metadata.match_format ?? null,
+            }
+          : rawResult
 
         seq += 1
         const userResolved = !(result.scoreboard?.ocrAnalysis && !result.scoreboard.ocrAnalysis.resolved)

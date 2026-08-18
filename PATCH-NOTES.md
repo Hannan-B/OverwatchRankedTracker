@@ -9,6 +9,93 @@
 
 ---
 
+## v1.1.4 — 18 August 2026
+
+Closes a scoping bug in the permanent-leaver scoreboard discard: it nulled the board but not
+the three values already derived from it. **DB change? Data only** — five historical rows
+repaired by hand; no table, view, column or RLS touched.
+
+| # | Area | Symptom | Fix | DB change? |
+|---|------|---------|-----|-----------|
+| 1 | `/process` | Leaver games stored impossible team comps and let detection override the phone's format | Extend the discard to `allyComp`, `enemyComp`, `matchFormat` | Data only |
+
+---
+
+### 1. The leaver discard nulled the board but kept what the board had produced
+
+**Symptom.** Match 296 (Midtown, 16 Aug, enemy permanent leaver) saved as 6v6 when 5v5 was
+selected on the phone, and carried comps of `2-2-2` / `0-3-3` — a tankless enemy team of six,
+in a game where an enemy had permanently left. Four older leaver matches (224, 213, 160, 103)
+carried the same signature at 5v5: ally `1-2-2`, enemy `0-3-2`.
+
+**Root cause.** `/process` discards a permanent leaver's scoreboard because the missing row
+makes the board asymmetric and the VS-gap grid can no longer say which slot is which:
+
+```ts
+const result = isLeaverGame ? { ...rawResult, scoreboard: null } : rawResult
+```
+
+`allyComp`, `enemyComp` and `matchFormat` are declared **alongside** `scoreboard` on
+`ProcessedMatch`, not inside it — but all three are assigned in the same Step 8 block that
+builds the board, from the same pixels. Nulling one field left the other three to survive the
+spread, and `saveMatch` wrote them verbatim.
+
+`computeTeamComp` counts only slots whose role classified, so a tankless team at *full size*
+means the leaver's row was still on the board and its role icon failed to classify. The
+derivation was faithful; the board should never have been read.
+
+⚠️ **`matchFormat` is the one that did damage.** `saveMatch` reads
+`processed.matchFormat || meta.match_format`, so pixel detection outranked the user's own
+selection on exactly the games where the board is asymmetric and the format discriminator
+cannot be trusted. Whether that is what flipped 296 is **not established** — the stored comp
+shows six classified enemy slots, which fits both a misdetected 5v5 board and a real 6v6 board
+with the leaver's row still rendered. The database cannot separate them and no guess is
+recorded here.
+
+**Fix.** The discard now covers all four fields, with `matchFormat` falling back to
+`batch.metadata.match_format` rather than null — the phone becomes authoritative on leaver
+games, and the review card keeps its format chip.
+
+**Returned leavers are untouched.** `discardsScoreboard()` already returns false for
+`'returned'`, and match 294's stored comps were verified against its own scoreboard rows
+(`1-2-2` / `1-2-2` both teams, zero unclassified slots, ten slots) before the exemption was
+allowed to stand.
+
+**Files.** `src/app/process/page.tsx`.
+
+**Data repair.** 296 corrected by hand to `5v5` with both comps nulled; 224, 213, 160 and 103
+had comps nulled. Recorded here because a manual edit leaves no trace in git.
+
+```sql
+update matches set ally_team_comp = null, enemy_team_comp = null
+where id in (224, 213, 160, 103)
+  and (ally_team_comp is not null or enemy_team_comp is not null);
+```
+
+**Also established while investigating.** Across every non-alpha match that *has* a
+scoreboard, the stored comp matches what its own rows derive — zero disagreements. Comp
+derivation is sound; the defect was entirely upstream of it. ⚠️ That check inner-joins
+`scoreboard_players`, so the five leaver matches have no rows, never enter the join, and are
+**invisible to it by construction**. It says nothing about the population this patch changed.
+
+### What this one teaches
+
+v1.1.3's lesson was *a verification whose outcome is guaranteed is not a verification*. This
+one is its structural cousin:
+
+**A guard is scoped to a field, not to a cause.**
+
+The discard was written against `scoreboard` because that is where the untrustworthy data
+lived when the line was authored. Three values were later lifted out of the board into
+sibling fields — each individually reasonable — and every one of them stepped outside the
+guard's reach without stepping outside its intent. The comment above the line even claimed
+the win: *"everything downstream … correctly see 'no scoreboard' without any further
+special-casing."* True of the object. False of what the object had produced.
+
+*When something is discarded for being untrustworthy, ask what was already computed from it.*
+
+---
+
 ## v1.1.3 — 16 August 2026
 
 Fixes the scoreboard extraction geometry for **5v5**, which had been drifting silently and
