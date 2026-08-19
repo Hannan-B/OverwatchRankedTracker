@@ -45,10 +45,115 @@ const REGIONS: Record<string, Region> = {
 
   // Middle column — stat value digits (template matching).
   // Crop excludes the icon (left of x≈1720) and the label band below.
-  // Height 76 captures the digit in both layouts (with/without avg-per-10 line).
+  //
+  // ⚠️ (v1.1.5) `y` IS NO LONGER THE CROP TOP. It is the ANCHOR for a vertical
+  // search: findDigitBand() looks DIGIT_SEARCH_UP px above it and
+  // DIGIT_SEARCH_DOWN below, and crops the first band of bright pixels it
+  // finds. `h` is kept only as the fallback crop height for when the search
+  // comes back empty. See findDigitBand() for why.
   elimDigits:   { x: 1750, y: 642,  w: 170, h: 76 },
   assistDigits: { x: 1750, y: 1124, w: 170, h: 76 },
   deathDigits:  { x: 1750, y: 1606, w: 170, h: 76 },
+}
+
+// ── (v1.1.5) DIGIT BAND SEARCH ─────────────────────────────────────────────
+// The three stat cards are a fixed 470px tall, but their CONTENTS are centred
+// as a group inside the card. A card that earns a green NEW CAREER BEST! badge
+// gains a fourth line, the group grows, and everything above the badge is
+// pushed UP by half the growth.
+//
+// Measured on Test_1 (19 Aug), distance from card top to the top of the digits:
+//     ELIMINATIONS  (no badge)  157px    digits y=643..690
+//     ASSISTS       (badge)     119px    digits y=1087..1134   <- 38px higher
+//     DEATHS        (no badge)  157px    digits y=1607..1654
+//
+// The old assistDigits crop, y=1124 h=76, therefore contained: the bottom 11px
+// of "18", then 35 rows of empty card, then the top of the "ASSISTS" label from
+// y=1172. The matcher read that as "415", which failed the 0-150 sanity bound
+// and stored assists as null.
+//
+// This is NOT an assists bug — the badge lands on whichever stat you set a
+// career best in, and two badges break two stats. The header comment on the
+// regions above already noted "with/without avg-per-10 line" and bought slack
+// with h=76; the badge is a THIRD layout and needs 37px more than that slack.
+//
+// The fix mirrors what breakdown-ocr's hero-info scan already does on the
+// breakdown page — that page carried FIVE badges on this same match and read
+// 8/8 stats, because it finds text bands instead of trusting fixed offsets.
+const DIGIT_INK_MIN = 150   // min channel value counted as glyph ink
+const DIGIT_ROW_MIN = 3     // bright pixels in a row before it counts as ink
+const DIGIT_GAP_ROWS = 10   // blank rows that end the band
+const DIGIT_MIN_H = 20      // shorter than this is noise, not a numeral
+const DIGIT_PAD = 6         // breathing room added to the found band
+const DIGIT_SEARCH_UP = 80
+const DIGIT_SEARCH_DOWN = 140
+
+/**
+ * Find the vertical extent of the big stat numeral inside its card.
+ *
+ * The numeral is always the TOPMOST content in the card, so the first ink band
+ * below the search ceiling is it — the label and the avg-per-10 line follow
+ * after a gap, and the badge after those.
+ *
+ * Search bounds are anchored on the region's calibrated `y` (±80/+140), which
+ * keeps every window comfortably inside its own card: the cards sit at
+ * y=486..955, 968..1437 and 1450..1919, so no window can reach a neighbour and
+ * pick up the wrong stat's digits.
+ *
+ * @returns the band in IMAGE pixel coordinates, or null if nothing was found.
+ */
+function findDigitBand(
+  data: Uint8ClampedArray,
+  imgW: number,
+  x: number,
+  w: number,
+  anchorY: number,
+  imgH: number,
+): { y: number; h: number } | null {
+  // Every vertical distance below is quoted at REF_H and must be scaled with
+  // the image, exactly as scaleRegion() scales the anchor it is measured from.
+  // On a native 3840x2160 PS5 capture sy is 1 and these are no-ops.
+  const sy = imgH / REF_H
+  const up = Math.round(DIGIT_SEARCH_UP * sy)
+  const down = Math.round(DIGIT_SEARCH_DOWN * sy)
+  const minH = Math.round(DIGIT_MIN_H * sy)
+  const pad = Math.round(DIGIT_PAD * sy)
+  const gapRows = Math.max(2, Math.round(DIGIT_GAP_ROWS * sy))
+
+  const top = Math.max(0, anchorY - up)
+  const bottom = Math.min(imgH - 1, anchorY + down)
+  const xEnd = Math.min(imgW, x + w)
+
+  let bandTop = -1
+  let bandBottom = -1
+
+  for (let y = top; y <= bottom; y++) {
+    let bright = 0
+    for (let px = x; px < xEnd; px++) {
+      const i = (y * imgW + px) * 4
+      // min of the three channels — the numerals are near-white, the card
+      // background is (31,39,60)-ish, so the minimum separates them cleanly
+      // without being fooled by the green badge (low red, low blue).
+      const m = Math.min(data[i], data[i + 1], data[i + 2])
+      if (m > DIGIT_INK_MIN) bright++
+    }
+    if (bright >= DIGIT_ROW_MIN) {
+      if (bandTop < 0) bandTop = y
+      bandBottom = y
+    } else if (bandTop >= 0 && y - bandBottom > gapRows) {
+      break
+    }
+  }
+
+  if (bandTop < 0) return null
+  const h = bandBottom - bandTop + 1
+  if (h < minH) return null
+
+  const cropTop = Math.max(0, bandTop - pad)
+  return {
+    y: cropTop,
+    h: Math.min(imgH - cropTop, h + pad * 2),
+  }
 }
 
 function scaleRegion(r: Region, imgW: number, imgH: number): Region {
@@ -346,6 +451,22 @@ function extractStatValue(
   regionKey: 'elimDigits' | 'assistDigits' | 'deathDigits'
 ): number | null {
   const r = scaleRegion(REGIONS[regionKey], imgW, imgH)
+
+  // (v1.1.5) Locate the numeral rather than assuming where it sits. Falls back
+  // to the calibrated fixed crop if the scan finds nothing, so a scan failure
+  // is never worse than the old behaviour — but it says so, because a silent
+  // fallback that happens to work is how the badge shift went unnoticed.
+  const band = findDigitBand(data, imgW, r.x, r.w, r.y, imgH)
+  if (band) {
+    r.y = band.y
+    r.h = band.h
+  } else {
+    console.warn(
+      `[ocr-extractor] ${regionKey}: no digit band found in the search window — ` +
+      `falling back to the fixed crop y=${r.y} h=${r.h}.`
+    )
+  }
+
   const { value, confidence } = readRegionValueMultiThreshold(
     data, imgW, r.x, r.y, r.w, r.h
   )

@@ -444,7 +444,34 @@ function getPixel(data: Uint8ClampedArray, width: number, x: number, y: number):
 // vertical color pattern that no other page type has.
 // ============================================================
 
-export async function detectScoreboard(img: HTMLImageElement): Promise<ScoreboardDetectionResult> {
+/**
+ * Detect a scoreboard page and map its row grid.
+ *
+ * @param img         the candidate page, 3840x2160
+ * @param formatHint  the format the user chose in step one of the upload
+ *                    wizard. When supplied it IS the format — the VS-gap
+ *                    measurement is not run at all. Pass null/undefined only
+ *                    from surfaces that have no user answer to offer (i.e.
+ *                    `/testing`, which uploads bare files).
+ *
+ * ── (v1.1.5) WHY THE HINT OUTRANKS THE PIXELS ────────────────────────────
+ * The format decision sets rowsPerTeam AND swaps every x-constant, so a
+ * misread corrupts an entire board. It used to be derived from one subtraction
+ * of two single-column pixel scans, and on Test_1 (19 Aug) that subtraction
+ * used a FALLBACK CONSTANT rather than a measurement: the enemy block began at
+ * y=1401 and the scan for it stopped at 1399. The fallback pair (allyEndY 1183,
+ * enemyStartY 1330) yields a gap of 147, which is <= the threshold, so a failed
+ * scan does not produce "unknown" — it produces 6v6. A 5v5 board saved as 6v6.
+ *
+ * The user picks the format before they queue. That answer is free, certain,
+ * and already in `batch.metadata.match_format`. Deriving it again could only
+ * ever agree or be wrong, so the derivation is now skipped whenever the answer
+ * is available. 5v5 and 6v6 are two different boards; they get two paths.
+ */
+export async function detectScoreboard(
+  img: HTMLImageElement,
+  formatHint?: '5v5' | '6v6' | null,
+): Promise<ScoreboardDetectionResult> {
   const w = img.naturalWidth
   const h = img.naturalHeight
   const signals: string[] = []
@@ -517,23 +544,43 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
 
   // --- Grid mapping: find exact section boundaries ---
   // Scan for ally section end: look for consecutive dark pixels (VS gap)
-  // Must scan past y=1200 since 6v6 ally sections can extend to y=1200
+  //
+  // (v1.1.5) CEILING 1250 -> 1350. The old ceiling was set from a corpus whose
+  // worst case was y=1184. Test_1 (19 Aug, 5v5) ends its ally block at y=1216 —
+  // 30px past that worst case and only 34px short of the ceiling itself. Its
+  // ally rows measure 151/153/153.5/153px against the ~141px the corpus implies,
+  // so the block is growing and the margin was nearly gone.
+  //
+  // Raising a ceiling on a loop that BREAKS at the first hit cannot change any
+  // board that already found one. Every 6v6 board finds its edge by ~1184 and
+  // returns byte-identical. This is safe by construction, not by testing.
   let allyEndY = 0
+  let allyEndFound = false
   let darkRunCount = 0
-  for (let y = 1050; y < 1250; y++) {
+  for (let y = 1050; y < 1350; y++) {
     const [r, g, b] = getPixel(px, w, sampleX, y)
     if (isDark(r, g, b)) {
       darkRunCount++
       if (darkRunCount >= 3) {
         allyEndY = y - 2  // first dark pixel in the run
+        allyEndFound = true
         break
       }
     } else {
       darkRunCount = 0
     }
   }
-  if (allyEndY === 0) allyEndY = 1183
-  signals.push(`Ally section ends at y=${allyEndY}`)
+  if (!allyEndFound) {
+    allyEndY = 1183
+    console.error(
+      `[scoreboard] ⚠️ ALLY BLOCK BOTTOM NOT FOUND in y=1050..1349 at x=${sampleX}. ` +
+      `Falling back to ${allyEndY}. That is a guess, not a measurement — every row ` +
+      `position on this board is now unreliable. See PATCH-NOTES v1.1.5.`
+    )
+    signals.push(`⚠️ Ally section end NOT FOUND — using fallback y=${allyEndY}`)
+  } else {
+    signals.push(`Ally section ends at y=${allyEndY}`)
+  }
 
   let allyStartY = 0
   for (let y = 500; y > 400; y--) {
@@ -546,16 +593,41 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
   if (allyStartY === 0) allyStartY = 478
   signals.push(`Ally section starts at y=${allyStartY}`)
 
+  // (v1.1.5) ⛔ THIS LOOP IS THE v1.1.5 BUG. CEILING 1400 -> 1500.
+  //
+  // The old bound tested up to y=1399. On Test_1 (19 Aug, 5v5) the first red
+  // pixel at x=1800 is at y=1401 — the scan missed the enemy block by TWO
+  // PIXELS, found nothing, and fell through to the 1330 constant. That constant
+  // is 71px above the real block, which
+  //   * placed a phantom enemy row 7 inside the VS gap (no icon, all-zero stats)
+  //   * offset the five real enemy rows by +43/+35/+25/+14/+4px
+  //   * and, before v1.1.5 split the paths, made vsGapHeight 114 instead of 185,
+  //     saving a 5v5 match as 6v6.
+  //
+  // Measured on Test_1: ally blue 478-1214, VS gap 1215-1400, enemy red
+  // 1401-2036. 1500 clears the observed edge by 99px. Break-on-first-hit means
+  // every 6v6 board (enemy edge ~1312-1350) is unaffected.
   let enemyStartY = 0
-  for (let y = 1250; y < 1400; y++) {
+  let enemyStartFound = false
+  for (let y = 1250; y < 1500; y++) {
     const [r, g, b] = getPixel(px, w, sampleX, y)
     if (isRed(r, g, b)) {
       enemyStartY = y
+      enemyStartFound = true
       break
     }
   }
-  if (enemyStartY === 0) enemyStartY = 1330
-  signals.push(`Enemy section starts at y=${enemyStartY}`)
+  if (!enemyStartFound) {
+    enemyStartY = 1330
+    console.error(
+      `[scoreboard] ⚠️ ENEMY BLOCK TOP NOT FOUND in y=1250..1499 at x=${sampleX}. ` +
+      `Falling back to ${enemyStartY}. That is a guess, not a measurement — every ` +
+      `enemy row on this board is now unreliable. See PATCH-NOTES v1.1.5.`
+    )
+    signals.push(`⚠️ Enemy section start NOT FOUND — using fallback y=${enemyStartY}`)
+  } else {
+    signals.push(`Enemy section starts at y=${enemyStartY}`)
+  }
 
   let enemyEndY = 0
   for (let y = 1900; y < 2100; y++) {
@@ -568,26 +640,32 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
   if (enemyEndY === 0) enemyEndY = 1980
   signals.push(`Enemy section ends at y=${enemyEndY}`)
 
-  // Detect format via VS gap height.
-  //
-  // (v1.1.3) Threshold moved 175 -> 173. Re-measured across 25 boards:
-  //     5v5 test corpus (10)   185-186
-  //     5v5 REAL matches (3)   177-185   <- IMG_2912 is the 177
-  //     6v6 all (12)           159-170
-  // The populations are 7px apart and 175 was not in the middle of the gap: it
-  // left 5px of margin on the 6v6 side and only 2px on the 5v5 side. 173 gives
-  // 3 and 4.
-  //
-  // ⚠️ This is the highest-blast-radius single decision in the pipeline — a
-  // misread changes rowsPerTeam AND every x-constant at once — and it still
-  // rests on one subtraction of two single-column pixel scans. A second,
-  // independent signal (row count, or block-height ratio) is still owed. See
-  // PATCH-SPEC-v1_1_3.md §1.6.
   const allyHeight = allyEndY - allyStartY
   const enemyHeight = enemyEndY - enemyStartY
-  const vsGapHeight = enemyStartY - allyEndY
 
-  const detectedFormat: '5v5' | '6v6' = vsGapHeight <= 173 ? '6v6' : '5v5'
+  // ── FORMAT (v1.1.5) ──────────────────────────────────────────────────────
+  // Two formats, two paths. When the wizard's answer is present it IS the
+  // format and nothing is measured. The VS-gap derivation survives only for
+  // `/testing`, which uploads bare files and has no answer to pass.
+  //
+  // (v1.1.3, retained for the derived path only) Threshold 173. Measured across
+  // 25 boards: 6v6 159-170, 5v5 177-186. 175 left only 2px of margin on the 5v5
+  // side; 173 gives 3 and 4.
+  //
+  // ⚠️ The derived path remains the highest-blast-radius decision in the
+  // pipeline and rests on one subtraction of two single-column scans. It is no
+  // longer on the road to the database. Do not reintroduce it there.
+  let detectedFormat: '5v5' | '6v6'
+  if (formatHint === '5v5' || formatHint === '6v6') {
+    detectedFormat = formatHint
+    signals.push(`Format: ${detectedFormat} (from the upload wizard — not derived)`)
+  } else {
+    const vsGapHeight = enemyStartY - allyEndY
+    detectedFormat = vsGapHeight <= 173 ? '6v6' : '5v5'
+    signals.push(
+      `Format: ${detectedFormat} (DERIVED from VS gap ${vsGapHeight}px — no wizard answer supplied)`
+    )
+  }
   const fmtCfg = getFormatConfig(detectedFormat)
   const rowsPerTeam = fmtCfg.rowsPerTeam
 
@@ -643,7 +721,6 @@ export async function detectScoreboard(img: HTMLImageElement): Promise<Scoreboar
     ? allyRowH
     : enemyHeight / rowsPerTeam
 
-  signals.push(`VS gap: ${vsGapHeight}px → format=${detectedFormat}`)
   signals.push(`Ally rows: ${allyHeight}px total, ${rowsPerTeam} rows, ~${allyRowH.toFixed(1)}px/row`)
   signals.push(
     `Enemy rows: ${enemyHeight}px total, ${rowsPerTeam} rows, ~${enemyRowH.toFixed(1)}px/row` +

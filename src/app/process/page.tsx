@@ -507,11 +507,16 @@ export default function ProcessPage() {
       setProcessingStatus(null)
 
       try {
+        // (v1.1.5) The format goes IN, it is not guessed back out. See the
+        // detectScoreboard header: the VS-gap derivation misread Test_1 as 6v6
+        // because a two-pixel scan-window shortfall made it divide by a
+        // fallback constant. The wizard already knows the answer.
         const rawResult = await processMatchPhotos(
           batch.photoUrls,
           (status) => setProcessingStatus(status),
           batch.metadata.role_played || undefined,
           gamertag || undefined,
+          batch.metadata.match_format ?? null,
         )
 
         // PERMANENT-leaver games: the leaver's row disappears, so the board is
@@ -959,7 +964,12 @@ export default function ProcessPage() {
     const meta = batch.metadata
     const gameMode = processed.mapName ? getGameModeForMap(processed.mapName) : null
     const finalRole = processed.correctedRole || meta.role_played || 'dps'
-    const matchFormat = processed.matchFormat || meta.match_format || '5v5'
+    // (v1.1.5) PHONE FIRST. Was `processed.matchFormat || meta.match_format`,
+    // which let a pixel measurement overrule an answer the user had typed in.
+    // As of v1.1.5 processMatchPhotos is handed meta.match_format and echoes it
+    // back, so these two agree by construction on the /process path — the order
+    // is belt-and-braces for any future caller that forgets to pass it.
+    const matchFormat = meta.match_format || processed.matchFormat || '5v5'
     const rolesPlayed = meta.roles_played && meta.roles_played.length > 0
       ? meta.roles_played
       : [finalRole]

@@ -9,6 +9,292 @@
 
 ---
 
+## v1.1.5 — 19 August 2026
+
+Fixes a 5v5 match that saved as 6v6 and took every row and column with it, the phone step
+that refused to read a scoreboard it could see, and a summary stat that returned null
+whenever it was a career best. One cause under the first three: **the ally block on the
+scoreboard is now taller than any board the pixel windows were calibrated against.**
+**DB change? No** — the one bad match was deleted in-app and re-uploaded.
+
+| # | Area | Symptom | Fix | DB change? |
+|---|------|---------|-----|-----------|
+| 1 | Extraction | 5v5 match saved as 6v6; 12 rows read off a 10-row board, MIT/H clipped on every row | Enemy-block scan ceiling 1400 → 1500 | No |
+| 2 | Extraction | Format derived from pixels could overrule the format the user picked | Wizard's answer passed in and used outright | No |
+| 3 | Extraction | Ally-block scan had 34px of headroom left | Ceiling 1250 → 1350 | No |
+| 4 | Extraction | A failed boundary scan silently substituted a constant that means 6v6 | Both fallbacks now `console.error` | No |
+| 5 | Phone | "Can't read the scoreboard" on a valid board; standouts fell back to the numeric grid | Per-format gap probes; 6v6 row untouched | No |
+| 6 | Phone | 5v5 ally crop sliced 38px off the user's own row | Lower bound 0.545 → 0.567 | No |
+| 7 | Summary OCR | Assists stored null on a career-best game | Locate the numeral instead of assuming its offset | No |
+
+---
+
+### 1. ⭐ Two pixels made a 5v5 match save as 6v6
+
+**Symptom.** A 5v5 Lijiang Tower win, with 5v5 explicitly selected on the phone, saved as
+6v6. Comps came back `1-3-2` / `1-2-3` — impossible in either format. Four of the twelve
+scoreboard slots held all-zero or punctuation-only stats, and every MIT value on the board
+was truncated.
+
+**Root cause.** `detectScoreboard()` locates the enemy block by scanning down x=1800 for the
+first red pixel:
+
+```ts
+for (let y = 1250; y < 1400; y++) { ... }   // last y tested = 1399
+if (enemyStartY === 0) enemyStartY = 1330   // fallback
+```
+
+Measured on the board in question, at x=1800:
+
+| band | y range |
+|---|---|
+| ally blue | 478 – 1214 |
+| VS gap | 1215 – 1400 |
+| **enemy red** | **1401 – 2036** |
+
+The first red pixel is at **y=1401**. The scan stops at 1399. It misses by two pixels, finds
+nothing, and falls through to the 1330 constant — 71px above the real block.
+
+**The fallback pair is not neutral.** `allyEndY` falls back to 1183 and `enemyStartY` to
+1330, a gap of 147, which is ≤ the 173 threshold. A failed boundary scan therefore does not
+produce "unknown" — it produces **6v6**, every time.
+
+Everything downstream is arithmetic from there. `vsGapHeight` came out 114 instead of 185
+(the true value, comfortably inside the 5v5 population of 177–186 — the v1.1.3 threshold move
+is irrelevant here, because the number fed to the threshold was a constant, not a
+measurement). `rowsPerTeam` became 6:
+
+- Ally grid `478 + (738/6)·i` → centres 540, 663, 786, 909, 1032, 1155 against real centres
+  553.5, 705.5, 858.8, 1011.8, 1151.5. Slots 3 and 4 **both landed inside real row 3**; slot 3
+  sat 4px below that row's top edge and found no role icon.
+- Enemy grid `1330 + (707/6)·i` → centres 1389, 1507, 1625, 1743, 1860, 1978. Slot 7 landed
+  **12px above the red block, inside the VS gap** — a phantom row. The five real rows were
+  offset +43, +35, +25, +14, +4px, and that monotonic decay is exactly why slot 8 read zeros,
+  slot 9 read punctuation, slot 10 read partials, and 11/12 read clean.
+- `SCOREBOARD_COLUMNS_6V6` was applied to a 5v5 table. MIT read window 2520–2690 instead of
+  2580–2750. Measured ink extents prove the clip to the glyph:
+
+| row | MIT truth | ink x-span | past the 2690 edge | read as |
+|---|---|---|---|---|
+| ally 1 | 14,018 | 2619–2721 | 31px | `"14.0"` → 14 |
+| ally 5 | 2,015 | 2627–2711 | 21px | `".2.01"` → null |
+| enemy 4 | 0 | 2660–2677 | fits | `"0"` → 0 ✓ |
+| enemy 5 | 892 | 2641–2698 | 8px | `"89.."` → 89 |
+
+**Fix.** Ceiling 1400 → 1500. The loop breaks at the first hit, so raising the ceiling
+**cannot change any board that already found one** — every 6v6 board finds its edge at
+~1312–1350 and returns byte-identical. Safe by construction, not by testing.
+
+**Why it had never fired.** The v1.1.3 corpus records the ally block reaching y=1184 at
+worst across 27 boards. This board ends at 1214 — 30px past that — which puts the enemy block
+at 1401. Its ally rows measure 151 / 153 / 153.5 / 153px against the ~141px the corpus
+implies, with the fifth clipped to 126.5px. The block is growing.
+
+**Files.** `src/lib/scoreboard-extractor.ts`.
+
+---
+
+### 2. The format was being guessed when the answer was already known
+
+**Symptom.** None on its own. It is what turned change 1 from a bad row grid into a
+corrupted match record.
+
+**Root cause.** The user picks 5v5 or 6v6 in step one of the upload wizard, before they
+queue. That answer sat in `batch.metadata.match_format` and was used only as a *fallback*:
+
+```ts
+const matchFormat = processed.matchFormat || meta.match_format || '5v5'
+```
+
+A pixel measurement outranked a certain answer the user had typed in. The format decision
+sets `rowsPerTeam` AND swaps every x-constant at once, so it is the highest-blast-radius
+single decision in the pipeline — and it was being re-derived for no benefit. Re-deriving a
+known value can only ever agree or be wrong.
+
+**Fix.** The format now goes IN rather than being guessed back out.
+`processMatchPhotos(urls, onStatus, role?, gamertag?, formatHint?)` passes it to
+`classifyImage`, which passes it to `detectScoreboard(img, formatHint)`. When the hint is
+present the VS-gap measurement **does not run at all**. Save-time precedence flipped to
+`meta.match_format || processed.matchFormat || '5v5'`; the two now agree by construction on
+the `/process` path, and the order is belt-and-braces for any future caller that forgets.
+
+⚠️ **The derived path survives for `/testing` only**, which uploads bare files and has no
+answer to pass — a detection harness should exercise detection. `/process` must always pass
+the hint. Do not put the derivation back on the road to the database.
+
+**Files.** `src/lib/scoreboard-extractor.ts`, `src/lib/image-processor.ts`,
+`src/app/process/page.tsx`.
+
+---
+
+### 3. The ally-block scan had 34px of headroom left
+
+**Root cause.** `for (let y = 1050; y < 1250; y++)`, ceiling set from a corpus whose worst
+case was 1184. The board that triggered this patch ends at 1216.
+
+**Fix.** Ceiling 1250 → 1350. Same break-on-first-hit argument as change 1: no board that
+already found its edge can behave differently.
+
+**Files.** `src/lib/scoreboard-extractor.ts`.
+
+---
+
+### 4. Both boundary fallbacks now fail loudly
+
+**Root cause.** `if (allyEndY === 0) allyEndY = 1183` and `if (enemyStartY === 0)
+enemyStartY = 1330` substituted a plausible number and carried on. Nothing in the log said a
+measurement had been replaced by a guess — the run looked normal and the geometry line
+printed a table position it had derived from the guess.
+
+**Fix.** Explicit `allyEndFound` / `enemyStartFound` flags. A failure emits `console.error`
+naming the search window and stating that every row position on the board is now unreliable,
+and pushes a `⚠️ … NOT FOUND` entry into `signals` so `/testing` shows it.
+
+**Files.** `src/lib/scoreboard-extractor.ts`.
+
+---
+
+### 5. The phone rejected a scoreboard it could see
+
+**Symptom.** `/process` reported it could not read the scoreboard and fell back to the bare
+numeric slot grid for the impressed-ally and enemy-struggle questions. `/testing` read the
+same three photos without complaint.
+
+**Root cause.** `phone-scoreboard-detect.ts` requires **3/3** dark pixels at
+`GAP_Y = [1200, 1240, 1290]`. On this board the ally block runs to y=1214, so:
+
+| probe | pixel | dark? |
+|---|---|---|
+| 1200 | `(0, 140, 193)` | ✗ — inside the ally block |
+| 1240 | `(11, 17, 33)` | ✓ |
+| 1290 | `(11, 17, 33)` | ✓ |
+
+2/3 against a 3/3 rule → rejected. The extractor's own probes are `[1180, 1220, 1260]` and
+need only **2/3**; it also scored 2 (1180 is likewise blue) and passed. One shifted layout,
+two surfaces, opposite verdicts.
+
+**Fix.** `GAP_Y` becomes per-format. **The 6v6 row is unchanged and must stay that way** —
+1200/1240/1290 is the value that fixed the 9-of-27 failure in v1.1.3. 5v5 gets
+`[1240, 1275, 1310]`. `detectScoreboardCrops` already receives the format, so the two boards
+are now probed in their own places instead of in one shrinking overlap.
+
+⚠️ **One 5v5 board has been measured at the new ally height.** Its gap is 1215–1400; the
+corpus puts the earliest gap end at 1312, so the defensible intersection is 1215–1312 and the
+three probes sit inside it with 25px at each end. Re-measure against a pre-19-Aug 5v5 board
+before treating this row as settled.
+
+**Files.** `src/lib/phone-scoreboard-detect.ts`.
+
+---
+
+### 6. The 5v5 ally crop sliced the user's own row
+
+**Root cause.** `CROPS['5v5'].ally = [0.215, 0.545]`. 0.545 is y=1177 and the ally block now
+reaches 1214, so the crop cut 38px off the last ally row — which is the user's own, and the
+one the standout question most often concerns.
+
+**Fix.** Lower bound 0.545 → 0.567 (y=1225), clearing the block by 11px. 6v6 untouched.
+
+**Files.** `src/lib/phone-scoreboard-detect.ts`.
+
+---
+
+### 7. A green badge moved the summary digits
+
+**Symptom.** `[ocr-extractor] assistDigits: value 415 out of range` → assists stored null,
+on a board where eliminations and deaths read perfectly.
+
+**Root cause.** The three summary stat cards are a fixed 470px tall (y=486–955, 968–1437,
+1450–1919), but their CONTENTS are centred as a group inside the card. A card that earns a
+green **NEW CAREER BEST!** badge gains a fourth line, the group grows, and everything above
+the badge is pushed UP by half the growth.
+
+| tile | badge | digits at | offset from card top |
+|---|---|---|---|
+| ELIMINATIONS | no | 643–690 | 157 |
+| **ASSISTS** | **yes** | **1087–1134** | **119** |
+| DEATHS | no | 1607–1654 | 157 |
+
+The fixed crop `assistDigits: { y: 1124, h: 76 }` therefore contained the bottom 11px of
+"18", then 35 rows of empty card, then the top of the "ASSISTS" label from y=1172. That mush
+read as `415`, which failed the 0–150 sanity bound and stored null.
+
+⚠️ **This was never an assists bug.** The badge lands on whichever stat the user set a career
+best in; two badges break two stats. It only looked assists-specific because that is where
+the career best was.
+
+The region comment already noted `h=76` was chosen to cover "both layouts (with/without
+avg-per-10 line)" and bought slack accordingly. The badge is a THIRD layout and needs 37px
+more than that slack. **The height was never the problem — the top edge was.**
+
+**Fix.** `y` is now a search ANCHOR, not a crop top. `findDigitBand()` scans −80/+140 around
+it and crops the first band of bright pixels, which is always the numeral because the label
+and avg line follow after a gap. Those windows stay well inside their own cards, so no stat
+can pick up a neighbour's digits. A scan that finds nothing falls back to the old fixed crop
+**and logs it**. All vertical distances are scaled by `imgH / REF_H`, matching
+`scaleRegion()`.
+
+This mirrors what `breakdown-ocr`'s hero-info scan already does — the breakdown page on this
+same match carried FIVE badges and read 8/8 stats, because it finds text bands instead of
+trusting fixed offsets. The problem was already solved one file over.
+
+Verified against the real screenshot: crops move to y=637/1081/1601 (h=60), each fully
+enclosing its numeral.
+
+**Files.** `src/lib/ocr-extractor.ts`.
+
+---
+
+### What this one teaches
+
+v1.1.3's lesson was *a verification whose outcome is guaranteed is not a verification*.
+v1.1.4's was *a guard is scoped to a field, not to a cause*. This one:
+
+**A calibrated window is a claim about a corpus, and corpora go stale.**
+
+Every window in this patch was correct when it was measured and correct on every board it was
+measured against. The scan ceilings, the gap probes, the crop fractions, the stat-tile
+offsets — none of them were wrong. The game's layout moved out from under all four at once,
+and each failed in the manner its own fallback dictated rather than in the manner that would
+have been noticed. The enemy scan fell back to a constant that means 6v6, so a 5v5 board
+became a 6v6 board. The phone probe failed closed, so a real scoreboard became "not a
+scoreboard". The stat crop returned a number outside its sanity bound, so a career best
+became null. Three different disguises, one shared cause.
+
+The ally block was 30px outside a 27-board corpus, and nothing anywhere reported that a
+window had been used near its edge.
+
+*A window that has never been observed close to its limit has not been shown to have margin —
+only that nothing has yet tested it.*
+
+---
+
+### Deploy checklist — v1.1.5
+
+Files to ship: `src/lib/scoreboard-extractor.ts`, `src/lib/image-processor.ts`,
+`src/lib/phone-scoreboard-detect.ts`, `src/lib/ocr-extractor.ts`,
+`src/app/process/page.tsx`.
+Docs updated: `PATCH-NOTES.md`, `FILE-MAP.md`.
+No SQL, no DB, no `Supabase Map.md` change.
+
+Before commit: `npm run build` (typecheck + lint clean), then commit + push (Vercel
+auto-deploys).
+
+Post-deploy:
+1. `/process` a real 5v5 — confirm the format chip matches the phone selection, comps are
+   1-2-2, ten slots, and the standouts step shows team crops rather than the numeric grid.
+2. **`/process` a real 6v6** — the corpus staleness that caused this patch has not been
+   checked against 6v6. If its ally block has grown the same way, it will misplace rows while
+   still reporting the right format, because the fallback pair means 6v6. Nothing in the app
+   will look wrong. Check the row stats against the screenshot by eye.
+3. Confirm E/A/D on a game with a NEW CAREER BEST badge on any of the three tiles.
+
+⚠️ Outstanding, not fixed here: the ally row grid still divides the block evenly, and the
+fifth ally row is clipped 26.5px short, so centres drift to −17px by row 4 (portrait is 122px
+in a 153px row). Survivable, measured, and needs more than one board to calibrate a fix.
+
+---
+
 ## v1.1.4 — 18 August 2026
 
 Closes a scoping bug in the permanent-leaver scoreboard discard: it nulled the board but not

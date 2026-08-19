@@ -54,14 +54,33 @@ const PROBE_X = 1800
 const BLUE_Y = [550, 700, 850]
 /** Enemy rows — inside the red block (block spans ~1312-2060). */
 const RED_Y = [1450, 1600, 1750]
-/** The VS gap.
+/** The VS gap — PER FORMAT as of v1.1.5.
  *
- *  ⚠️ These were 1180/1220/1260 in the first draft and 9 of 27 boards failed:
- *  the ally block runs as low as y=1184 on tall 6v6 boards, so y=1180 was
- *  still inside it. The guaranteed gap across all 27 measured boards is
- *  1184-1312. These three sit inside that with margin. Do not move them
- *  without re-measuring the widest ally block in the corpus. */
-const GAP_Y = [1200, 1240, 1290]
+ *  ⚠️ The 6v6 row is UNCHANGED and must stay that way. It was 1180/1220/1260 in
+ *  the first draft and 9 of 27 boards failed: the ally block runs as low as
+ *  y=1184 on tall 6v6 boards, so y=1180 was still inside it. 1200/1240/1290 is
+ *  the value that fixed those nine. Do not touch it while fixing 5v5.
+ *
+ *  ── WHY 5v5 NEEDED ITS OWN ROW ──
+ *  One shared row had to be dark on both formats at once, and that intersection
+ *  has now closed. Test_1 (19 Aug, 5v5) measures ally blue 478-1214, VS gap
+ *  1215-1400, enemy red 1401-2036 — so y=1200 is INSIDE its ally block, the
+ *  probe scored 2/3 against a 3/3 rule, the photo was rejected as "not a
+ *  scoreboard", and the standouts step fell back to the bare numeric grid with
+ *  no crops. That is the "it couldn't read the scoreboard" report.
+ *
+ *  detectScoreboardCrops() already receives the format, so the two boards can
+ *  simply be probed in their own places instead of in one shrinking overlap.
+ *
+ *  5v5 values: measured gap on Test_1 is 1215-1400. The 27-board corpus puts
+ *  the earliest gap END at 1312, so the defensible intersection is 1215-1312
+ *  and these three sit inside it with 25px of margin at each end.
+ *  ⚠️ ONE 5v5 board has been measured at the new ally height. Re-measure
+ *  against a pre-19-Aug 5v5 board before treating this row as settled. */
+const GAP_Y: Record<'5v5' | '6v6', number[]> = {
+  '5v5': [1240, 1275, 1310],
+  '6v6': [1200, 1240, 1290],
+}
 
 /** Minimum width of the team-coloured band on an ally row. Measured 1484-1699
  *  across 27 boards. A summary or breakdown page has no such band, which is
@@ -71,7 +90,11 @@ const MIN_TABLE_SPAN = 1200
 /** Quadrant crops as fractions of the frame, per format. Measured on 25
  *  boards; padded so the table can drift inside them without clipping a row. */
 const CROPS = {
-  '5v5': { x0: 0.272, x1: 0.728, ally: [0.215, 0.545], enemy: [0.614, 0.968] },
+  // (v1.1.5) 5v5 ally lower bound 0.545 -> 0.567. 0.545 is y=1177 and Test_1's
+  // ally block now runs to y=1214, so the crop sliced 38px off your own row —
+  // the last one, and the one the standouts question is most often about.
+  // 0.567 is y=1225, clearing it by 11px. 6v6 untouched.
+  '5v5': { x0: 0.272, x1: 0.728, ally: [0.215, 0.567], enemy: [0.614, 0.968] },
   '6v6': { x0: 0.301, x1: 0.698, ally: [0.212, 0.541], enemy: [0.600, 0.970] },
 } as const
 
@@ -101,7 +124,9 @@ function px(data: ImageData, x: number, y: number): [number, number, number] {
 }
 
 /** Does this image look like a scoreboard? Nine probes plus a width check. */
-function looksLikeScoreboard(data: ImageData, debug: string[], label: string): boolean {
+function looksLikeScoreboard(
+  data: ImageData, debug: string[], label: string, format: '5v5' | '6v6',
+): boolean {
   const w = data.width
   const h = data.height
   const sx = Math.round((PROBE_X * w) / REF_W)
@@ -110,7 +135,7 @@ function looksLikeScoreboard(data: ImageData, debug: string[], label: string): b
 
   const blue = BLUE_Y.filter(y => isBlue(...px(data, sx, sy(y)))).length
   const red = RED_Y.filter(y => isRed(...px(data, sx, sy(y)))).length
-  const gap = GAP_Y.filter(y => isDark(...px(data, sx, sy(y)))).length
+  const gap = GAP_Y[format].filter(y => isDark(...px(data, sx, sy(y)))).length
 
   // All nine. A weaker rule (2 of 3) would pass every board too, but the whole
   // value here is REJECTING the summary and breakdown pages, and there is no
@@ -212,7 +237,7 @@ export async function detectScoreboardCrops(
       continue
     }
 
-    if (!looksLikeScoreboard(data, debug, `photo ${i + 1}`)) continue
+    if (!looksLikeScoreboard(data, debug, `photo ${i + 1}`, format)) continue
 
     const c = CROPS[format]
     const ally = cropToDataUrl(img, c.x0, c.x1, c.ally[0], c.ally[1])

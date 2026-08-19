@@ -190,12 +190,17 @@ const BREAKDOWN_KEYWORDS = ['PERCENT PLAYED', 'PLAY TIME']
  * Tries pixel-based scoreboard detection first (fast, no OCR).
  * Falls through to OCR keyword matching for summary/breakdown.
  */
-async function classifyImage(img: HTMLImageElement): Promise<{
+async function classifyImage(
+  img: HTMLImageElement,
+  formatHint?: '5v5' | '6v6' | null,
+): Promise<{
   pageType: PageType
   scoreboardDetection: ScoreboardDetectionResult | null
 }> {
   // Step 1 (fast, no OCR): pixel-based scoreboard detection.
-  const sbDetection = await detectScoreboard(img)
+  // (v1.1.5) formatHint is the wizard's answer. When present detectScoreboard
+  // uses it instead of measuring the VS gap — see its header for why.
+  const sbDetection = await detectScoreboard(img, formatHint)
   if (sbDetection.imageType === 'scoreboard') {
     console.log('Page classification: scoreboard (pixel detection)')
     return { pageType: 'scoreboard', scoreboardDetection: sbDetection }
@@ -543,11 +548,20 @@ async function assignBreakdownsToHeroes(
 // MAIN PIPELINE
 // ============================================================
 
+/**
+ * @param formatHint (v1.1.5) the 5v5/6v6 the user picked in step one of the
+ *   upload wizard, i.e. `batch.metadata.match_format`. When supplied it becomes
+ *   the match format outright and the VS-gap derivation never runs. OMIT IT
+ *   ONLY where there is genuinely no user answer to pass — `/testing` uploads
+ *   bare files and therefore still exercises the derived path, which is what a
+ *   detection harness should do. `/process` must always pass it.
+ */
 export async function processMatchPhotos(
   photoUrls: string[],
   onStatus: (status: ProcessingStatus) => void,
   roleFilter?: RoleType,
   gamertag?: string,
+  formatHint?: '5v5' | '6v6' | null,
 ): Promise<ProcessedMatch> {
   const startTime = Date.now()
 
@@ -610,7 +624,7 @@ export async function processMatchPhotos(
 
   for (let i = 0; i < images.length; i++) {
     onStatus({ stage: 'classifying_pages', progress: 28 + ((i / images.length) * 10) })
-    const { pageType, scoreboardDetection: sbDet } = await classifyImage(images[i])
+    const { pageType, scoreboardDetection: sbDet } = await classifyImage(images[i], formatHint)
     console.log(`Image ${i + 1}: classified as "${pageType}"`)
 
     if (pageType === 'scoreboard' && !scoreboardImage) {
