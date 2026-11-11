@@ -126,6 +126,8 @@ export const STAT_NORMALISE: Record<string, string> = {
   "GUARDIAN WAVE KILLS": "GUARDIAN WAVE KILLS",
   "HAMMER KILL": "HAMMER KILLS",
   "HAMMER KILLS": "HAMMER KILLS",
+  "HEALTH PACK HACKED": "HEALTH PACKS HACKED",
+  "HEALTH PACKS HACKED": "HEALTH PACKS HACKED",
   "HELIX ROCKET KILL": "HELIX ROCKET KILLS",
   "HELIX ROCKET KILLS": "HELIX ROCKET KILLS",
   "HIGH ENERGY KILL": "HIGH ENERGY KILLS",
@@ -222,6 +224,9 @@ export const STAT_NORMALISE: Record<string, string> = {
   "SOUND BARRIERS PROVIDED": "SOUND BARRIERS PROVIDED",
   "STICKY BOMB KILL": "STICKY BOMB KILLS",
   "STICKY BOMB KILLS": "STICKY BOMB KILLS",
+  // In game it reads "STICKY BOMBS KILL(S)" (plural bombs) — fold to the same canonical.
+  "STICKY BOMBS KILL": "STICKY BOMB KILLS",
+  "STICKY BOMBS KILLS": "STICKY BOMB KILLS",
   "STORM ARROW KILL": "STORM ARROW KILLS",
   "STORM ARROW KILLS": "STORM ARROW KILLS",
   "SUNDERING BLADE KILL": "SUNDERING BLADE KILLS",
@@ -276,6 +281,7 @@ const PERCENT_STATS = new Set<string>([
   "ALLY COALESCENCE EFFICIENCY",
   "AVERAGE AURA",
   "AVERAGE ENERGY",
+  "AVERAGE TRASH COMPACTED",
   "BONUS ULT CHARGE GAINED",
   "CHAIN HOOK ACCURACY",
   "CHARGED SHOT ACCURACY",
@@ -445,6 +451,13 @@ export const HERO_BREAKDOWN_ORDER: Record<string, BreakdownStat[]> = {
     { label: "Seismic Slam Kills", canonical: "SEISMIC SLAM KILLS", fmt: "number", hasPer10: true },
     { label: "Overhealth Created", canonical: "OVERHEALTH CREATED", fmt: "number", hasPer10: true },
     { label: "Meteor Strike Kills", canonical: "METEOR STRIKE KILLS", fmt: "number", hasPer10: true },
+  ],
+  "Doctrine": [
+    { label: "Weapon Accuracy", canonical: "WEAPON ACCURACY", fmt: "percent", hasPer10: true },
+    { label: "Infused Scepter Damage", canonical: "INFUSED SCEPTER DAMAGE", fmt: "number", hasPer10: true },
+    { label: "Infused Scepter Healing", canonical: "INFUSED SCEPTER HEALING", fmt: "number", hasPer10: true },
+    { label: "Deliverance Overhealth Granted", canonical: "DELIVERANCE OVERHEALTH GRANTED", fmt: "number", hasPer10: true },
+    { label: "Deliverance Health Capped", canonical: "DELIVERANCE HEALTH CAPPED", fmt: "number", hasPer10: true },
   ],
   "Echo": [
     { label: "Weapon Accuracy", canonical: "WEAPON ACCURACY", fmt: "percent", hasPer10: true },
@@ -638,6 +651,9 @@ export const HERO_BREAKDOWN_ORDER: Record<string, BreakdownStat[]> = {
     { label: "Chain Hook Accuracy", canonical: "CHAIN HOOK ACCURACY", fmt: "percent", hasPer10: false },
     { label: "Chain Hook Kills", canonical: "CHAIN HOOK KILLS", fmt: "number", hasPer10: true },
     { label: "Self Healing", canonical: "SELF HEALING", fmt: "number", hasPer10: true },
+    { label: "Average Trash Compacted", canonical: "AVERAGE TRASH COMPACTED", fmt: "percent", hasPer10: false },
+    { label: "Ultimates Negated", canonical: "ULTIMATES NEGATED", fmt: "number", hasPer10: true },
+    // Retired in the Season 5 rework (Oct 2026) — kept so earlier matches still show it.
     { label: "Whole Hog Kills", canonical: "WHOLE HOG KILLS", fmt: "number", hasPer10: true },
   ],
   "Shion": [
@@ -681,11 +697,18 @@ export const HERO_BREAKDOWN_ORDER: Record<string, BreakdownStat[]> = {
   ],
   "Sombra": [
     { label: "Weapon Accuracy", canonical: "WEAPON ACCURACY", fmt: "percent", hasPer10: true },
+    { label: "Critical Hit Accuracy", canonical: "CRITICAL HIT ACCURACY", fmt: "percent", hasPer10: false },
+    { label: "Cyberspace Damage", canonical: "CYBERSPACE DAMAGE", fmt: "number", hasPer10: true },
+    { label: "Hotfix Healing", canonical: "HOTFIX HEALING", fmt: "number", hasPer10: true },
+    { label: "Cyberspace Healing", canonical: "CYBERSPACE HEALING", fmt: "number", hasPer10: true },
+    { label: "Health Packs Hacked", canonical: "HEALTH PACKS HACKED", fmt: "number", hasPer10: true },
+    { label: "EMP Kills", canonical: "EMP KILLS", fmt: "number", hasPer10: true },
+    // Retired when Sombra moved to support (Season 5, Oct 2026) — kept so her
+    // DPS-era matches still show them.
     { label: "Enemies Hacked", canonical: "ENEMIES HACKED", fmt: "number", hasPer10: true },
     { label: "Virus Accuracy", canonical: "VIRUS ACCURACY", fmt: "percent", hasPer10: true },
     { label: "Virus Kills", canonical: "VIRUS KILLS", fmt: "number", hasPer10: true },
     { label: "Low Health Teleports", canonical: "LOW HEALTH TELEPORTS", fmt: "number", hasPer10: true },
-    { label: "EMP Kills", canonical: "EMP KILLS", fmt: "number", hasPer10: true },
   ],
   "Symmetra": [
     { label: "Primary Fire Accuracy", canonical: "PRIMARY FIRE ACCURACY", fmt: "percent", hasPer10: true },

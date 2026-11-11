@@ -177,6 +177,58 @@ export function passesFilters(
 }
 
 // ====================================================================
+// ROLE ERAS  (v1.2.0)
+// ====================================================================
+// A hero's role can change between seasons — Sombra was DPS until Season 5
+// and support from it. Facing one is not facing the other, so Matchups keeps
+// the eras apart: a row from an earlier role is RENAMED to an era label
+// ("Sombra (DPS era)") before any aggregation. Everything downstream keys by
+// hero name, so the singles, combinations, standouts and suggestions all
+// separate the eras with no further change; suggestions iterate the current
+// roster, so they only ever draw on the current era.
+//
+// Roles are also re-derived here, per match date, rather than trusted from the
+// views: hero_role_ref only becomes date-aware when the Season 5 SQL is run,
+// and this keeps the page right on either side of that.
+//
+// ⚠️ NOT re-derived: matchup_team_sets' roles_present / n_tank / n_dps /
+// n_support. Those are counted in SQL and follow hero_role_ref.
+//
+// The lookups are injected (from @/data/reference) so this file stays free of
+// imports, per the header.
+export function applyRoleEras(
+  pairs: PairRow[],
+  teamSets: TeamSetRow[],
+  standouts: StandoutRow[],
+  roleAt: (hero: string, playedAt: string | null) => Role | undefined,
+  eraName: (hero: string, playedAt: string | null) => string,
+): { pairs: PairRow[]; teamSets: TeamSetRow[]; standouts: StandoutRow[] } {
+  const playedAtByMatch = new Map<number, string | null>()
+  for (const r of pairs) playedAtByMatch.set(r.match_id, r.played_at)
+  for (const r of teamSets) if (!playedAtByMatch.has(r.match_id)) playedAtByMatch.set(r.match_id, r.played_at)
+
+  return {
+    pairs: pairs.map(r => ({
+      ...r,
+      anchor_role: roleAt(r.anchor_hero, r.played_at) ?? r.anchor_role,
+      other_role: roleAt(r.other_hero, r.played_at) ?? r.other_role,
+      anchor_hero: eraName(r.anchor_hero, r.played_at),
+      other_hero: eraName(r.other_hero, r.played_at),
+    })),
+    teamSets: teamSets.map(r => ({
+      ...r,
+      anchor_role: roleAt(r.anchor_hero, r.played_at) ?? r.anchor_role,
+      anchor_hero: eraName(r.anchor_hero, r.played_at),
+      hero_set: r.hero_set.map(h => eraName(h, r.played_at)).sort(),
+    })),
+    standouts: standouts.map(s => s.hero_name == null ? s : {
+      ...s,
+      hero_name: eraName(s.hero_name, playedAtByMatch.get(s.match_id) ?? null),
+    }),
+  }
+}
+
+// ====================================================================
 // SINGLE-HERO AGGREGATION  (the four ranked lists)
 // ====================================================================
 // Given pair rows already filtered to ONE anchor hero (or null = the

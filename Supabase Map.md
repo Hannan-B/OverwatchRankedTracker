@@ -337,7 +337,19 @@ the `_with_alpha` twin **keeps** them (localhost only).
 
 ## ⭐ The two hardcoded views (update for new content)
 
-### ⭐ `hero_role_ref` — HARDCODED 53-hero → role list
+### ⭐ `hero_role_history` — HARDCODED hero → role over time  *(new in v1.2.0, Season 5 SQL)*
+`hero_name`, `role`, `valid_from`, `valid_to` — `[from, to)` on the UTC calendar date of
+`matches.played_at`, `NULL` = open-ended. One row per hero per role it has held; Sombra has
+two (`dps` until 2026-10-06, `support` from it). Mirrors `HEROES[].previously` in
+`src/data/reference.ts`. **`matchup_rows` and `matchup_user` join THIS view, by game date**
+(was `hero_role_ref`). A new hero goes in both role views — the `/testing` panel's
+"COPY hero role SQL" regenerates them together.
+
+### ⭐ `hero_role_ref` — HARDCODED hero → CURRENT role list  *(54 heroes after the Season 5 SQL)*
+> **(v1.2.0)** Still one row per hero, current roles only (Sombra = support). After
+> the Season 5 SQL nothing in the matchup chain reads it; it is kept, one-row-per-hero, so any
+> other consumer can never double-count a hero that changed role.
+
 A standalone lookup built from an inlined `VALUES` table:
 `('D.Va','tank'), ('Doomfist','tank'), … ('D.Mon','tank')` — all 53 heroes.
 Columns: `hero_name`, `role`. New entries are APPENDED to the end of the `VALUES` list

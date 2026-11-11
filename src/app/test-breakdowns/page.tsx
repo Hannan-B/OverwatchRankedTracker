@@ -20,6 +20,7 @@ const FILENAME_TO_HERO: Record<string, string> = {
   'D_Va': 'D.Va',
   'D.Va': 'D.Va',
   'DVa': 'D.Va',
+  'Doctrine': 'Doctrine',
   'Domina': 'Domina',
   'Doomfist': 'Doomfist',
   'Echo': 'Echo',

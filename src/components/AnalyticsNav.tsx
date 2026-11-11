@@ -15,6 +15,13 @@ import { usePathname } from 'next/navigation'
 //   2. Hero analysis  — Heroes · Hero Pairings · Hero Matchups
 //   3. Build your own — Builder (the generic laboratory, alone, shown last)
 // The flat sub-nav (ANALYTICS_TABS) is derived by flattening the groups.
+//
+// RETIRED surfaces (v1.2.0): Feel and Builder. The per-match questions they are
+// built on were sunset with bulk session upload (Season 5), so from then on
+// no new matches carry answers. They are kept, NOT deleted, and still work for
+// past seasons. They are just set apart: a dimmer shade, at the right-hand end
+// of the sub-nav, and in their own "Retired" section at the end of the menu.
+// Retiring a surface = `retired: true` on its tab; nothing else to change.
 // ============================================================
 
 export interface AnalyticsTab {
@@ -22,6 +29,8 @@ export interface AnalyticsTab {
   label: string
   blurb?: string          // shown on the overview cards + Home block
   kind?: 'curated' | 'builder'
+  /** Sunset: kept and working for past data, but no longer fed new data. */
+  retired?: boolean
 }
 
 export interface AnalyticsGroup {
@@ -46,7 +55,7 @@ export const ANALYTICS_GROUPS: AnalyticsGroup[] = [
     label: 'Match analysis',
     tabs: [
       { href: '/analytics/outcomes', label: 'Outcomes', kind: 'curated', blurb: 'Win rate by mode, map, and role, with 5v5 vs 6v6 and your result mix.' },
-      { href: '/analytics/feel', label: 'Feel', kind: 'curated', blurb: 'How fun, matchup feel, and your own performance ratings line up against your results.' },
+      { href: '/analytics/feel', label: 'Feel', kind: 'curated', retired: true, blurb: 'How fun, matchup feel, and your own performance ratings line up against your results.' },
       { href: '/analytics/time', label: 'Time', kind: 'curated', blurb: 'Streaks, sessions, time-of-day, and game-length patterns.' },
       { href: '/analytics/combat', label: 'Combat', kind: 'curated', blurb: 'Damage/healing share, E/A/D trends, and how stats differ in wins vs losses.' },
     ],
@@ -63,7 +72,7 @@ export const ANALYTICS_GROUPS: AnalyticsGroup[] = [
   {
     label: 'Build your own',
     tabs: [
-      { href: '/analytics/builder', label: 'Builder', kind: 'builder', blurb: 'Build any chart yourself \u2014 pick a variable, a measure, and a chart type.' },
+      { href: '/analytics/builder', label: 'Builder', kind: 'builder', retired: true, blurb: 'Build any chart yourself \u2014 pick a variable, a measure, and a chart type.' },
     ],
   },
 ]
@@ -71,6 +80,16 @@ export const ANALYTICS_GROUPS: AnalyticsGroup[] = [
 // Flat tab list (sub-nav order = group order, flattened). Derived, so it stays
 // in lockstep with the groups above.
 export const ANALYTICS_TABS: AnalyticsTab[] = ANALYTICS_GROUPS.flatMap(g => g.tabs)
+
+/** Live surfaces only, grouped (groups left empty by retirement are dropped). */
+const LIVE_GROUPS: AnalyticsGroup[] = ANALYTICS_GROUPS
+  .map(g => ({ ...g, tabs: g.tabs.filter(t => !t.retired) }))
+  .filter(g => g.tabs.length > 0)
+
+/** Retired surfaces, in their original order. */
+export const RETIRED_TABS: AnalyticsTab[] = ANALYTICS_TABS.filter(t => t.retired)
+
+const RETIRED_NOTE = 'Kept for your past seasons. These were built on the per-match questions, which were retired with bulk upload in Season 5, so they get no new data.'
 
 
 export function AnalyticsNav() {
@@ -86,7 +105,7 @@ export function AnalyticsNav() {
         }`}>
         Overview
       </Link>
-      {ANALYTICS_TABS.map(t => {
+      {ANALYTICS_TABS.filter(t => !t.retired).map(t => {
         const active = pathname === t.href || pathname.startsWith(t.href + '/')
         return (
           <Link
@@ -101,6 +120,26 @@ export function AnalyticsNav() {
           </Link>
         )
       })}
+      {/* Retired surfaces: pushed to the right-hand end, one shade dimmer. */}
+      {RETIRED_TABS.length > 0 && (
+        <div className="ml-auto flex flex-wrap gap-1" title={RETIRED_NOTE}>
+          {RETIRED_TABS.map(t => {
+            const active = pathname === t.href || pathname.startsWith(t.href + '/')
+            return (
+              <Link
+                key={t.href}
+                href={t.href}
+                className={`px-3 py-2 text-xs font-display tracking-wider uppercase rounded-t-md transition-colors ${
+                  active
+                    ? 'text-ow-muted border-b-2 border-ow-faint'
+                    : 'text-ow-faint hover:text-ow-muted'
+                }`}>
+                {t.label}
+              </Link>
+            )
+          })}
+        </div>
+      )}
     </nav>
   )
 }
@@ -130,7 +169,7 @@ export function AnalyticsHeader({
 export function AnalyticsMenu({ compact = false }: { compact?: boolean }) {
   return (
     <div className={compact ? 'space-y-5' : 'space-y-7'}>
-      {ANALYTICS_GROUPS.map(group => (
+      {LIVE_GROUPS.map(group => (
         <div key={group.label} className="space-y-2">
           <div className="flex items-center gap-2">
             <div className="h-1 w-8 bg-ow-orange rounded-full" />
@@ -156,6 +195,30 @@ export function AnalyticsMenu({ compact = false }: { compact?: boolean }) {
           </div>
         </div>
       ))}
+
+      {RETIRED_TABS.length > 0 && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <div className="h-1 w-8 bg-ow-line rounded-full" />
+            <h3 className="font-display tracking-[0.15em] text-ow-faint uppercase text-xs">Retired</h3>
+          </div>
+          <p className="text-xs text-ow-faint">{RETIRED_NOTE}</p>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 items-start">
+            {RETIRED_TABS.map(item => (
+              <Link
+                key={item.href}
+                href={item.href}
+                className="block bg-ow-dark rounded-lg p-4 border border-ow-line
+                           hover:border-ow-faint transition-colors">
+                <span className={`font-display font-bold text-ow-muted tracking-wider uppercase ${compact ? 'text-base' : 'text-lg'}`}>
+                  {item.label}
+                </span>
+                {item.blurb && <p className="text-sm text-ow-faint mt-1.5">{item.blurb}</p>}
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -15,9 +15,12 @@
 // as long as their file follows the same convention.
 // ============================================================
 
+import { baseHeroName } from '@/data/reference'
+
 /** Convert a hero display name to its portrait URL under /heroes/. */
 export function heroPortrait(heroName: string): string {
-  const cleaned = heroName
+  // (v1.2.0) An era label ("Sombra (DPS era)", Matchups) uses the hero's portrait.
+  const cleaned = baseHeroName(heroName)
     .normalize('NFD')                 // split accented chars into base + accent
     .replace(/[\u0300-\u036f]/g, '')  // drop the accent marks (Lúcio -> Lucio)
     .replace(/:/g, '')                // drop colons (Soldier: 76 -> Soldier 76)

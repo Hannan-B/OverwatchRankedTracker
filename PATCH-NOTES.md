@@ -1,11 +1,400 @@
-# Patch Notes — Overwatch Ranked Tracker
+# Patch Notes (Detailed) — Overwatch Ranked Tracker
 
-> **What this is.** The single, permanent home for every patch's notes. Newest patch on top.
+> **What this is.** The detailed, permanent record of every patch. Newest patch on top.
 > Each patch has a summary table and one entry per change (symptom → root cause → fix → files →
 > DB impact). Append the next patch as a new `## vX.Y.Z` section above the current one.
 >
+> **Two versions.** This is the detailed one. The short, plain-English bullet list of every
+> patch (added / changed / fixed / retired) is [PATCH-NOTES-SIMPLE.md](PATCH-NOTES-SIMPLE.md).
+> Every patch gets an entry in BOTH, written at the same time.
+>
 > **Convention.** "DB change? No" means no table/view/column/RLS/SQL was touched — the fix is
 > client/logic only. Note it explicitly for every change so deploys never guess.
+
+---
+
+## v1.2.0 — 11 November 2026
+
+Season 5: Doctrine, Grímsvötn, the Roadhog and Sombra kit changes, **Sombra's move from DPS
+to support** (the first hero ever to change role), hero pages that cope with a kit or role
+changing between seasons, HDR support, and **bulk session upload** — a whole play session's
+screenshots uploaded at once in any order and grouped into matches by the app (§8), added
+ALONGSIDE the per-match upload, which is unchanged (sunset, not deleted).
+The user now plays with HDR on, which brightens the whole screenshot by ~25–30%: three
+fixed cut-offs that had been calibrated on SDR sat close enough to the line that HDR crossed
+them. **Validated in `/testing`** on 5 matches captured twice, HDR off and on (10 runs): every
+HDR run now returns the same heroes, roles and breakdown values as its SDR twin, and after
+§5 every board reads 1-2-2 with Sombra as support.
+**DB change? Yes — the Season 5 SQL, one transaction, run in the Supabase SQL editor** (§7, §7b — both
+run and confirmed 7 Oct 2026), plus the Echo fold (§9b — run and confirmed). None for the HDR fixes or bulk upload.
+
+| # | Area | Symptom | Fix | DB change? |
+|---|------|---------|-----|-----------|
+| 1 | Extraction | HDR scoreboards: table edge found 11–23px right → icon window and portrait crops shifted, DPS read as tank, wrong heroes (Cassidy → Mauga) | Table-edge scan accepts the bright HDR cyan | No |
+| 2 | Extraction | HDR: ally icon strip counted as "bright", icon bounds blew out; DPS third bar clipped by the window | Icon pixels tested as white (min channel); scan no longer capped by the window | No |
+| 3 | Breakdown OCR | HDR: "41%" read as `410%`, "72%" as `72070`; hero tile "87%" read as `8%` (since the beta) | `%` pieces found by SHAPE (short circles, thin slash) instead of area | No |
+| 4 | Content | Doctrine (hero 54), Grímsvötn, Roadhog/Sombra kit changes | Reference lists, portrait, stat lists, catalog | Yes (§7) |
+| 5 | Roles | Sombra is support from Season 5 but DPS before it; every role lookup assumed one role forever | Role history in `HEROES` + `heroRoleAt(hero, playedAt)` used wherever a role is tied to a game | Yes (§7) |
+| 6 | Hero pages | A rework mixed old and new kits with no way to tell; hero page had no season filter | Season filter (current season default), Current kit / Retired split, per-stat game counts, role tiles per role held | No |
+| 7 | Database | Matchups would rewrite Sombra's past as support | `hero_role_history` (dated) joined by game date; `hero_role_ref` kept one-row-per-hero | **Yes** |
+| 8 | Upload / process | Logging one match at a time is tedious; a session's screenshots arrive in any order | Bulk session upload: read → group → preview → auto-save clean matches, hold the rest for review | No (storage only) |
+| 9 | Bulk upload test | 40 real games: a career-best tile broke a stat label; 4th/5th heroes dropped; Echo stat unfolded; Genji singular | Elimination for unlabelled tiles; sidebar heroes passed to the pipeline; folds added | Yes (§9b) |
+| 9c | Analytics nav | Feel and Builder get no new data once questions are retired | Marked retired: dimmer, right-hand end of the nav, own section in the menu | No |
+
+---
+
+### 1. ⭐ HDR moved the scoreboard 11–23px to the right
+
+**Symptom.** On HDR scoreboards, DPS rows came back as tank and the role filter then forced
+wrong heroes: the user's Cassidy saved as Mauga, an enemy Cassidy as D.Va, comps `2-2-1`.
+
+**Root cause.** `detectTableEdges()` takes the table's left edge as the first pixel passing
+`isBlue() || isRed()`. The true left edge is the ally role-icon strip, which is
+`(1,186,250)` in SDR and `(83,232,255)` in HDR. `isBlue` requires `r < 40`, so under HDR the
+strip fails and the scan anchors on whatever blue pixel comes next: tableLeft 1093 and 1081
+on the two worst boards, against a baseline of 1070. Every x-constant shifts with tableLeft
+(icon window, portrait crops, gamertag crops), so one bad edge spoils the whole board.
+
+**Fix.** `isTableBlue()` = `isBlue() || (g > 200 && b > 200 && b − r > 120)`, used by the
+edge scan only. SDR answers are unchanged: the SDR strip already passes `isBlue`, and the
+SDR anti-alias edge `(44,169,223)` fails `g > 200`. The HDR page background (~`95,88,196`)
+fails it too. Only ally rows are scanned, so red needs no equivalent.
+
+**Files.** `src/lib/scoreboard-extractor.ts`. **DB change? No.**
+
+### 2. Role icons: an HDR failure, and a 1–2px edge case that predates it
+
+**Symptom.** Even with the table edge correct, HDR ally icons misread.
+
+**Root cause (HDR).** Icon pixels were "average brightness > 180". The ally strip averages
+143 in SDR and **188** in HDR, so the whole strip counted as glyph and the icon's top/bottom
+blew out to the ±30px search limits.
+
+**Root cause (latent, SDR too).** `classifyRoleIcon()` scanned `left .. min(left+34,
+right+1)`, and `right` is capped by the 5v5 window end at x=1109. The DPS glyph's third bar
+starts at ~1108, so the three-bar test was seeing it by 1–2px. The file's own comment said
+the scan was not capped by the window; it was.
+
+**Fix.** `isIconWhite()`: the minimum of r/g/b must clear the threshold (180 for bounds, 200
+for classification). The white glyph is ≥ 200 on all three channels; cyan and red each keep
+one channel low in both modes. The classification scan is now genuinely `left .. left+34`.
+Pre-fix, on the 5 HDR boards: 0/5 correct. Post-fix: 5/5, SDR unchanged at 5/5.
+
+**Files.** `src/lib/scoreboard-extractor.ts`. **DB change? No.**
+
+### 3. HDR glow turned the `%` sign into a digit
+
+**Symptom.** HDR breakdowns stored percentages like `410%`, `480%`, `72070`, `100070`.
+
+**Root cause.** `smartSegment()` Pass 2 rebuilds `%` from its pieces, each under 400 px.
+Measured in SDR: circles 383–388, slash 371–374 (~15px of margin). HDR glow grows them
+to 401–408 and 389, so one circle fails, drops to Pass 3 as a digit, and reads as `0`.
+
+**First fix, superseded.** The ceiling was raised 400 → 460 (the stat-tile "1" measures
+512–523). Testing bulk upload then showed the hero-info tile — % played on the Personal page
+and the Summary slots — uses a SMALLER font, where real digits sit under both ceilings: "7"
+346 px (so "87%" had read as `8%` since the beta, under 400) and "3" 438 px (so 460 turned
+"13%" into `1%`). No area threshold fits both fonts.
+
+**Fix.** `%` pieces are identified by SHAPE relative to the line's tallest character-sized
+blob: a circle is ≤ 0.75 × line height (`PCT_CIRCLE_MAX_H`), the slash fills ≤ 0.3 of its
+bounding box (`PCT_SLASH_MAX_FILL`); every digit is full height and fills ≥ ~0.4. A group
+needs ≥ 2 pieces including a circle. Line height ignores blobs < 8 px wide (a tile-edge bar,
+80 px tall, on Roadhog's R2C3 would otherwise make every character look short).
+Validated on real HDR pixels: stat tiles 48 %, 72 %, 31 %, 12 %, 36 %, 41 %, 2,116, 4,545,
+1,032, 00:29; hero tile 87 %, 13 %, 100 %, 04:48; Summary slots 87 %, 13 % — all segment
+correctly, and the full pipeline returns the same values as before with Cassidy now 87 %.
+
+**Files.** `src/lib/breakdown-ocr.ts`. **DB change? No.**
+
+### 4. Season 5 content
+
+- **Doctrine** (hero 54, support / survivor): `reference.ts`, portrait
+  `public/heroes/Doctrine.png` (128×128 from the supplied art), `HERO_BREAKDOWN_ORDER`,
+  catalog (6 tiles), `/test-breakdowns` map. Identified correctly on every summary,
+  breakdown and scoreboard slot in the test set (SDR and HDR), with no false positives.
+  ⚠️ Its breakdown leaves **R2C3 empty** and continues on row 3; the positional catalog
+  can't express that, so the label-OCR-failed fallback is wrong for its row-3 tiles (noted
+  on the catalog entry; follow-up task raised).
+- **Grímsvötn** (escort, Iceland): `MAPS` + `findMapName` keywords `GRIMSV` / `GRÍMSV`.
+- **Roadhog**: catalog 7 → 8 tiles in the new order. `AVERAGE TRASH COMPACTED` (new, percent)
+  and `ULTIMATES NEGATED` added; `WHOLE HOG KILLS` retired but kept in
+  `HERO_BREAKDOWN_ORDER` for earlier matches.
+- **Sombra**: new 8-tile kit (Cyberspace Damage/Healing, Hotfix Healing, Health Packs Hacked,
+  Critical Hit Accuracy; support tile `PLAYERS SAVED` replaces `FINAL BLOWS`/`SOLO KILLS`);
+  old stats kept for her earlier matches. Catalog entry moved to the support section.
+  Her role change is §5.
+
+**Singular at 1.** `HEALTH PACKS HACKED` (Sombra) and `ULTIMATES NEGATED` (Roadhog, and the
+heroes that already had it) show singular at exactly 1 on screen. Neither noun is the
+trailing KILL(S)-type word nor a leading PLAYER/ENEMY, so the count-grammar rules never
+reached them. `breakdown-ocr.ts` now has `PHRASE_FORMS` (whole-phrase singular/plural pairs,
+applied by `applyCountGrammar`) and matching-only folds `PACKS→PACK`, `ULTIMATES→ULTIMATE`,
+so `HEALTH PACK HACKED` / `ULTIMATE NEGATED` are stored at 1 and fold to the plural in
+`STAT_NORMALISE` and `hero_stats_normalised` (§7b). Every other new name has no plural.
+
+**DB change?** Yes — `hero_role_ref` / `hero_role_history` (§7) and two folds (§7b).
+
+### 5. ⭐ Sombra moved from DPS to support — a hero's role now depends on the date
+
+**Symptom.** Season 5 moved Sombra to support (tactician). Every role lookup in the app was
+a fixed hero → role map: switching it would have rewritten her history (old boards 1-1-3,
+DPS-era games in support pools, the wrong share metric); not switching it saved her support
+games as DPS.
+
+**Fix.** The role belongs to the MATCH.
+- `reference.ts`: `Hero.previously` records earlier roles with the date they ended
+  (Sombra: `dps` / recon until `2026-10-06`). `heroRoleAt(name, playedAt)` returns the role
+  on that date (UTC calendar day of `played_at`, the same day boundary as
+  `get_season_for_date`); `heroRoleEras()` lists them.
+- `/process` re-derives EVERY saved scoreboard row's role, and the team comps, for the
+  match's date — not just audit-corrected rows.
+- `HERO_ROLE_MAP` (scoreboard-extractor) is now built from `HEROES` instead of being a
+  second hand-kept list. Runbook Step 2 retired.
+- Date-aware: Home appearances, Matches hero buckets, Combat 6v6 role filter
+  (`HeroRoleLookup`), Feel (now selects `played_at`), Heroes list (role = most recent game
+  in scope; role tiles for every role held).
+- Matchups keeps the eras apart: `applyRoleEras()` renames rows from an earlier role to
+  `"Sombra (DPS era)"` at load, and re-derives pair roles by date, so the page is right
+  before and after the SQL. Suggestions iterate the current roster → current era only.
+  `heroPortrait()` strips the era label.
+
+**Validated.** `/testing`, all 10 Season 5 runs: both teams 1-2-2 (were 1-3-1), every Sombra
+saved as support, heroes unchanged.
+
+**Files.** `reference.ts`, `scoreboard-extractor.ts`, `process/page.tsx`, `page.tsx`,
+`matches/page.tsx`, `combat/*`, `feel/page.tsx`, `heroes/page.tsx`, `matchups/*`,
+`hero-image.ts`. **DB change?** Yes (§7).
+
+### 6. Hero pages: kits and roles that change between seasons
+
+- **Hero page** (`/analytics/heroes/[name]`): **Season filter** added, defaulting to the
+  current season (it had none — it always averaged a hero's whole history). Role stats get
+  one block per role held in the games in view. The breakdown splits into **Current kit**
+  and **Retired** (`isCurrentKitStat()`: in `HERO_BREAKDOWN_ORDER` but no longer in the
+  catalog — Whole Hog Kills, Sombra's DPS kit, and the five tank ultimates dropped in
+  v1.1.1); retired stats show only when the games in view hold them. Every stat line has a
+  **Games** column, because current and retired stats average over different games. Header
+  shows "Formerly DPS until 6 Oct 2026".
+- **Hero Compare**: per-slot (and shared) **Season** filter, current-season default, so one
+  hero can sit either side of a rework. Role rows follow each column's games; retired
+  stats labelled, and dropped when no slot has a value.
+- **`/testing`**: "COPY hero role SQL" now regenerates both role views.
+
+**Files.** `heroes/[name]/page.tsx`, `hero_compare/page.tsx`, `hero-stat-catalog.ts`,
+`new-content-readiness.ts`, `testing/page.tsx`. **DB change? No.**
+
+### 7. Database — Season 5 SQL (Supabase SQL editor, one transaction)
+
+One transaction (session pinned to UTC); every check must pass or nothing is kept, and it
+ends by returning "all checks passed — changes saved". A read-only query run first saved
+the previous `hero_role_ref` / `matchup_rows` / `matchup_user` definitions as rollback
+statements. The script itself was run from the chat and not kept in the repo.
+1. **`hero_role_history`** (new view): every hero's role over time, `[valid_from, valid_to)`.
+2. **`matchup_rows` / `matchup_user`** join `hero_role_history` on hero AND game date. Edited
+   from their LIVE `pg_get_viewdef` text; the script stops, changing nothing, if any other
+   view reads `hero_role_ref` or the join isn't the expected one.
+3. **`hero_role_ref`**: 54 heroes, current roles (Doctrine added, Sombra support), still one
+   row per hero so no consumer can double-count.
+4. **Data fix**: Season 5 Sombra rows saved with a non-support role → `support`, and those
+   matches' team comps rebuilt.
+5. **Checks**: 54 unique heroes; Sombra/Doctrine support; history covers every hero with no
+   overlapping ranges; `matchup_rows`/`matchup_user` row counts unchanged; no new null
+   `anchor_role`; every dated Sombra row DPS before 2026-10-06 and support from it; no
+   Doctrine row flagged `hero_role_unknown`.
+
+### 7b. Database — singular/plural folds in `hero_stats_normalised`
+
+A second transaction, run after §7. Adds a `WHEN` fold for each singular form not already
+in the LIVE view (built from its own `pg_get_viewdef`, reusing its own left-hand
+expression): `HEALTH PACK HACKED` and `ULTIMATE NEGATED` (new in this patch), and — only if
+missing — `CHAIN HOOK KILL`, `EMP KILL`, `PLAYER SAVED`, `PLAYER PROTECTED`. Stops if the
+view doesn't have exactly one `ELSE`. Checks: every fold present; row count unchanged; no
+row's `stat_canonical` changed except rows whose raw name is one of those singulars.
+**Outcome:** the live view already had `ULTIMATE NEGATED` and the four KILL/PLAYER folds, so
+only `HEALTH PACK HACKED` was added. (The database was again ahead of the code: the app had
+been saving `ULTIMATES NEGATED` as plural even at 1 until this patch.)
+
+> **Run notes.** The first attempt at §7 stopped on a PL/pgSQL name clash — a record
+> variable `b` shadowed the table alias `b` in the overlap check — and, being one
+> transaction, changed nothing. Renamed (`snap`, `h1`/`h2`) and re-run cleanly. Before
+> running, a read-only query saved the previous `hero_role_ref` / `matchup_rows` /
+> `matchup_user` (and, for §7b, `hero_stats_normalised`) definitions as rollback
+> statements. The live definitions matched what the scripts expected.
+
+### 8. ⭐ Bulk session upload — a whole session at once, in any order
+
+**Why.** Logging one match at a time (upload wizard per game) is tedious. The match-history
+screens (Summary / Teams / Personal) use the same layout the pipeline already reads, so a
+whole session can be screenshotted afterwards and uploaded in one go. The PS App → Photos
+path doesn't preserve order, names or dates, so the app has to work out which screenshot
+belongs to which match from what's ON them.
+
+**Decisions (user, 7 Oct 2026).** No per-match questions in bulk mode (columns left NULL;
+earlier answers stay in analytics). Returned leavers and throwers can't be seen on a
+screenshot and are accepted as lost; PERMANENT leavers are detected from the Teams page.
+No per-slot hero review this season — replaced by an automatic 5v5 team-shape check. A
+grouping preview before anything is processed. Unsure digits don't hold a match. The
+per-match upload, its questions and review stay exactly as they were.
+
+**Flow.** `/upload` → "Or upload a whole session" → pick any number of screenshots → one
+storage folder `pending/session-<ts>/` (`metadata.json` `{ kind: 'session', upload_complete,
+photo_count, uploaded_count }`; written first as incomplete, rewritten complete at the end;
+each photo keeps its own number so a retry can't overwrite one that uploaded). `/process`
+lists sessions separately → **Open session**:
+1. **Read** every screenshot once (`session-fingerprint.ts`) — no hero portrait matching:
+   - page type from the ACTIVE NAV TAB (`classifyByTabs`): the active box reads
+     11,000–15,800 bright-blue px, the others ≤ 34. Needs no red enemy block, so a Teams
+     page whose enemy rows all left still classifies.
+   - **Summary:** map, result, score, date/time, length, E/A/D (existing `ocrSummaryPage`), and
+     each filled hero slot's % played + play time — the Summary slots use the SAME tile
+     layout as the Personal page's hero tile (identical offsets from the portrait), so the
+     proven hero-info reader reads both (`readHeroTiles`, `summaryHeroTileOrigin`).
+   - **Personal:** % played + play time, and the left **sidebar**: every hero played that
+     match (OCR of each button with text, matched to `HEROES`), the highlighted one being
+     this page's hero. Measured: buttons x 100–740, first at y 534, every 150 px; the
+     highlighted button ≥ 94 % bright blue, others 0 %; a one-hero match shows an empty
+     second button; the list ends at ALL HEROES.
+   - **Teams:** `measureTeamsPage` — rows per side counted from ROLE ICONS (one white icon per
+     row, team from the row's own colour at x=1800), so any number of rows works, including
+     none; the user's row is the ally row with the brighter E/A/D cell background; its E/A/D
+     read with the existing three-cut-off cell reader.
+2. **Group** (`session-grouper.ts`, pure): Summary anchors a match (date/time); Teams page joins
+   by the user's E/A/D; Personal pages join by % played + play time against Summary slots,
+   then the rest through identical sidebars. Exact agreement or a **leftover** with a reason —
+   never a guess (two matches with the same E/A/D → leftover). Repeats are detected.
+   Format and leavers from row counts: a side with fewer rows than the format had a
+   permanent leaver (the history board drops the row entirely).
+3. **Preview** (`SessionPreview.tsx`): one card per match with thumbnails, format, leaver
+   badge, red "will be held" reasons, amber notes; leftovers and repeats can be placed into a
+   match or ignored (re-runs the grouping with `ManualPlacements`). Matches whose date/time is
+   already saved are skipped (`matchQuery`, so the alpha rule applies).
+4. **Process** each match with the unchanged `processMatchPhotos`, format passed in; a leaver
+   game's Teams page is left out (scoreboard not used, as for any permanent leaver).
+   `applyMatchDateRoles` (now shared with `onAuditComplete`) sets each row's role for the
+   match date. `sessionMatchMetadata` builds what the wizard used to supply (role from the
+   heroes played at the date; leavers; no questions).
+5. **Auto-save gate** (`sessionMatchExceptions`): saved without review unless — grouping issue
+   (no Teams page, format unclear, date/map/result unread), map/result/date unread after
+   processing, no heroes, 5v5 heroes spanning two roles, the user's scoreboard row
+   unresolved, or **5v5 team shape not 1-2-2 on both sides**. Held matches go through the
+   existing review with "Held for checking" reasons shown. On the beta season's 93 matches
+   the 1-2-2 rule would have held 7 of the 10 matches with hero errors (15 of 18 errors).
+6. **Clean-up**: each saved match's screenshots are deleted by `saveMatch` as before. What's
+   left (leftovers, repeats, unsaved) stays for next time unless the user presses
+   "Delete remaining"; an empty session folder is closed automatically.
+
+`/testing` gains a **Session mode (order-free)** checkbox that groups with the same reader and
+grouper and shows held reasons, notes and leftovers — nothing is written.
+
+**Validated.** Grouper: 19 Node tests (shuffled session, 4-hero match placed via sidebar,
+5-v-3 leaver, 6v6 with/without leavers, E/A/D tie → leftover, repeats, hand placement,
+ignore). Reader + grouper on real screenshots (`/testing` session mode): the 5 Season 5
+matches, HDR on, 16 screenshots shuffled and renamed `IMG_9000…` — every screenshot placed
+in the right match, no leftovers; every sidebar hero, % played, play time, user row and E/A/D
+read correctly; the quick-play Gibraltar game held (no date — expected). PROCESS ALL on the
+groups: all recognised, 1-2-2 both sides, breakdown values unchanged.
+Two reader fixes came out of that run: the highlighted sidebar button (white on bright blue)
+didn't OCR — every sidebar label is now recoloured black-on-white first
+(`ocrImageRegion(…, whiteText)`); and the Summary date key stores only the
+`MM/DD/YY - HH:MM` pattern (a Summary with no FINAL SCORE line reads "GAME MODE: …" there,
+which two different matches could share).
+
+**Files.** New: `src/lib/session-fingerprint.ts`, `src/lib/session-grouper.ts`,
+`src/lib/session-match.ts`, `src/app/process/SessionPreview.tsx`. Changed: `upload/page.tsx`
+(session screens + link), `process/page.tsx` (sessions, preview, run loop, held reasons,
+summary; file listing limit 100 → 1000), `testing/page.tsx` (session mode),
+`image-processor.ts` (`classifyByTabs`, `summarySlotsFilled`), `breakdown-ocr.ts`
+(`readHeroTiles`, hero-tile origins), `ocr-extractor.ts` (`ocrImageRegion`),
+`scoreboard-extractor.ts` (`measureTeamsPage`). **DB change? No** — storage only.
+
+### 9. ⭐ The 40-game test — results, and the fixes it produced
+
+The user captured **40 competitive games, HDR on: 10 each as tank, DPS, support and 6v6**
+(150 screenshots). Each set was shuffled, run through `/testing` session mode, then
+PROCESS ALL.
+
+**Grouping — 40/40 matches, nothing misplaced.** Tank 43/43 screenshots placed (including a
+4-hero and a 5-hero game joined via the sidebar); DPS 37/37; support 33 placed + 4 repeats
+caught (a second copy of one match's pages); 6v6 37/37. Leavers detected from row counts:
+5v4 and 4v5 (support), 5v6 and 6v0 (6v6). No leftovers, no format guesses — the 6v6 pitch
+measured 116–121 px against 128–141 px for 5v5, so `SIXV6_MAX_PITCH = 124` holds.
+
+**Processing.** Every non-leaver board read 1-2-2 (2-2-2 in 6v6, plus one real 2-1-3 enemy
+team, confirmed from the icons); Sombra and Doctrine read as support; every breakdown read
+all its stats. The ⚠ marks on some scoreboard heroes are low-confidence flags only — the
+heroes checked were correct.
+
+**Fix 1 — a "NEW CAREER BEST!" tile broke the breakdown label fallback.**
+*Symptom:* 6v6 Midtown, Orisa: `UNKNOWN_TILE_R3C1 = 22` (7/8 stats). *Root cause:* the label
+OCR failed on that tile, and the fallback names a tile by its POSITION in the hero's usual
+order, but the game had moved the career-best tile first, so the positions no longer lined up.
+*Fix:* `ocrBreakdownPage` now resolves label-failed tiles **by elimination**: if exactly one
+expected stat is still unclaimed and its type fits the value (number / % / time), it takes
+that name. *Result:* PLAYERS PROTECTED = 22, 8/8. *File:* `breakdown-ocr.ts`.
+
+**Fix 2 — heroes beyond the top 3 weren't recorded.**
+*Symptom:* tank Shambali (4 heroes) and Midtown (5 heroes): the extra Personal pages were
+grouped correctly, but only 3 heroes were saved (Midtown's % played added up to 89).
+*Root cause:* `processMatchPhotos` only assigns breakdowns to heroes found on the Summary,
+which shows at most 3. *Fix:* new optional `extraHeroes` argument. Bulk mode passes the sidebar's
+names for a 4+-hero match (`sessionExtraHeroes`); those become extra assignment candidates,
+and each one whose breakdown is assigned is added to `heroes`, so it gets a
+`hero_performances` row and its stats. It is only used for 4+ heroes, so a Summary misread
+is never "corrected" by it. *Result:* Shambali 4/4 heroes, Midtown 5/5 (% now sums to 100).
+The per-match upload is unchanged (it doesn't pass the argument).
+*Files:* `image-processor.ts`, `session-match.ts`, `session-grouper.ts` (preview note),
+`process/page.tsx`, `testing/page.tsx`.
+
+**Fix 3 — Echo's "STICKY BOMBS KILLS" was never folded** (pre-existing).
+*Symptom:* both Echo games flagged "new stat name". *Root cause:* the game prints STICKY
+BOMB**S** KILL(S); the fold list only had STICKY BOMB KILL(S), so the stat never matched
+Echo's breakdown display entry (`STICKY BOMB KILLS`). *Fix:* both forms folded in
+`stat-meta.ts`, and the same fold added to `hero_stats_normalised` (§9b).
+
+**Fix 4 — Genji's "ULTIMATE REFLECTED" at 1.** The game says ULTIMATE (singular) at 1, the
+same as Ultimates Negated. The name lists already folded both forms, but the reader always
+saved the plural. *Fix:* added to `PHRASE_FORMS` (`breakdown-ocr.ts`); DB fold added in
+§9b if it was missing.
+
+**Seen, not fixed (low impact).** The "AVG PER 10 MIN" sub-line misread on 3 of Orisa's
+tiles (e.g. "6.11" → "4"). It is saved as raw text (`hero_stats.avg_per_10_min`) and no
+analytics page reads it, since per-10 figures are worked out from value ÷ game length. Its
+only use is the beta-confirmation cross-check, which isn't part of bulk mode.
+
+**Still open:**
+- **Held for "format unclear" / "date not read":** the review screen has no format or date
+  control (`saveMatch` uses the grouper's guess / the process time). This didn't happen in
+  the 40 games.
+- **Gapped breakdown grids** (Doctrine leaves R2C3 empty). The elimination fallback (Fix 1)
+  now covers a single label failure anywhere in the grid. A follow-up task was raised for the
+  positional fallback itself.
+
+### 9b. Database — Echo and Genji folds in `hero_stats_normalised`
+
+Same pattern as §7b, one transaction. It reads the LIVE view definition, then adds
+`STICKY BOMBS KILL(S) → STICKY BOMB KILLS` and (only if missing)
+`ULTIMATE REFLECTED → ULTIMATES REFLECTED` just before its `ELSE`. Checks: row count
+unchanged; only rows with those raw names change; every one of them now folds to the
+canonical name. Anything unexpected → it stops and nothing changes.
+**Outcome (run and confirmed):** all checks passed. The live view already folded
+`ULTIMATE REFLECTED`, so only the Echo fold was added. **7 saved Echo rows** that had been
+stored as `STICKY BOMBS KILL(S)` now count as `STICKY BOMB KILLS`, so they show on Echo's
+hero page for the first time.
+
+**Cleanup.** The in-project test screenshot copies (`Season 5 test/`, `public/_s5test/`,
+`public/_bulktest/`) were deleted along with their `.gitignore` lines. The originals are
+kept outside the repo.
+
+### 9c. Feel and Builder retired (kept, not deleted)
+
+Bulk upload has no questions, so from Season 5 the per-match questions are retired, along
+with the two analytics pages built on them: **Feel** and **Builder**. Both still work for
+past seasons. In the analytics bar along the top they move to the right-hand end, in a
+dimmer shade. On the Analytics overview and Home they move to their own **Retired**
+section at the end, in dimmer cards, with a one-line note on why. To retire another
+page, set `retired: true` on it in `ANALYTICS_GROUPS`.
+*Files:* `components/AnalyticsNav.tsx`, `analytics/page.tsx`. **DB change? No.**
 
 ---
 

@@ -22,13 +22,17 @@
 //   - File cleanup remains the final step of saveMatch — never earlier.
 // ============================================================
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
 import { matchQuery } from '@/lib/alpha'
 import { processMatchPhotos, type ProcessedMatch, type ProcessingStatus } from '@/lib/image-processor'
 import { buildPlayerLabels } from '@/lib/scoreboard-extractor'
-import { getGameModeForMap, needsStartingSide, MAPS, HEROES } from '@/data/reference'
+import { getGameModeForMap, needsStartingSide, MAPS, HEROES, heroRoleAt } from '@/data/reference'
+import { applyMatchDateRoles, sessionMatchMetadata, sessionMatchExceptions, sessionExtraHeroes } from '@/lib/session-match'
+import { fingerprintSession, type Fingerprint } from '@/lib/session-fingerprint'
+import { groupSession, type SessionGrouping, type SessionMatch, type ManualPlacements } from '@/lib/session-grouper'
+import SessionPreview from './SessionPreview'
 import type {
   RoleType, MatchFeel, PerformanceFeel, StartingSide, LeaverType, StandoutKind,
 } from '@/lib/types'
@@ -181,6 +185,24 @@ interface ReviewItem {
   // username confirmation state for THIS match
   userResolved: boolean
   saved: boolean
+  /** (v1.2.0) Bulk session only: why this match was held instead of saved
+   *  automatically. Shown at the top of its review. */
+  heldBecause?: string[]
+}
+
+// (v1.2.0) A bulk session upload: one folder of match-history screenshots in
+// any order, grouped into matches here. Separate from PendingBatch — the
+// per-match path is unchanged.
+interface PendingSession {
+  sessionId: string
+  metadata: {
+    kind: 'session'
+    upload_complete?: boolean
+    uploaded_at: string
+    photo_count: number
+    uploaded_count?: number
+  }
+  photoPaths: string[]
 }
 
 interface ProcessFailure {
@@ -195,6 +217,8 @@ type PageState =
   | 'processing'    // Phase 1 — unattended loop
   | 'review'        // Phase 2 — grouped-by-match review
   | 'done'
+  | 'session_reading'  // (v1.2.0) reading every screenshot of a session
+  | 'session_preview'  // (v1.2.0) grouping preview, before anything is processed
 
 // Per-match review sub-step within Phase 2.
 type ReviewStep = 'user_confirm' | 'user_select' | 'beta' | 'saving' | 'saved'
@@ -217,6 +241,17 @@ const STATUS_MESSAGES: Record<string, string> = {
 export default function ProcessPage() {
   const router = useRouter()
   const [batches, setBatches] = useState<PendingBatch[]>([])
+  // (v1.2.0) Bulk sessions — see PendingSession.
+  const [sessions, setSessions] = useState<PendingSession[]>([])
+  const [activeSession, setActiveSession] = useState<PendingSession | null>(null)
+  const [sessionFps, setSessionFps] = useState<Fingerprint[]>([])
+  const [sessionUrls, setSessionUrls] = useState<Record<string, string>>({})
+  const [sessionManual, setSessionManual] = useState<ManualPlacements>({})
+  /** played_at (ISO) of matches already saved — those groups are skipped. */
+  const [savedPlayedAt, setSavedPlayedAt] = useState<Set<string>>(new Set())
+  const [sessionRead, setSessionRead] = useState({ done: 0, total: 0 })
+  const [sessionStats, setSessionStats] = useState<{ autoSaved: number; held: number; skipped: number; unplaced: number } | null>(null)
+  const [sessionRemaining, setSessionRemaining] = useState<number | null>(null)
   const [pageState, setPageState] = useState<PageState>('scanning')
   const [gamertag, setGamertag] = useState<string>('')
 
@@ -313,18 +348,22 @@ export default function ProcessPage() {
 
       if (!folders || folders.length === 0) {
         setBatches([])
+        setSessions([])
         setPageState('idle')
         return
       }
 
       const pendingBatches: PendingBatch[] = []
+      const pendingSessions: PendingSession[] = []
 
       for (const folder of folders) {
         if (!folder.name || folder.name === '.emptyFolderPlaceholder') continue
 
+        // (v1.2.0) limit raised from the default 100: a bulk session folder can
+        // hold 100–200 screenshots.
         const { data: files } = await supabase.storage
           .from('match-images')
-          .list(`pending/${folder.name}`)
+          .list(`pending/${folder.name}`, { limit: 1000 })
         if (!files) continue
 
         const metadataFile = files.find(f => f.name === 'metadata.json')
@@ -366,6 +405,23 @@ export default function ProcessPage() {
         }
 
         const photoFiles = files.filter(f => f.name !== 'metadata.json')
+
+        // (v1.2.0) Bulk session: kept apart from per-match batches. Photos are
+        // signed later, when the session is opened. A session with no photos
+        // left (all saved) is finished — remove its metadata.
+        if (metadata?.kind === 'session') {
+          if (photoFiles.length === 0) {
+            await supabase.storage.from('match-images').remove([`pending/${folder.name}/metadata.json`])
+            continue
+          }
+          pendingSessions.push({
+            sessionId: folder.name,
+            metadata,
+            photoPaths: photoFiles.map(f => `pending/${folder.name}/${f.name}`).sort(),
+          })
+          continue
+        }
+
         const photoUrls: string[] = []
         const photoPaths: string[] = []
 
@@ -389,6 +445,8 @@ export default function ProcessPage() {
         (a.metadata.uploaded_at || '').localeCompare(b.metadata.uploaded_at || ''))
 
       setBatches(pendingBatches)
+      setSessions(pendingSessions.sort((a, b) =>
+        (a.metadata.uploaded_at || '').localeCompare(b.metadata.uploaded_at || '')))
       setPageState('idle')
     } catch (err) {
       console.error('Scan error:', err)
@@ -793,6 +851,10 @@ export default function ProcessPage() {
     // would leave the result internally inconsistent.
     if (result.scoreboard) {
       const sb = result.scoreboard
+      // (v1.2.0) A hero's role belongs to the MATCH: Sombra is DPS before
+      // Season 5 and support from it. Same fallback saveMatch uses for
+      // played_at when the summary date failed to read.
+      const playedAt = result.matchTimestamp ?? new Date()
       for (const row of audit.rows) {
         if (!row.confirmedHero || row.confirmedHero === row.readHero) continue
         const hero = HEROES.find(h => h.name === row.confirmedHero)
@@ -800,54 +862,29 @@ export default function ProcessPage() {
           console.warn(`[audit] skipped unknown hero "${row.confirmedHero}" at slot ${row.slot}`)
           continue
         }
+        const role = heroRoleAt(hero.name, playedAt) ?? hero.role
         // Role is RE-DERIVED, never carried: a wrong hero drags a wrong role
         // with it, so correcting one without the other relocates the error.
-        for (const st of sb.stats) if (st.slot === row.slot) { st.heroName = hero.name; st.role = hero.role }
+        for (const st of sb.stats) if (st.slot === row.slot) { st.heroName = hero.name; st.role = role }
         for (const h of sb.heroes) if (h.slot === row.slot) { h.heroName = hero.name }
-        for (const r of sb.roles) if (r.slot === row.slot) { r.heroName = hero.name; r.role = hero.role; r.source = 'hero_lookup' }
+        for (const r of sb.roles) if (r.slot === row.slot) { r.heroName = hero.name; r.role = role; r.source = 'hero_lookup' }
         for (const pl of sb.players) if (pl.slot === row.slot) { pl.heroName = hero.name }
         // The match-level role follows the user's row; finalRole in saveMatch
         // reads correctedRole first, so a stale value would contradict the
         // scoreboard we just corrected.
-        if (row.isUser) result.correctedRole = hero.role
-        console.log(`[audit] slot ${row.slot}: ${row.readHero} -> ${hero.name} (${hero.role})`)
+        if (row.isUser) result.correctedRole = role
+        console.log(`[audit] slot ${row.slot}: ${row.readHero} -> ${hero.name} (${role})`)
       }
 
-      // ── (v1.1.3) RECOMPUTE THE TEAM COMPS ─────────────────────
-      // allyComp / enemyComp are built in image-processor.ts from the
-      // PRE-AUDIT roles and are NOT among the four arrays corrected above.
-      // saveMatch writes them verbatim, so every hero the audit fixed left the
-      // comp still describing the wrong hero. Silent, because a comp is a
-      // plausible-looking string either way.
-      //
-      // Rebuilt from the corrected stats rather than patched in place — the
-      // same reason role is re-derived rather than carried.
-      const shape = (team: 'ally' | 'enemy') => {
-        const n = { tank: 0, dps: 0, support: 0 }
-        let known = 0
-        for (const st of sb.stats) {
-          if (st.team !== team || !st.heroName) continue
-          const h = HEROES.find(x => x.name === st.heroName)
-          if (!h) continue
-          n[h.role]++
-          known++
-        }
-        // Only overwrite when every slot on the side resolved. A partial
-        // recount would look like a real comp while quietly under-counting.
-        return known === sb.stats.filter(st => st.team === team).length
-          ? `${n.tank}-${n.dps}-${n.support}`
-          : null
-      }
-      const ally = shape('ally')
-      const enemy = shape('enemy')
-      if (ally && ally !== result.allyComp) {
-        console.log(`[audit] ally comp ${result.allyComp} -> ${ally}`)
-        result.allyComp = ally
-      }
-      if (enemy && enemy !== result.enemyComp) {
-        console.log(`[audit] enemy comp ${result.enemyComp} -> ${enemy}`)
-        result.enemyComp = enemy
-      }
+      // (v1.2.0) Uncorrected rows carry the role extraction gave them — the
+      // hero's CURRENT role. Re-derive every row for this match's date, then
+      // rebuild allyComp / enemyComp from the corrected rows (v1.1.3: the comps
+      // are built pre-audit in image-processor.ts and saveMatch writes them
+      // verbatim). Shared with bulk session auto-save so the two can't drift.
+      const before = `${result.allyComp} v ${result.enemyComp}`
+      applyMatchDateRoles(result)
+      const after = `${result.allyComp} v ${result.enemyComp}`
+      if (after !== before) console.log(`[audit] comps ${before} -> ${after}`)
     }
 
     // ---- 2. logging ----
@@ -957,6 +994,11 @@ export default function ProcessPage() {
 
   function finishReview() {
     setPageState('done')
+    // (v1.2.0) A session's held matches have now been reviewed: report what's
+    // left in its folder (leftovers, repeats) and close it out if nothing is.
+    if (activeSession) {
+      void countSessionRemaining(activeSession.sessionId).then(setSessionRemaining)
+    }
   }
 
   // ── Save (unchanged logic; cleanup remains the LAST step) ──
@@ -1224,7 +1266,190 @@ export default function ProcessPage() {
     await supabase.storage.from('match-images').remove(allPaths)
   }
 
+  // ════════════════════════════════════════════════════════════
+  // BULK SESSION (v1.2.0)
+  // ------------------------------------------------------------
+  // read every screenshot → group → PREVIEW → process each match with the
+  // existing pipeline → save the clean ones automatically → held ones go
+  // through the existing review (Phase 2) with the reason shown. Nothing is
+  // saved before the preview is confirmed. Screenshots are deleted only by
+  // saveMatch (per match, after its insert) or by an explicit delete.
+  // ════════════════════════════════════════════════════════════
+
+  const sessionGrouping: SessionGrouping | null = useMemo(
+    () => (sessionFps.length ? groupSession(sessionFps, sessionManual) : null),
+    [sessionFps, sessionManual],
+  )
+  const sessionFpById = useMemo(() => new Map(sessionFps.map(f => [f.id, f])), [sessionFps])
+  const alreadySavedKeys = useMemo(() => {
+    const out = new Set<string>()
+    for (const m of sessionGrouping?.matches ?? []) {
+      if (m.playedAt && savedPlayedAt.has(new Date(m.playedAt).toISOString())) out.add(m.key)
+    }
+    return out
+  }, [sessionGrouping, savedPlayedAt])
+
+  async function signPaths(paths: string[]): Promise<Record<string, string>> {
+    const out: Record<string, string> = {}
+    for (let i = 0; i < paths.length; i += 100) {
+      const { data } = await supabase.storage
+        .from('match-images')
+        .createSignedUrls(paths.slice(i, i + 100), 3600 * 3)
+      for (const d of data ?? []) if (d.signedUrl && d.path) out[d.path] = d.signedUrl
+    }
+    return out
+  }
+
+  async function openSession(session: PendingSession) {
+    setActiveSession(session)
+    setSessionManual({})
+    setSessionFps([])
+    setSessionStats(null)
+    setSessionRemaining(null)
+    setSessionRead({ done: 0, total: session.photoPaths.length })
+    setPageState('session_reading')
+
+    const urls = await signPaths(session.photoPaths)
+    setSessionUrls(urls)
+    const fps = await fingerprintSession(
+      session.photoPaths.filter(p => urls[p]).map(p => ({ id: p, url: urls[p] })),
+      (done, total) => setSessionRead({ done, total }),
+    )
+
+    // Matches already in the database (same played_at) are skipped, so an
+    // overlapping or repeated upload can never save a match twice. Through
+    // matchQuery so the alpha rule matches the rest of the app.
+    const dates = fps.flatMap(f => (f.kind === 'summary' && f.playedAt ? [f.playedAt] : []))
+    let saved = new Set<string>()
+    if (dates.length > 0) {
+      const { data } = await matchQuery('played_at').in('played_at', dates)
+      const rows = (data as unknown as { played_at: string | null }[] | null) ?? []
+      saved = new Set(rows.flatMap(r => (r.played_at ? [new Date(r.played_at).toISOString()] : [])))
+    }
+    setSavedPlayedAt(saved)
+    setSessionFps(fps)
+    setPageState('session_preview')
+  }
+
+  function placeSessionScreenshot(id: string, target: string | null) {
+    setSessionManual(prev => {
+      const next = { ...prev }
+      if (target) next[id] = target
+      else delete next[id]
+      return next
+    })
+  }
+
+  async function countSessionRemaining(sessionId: string): Promise<number> {
+    const { data } = await supabase.storage.from('match-images').list(`pending/${sessionId}`, { limit: 1000 })
+    const photos = (data ?? []).filter(f => f.name !== 'metadata.json')
+    if (photos.length === 0) {
+      // Every screenshot was saved: the session is finished.
+      await supabase.storage.from('match-images').remove([`pending/${sessionId}/metadata.json`])
+    }
+    return photos.length
+  }
+
+  async function deleteSessionRemainder(sessionId: string) {
+    const { data } = await supabase.storage.from('match-images').list(`pending/${sessionId}`, { limit: 1000 })
+    const paths = (data ?? []).map(f => `pending/${sessionId}/${f.name}`)
+    if (paths.length) await supabase.storage.from('match-images').remove(paths)
+    setSessionRemaining(0)
+  }
+
+  async function runSessionLoop(session: PendingSession, grouping: SessionGrouping, skip: Set<string>) {
+    const todo: SessionMatch[] = grouping.matches.filter(m => !skip.has(m.key))
+    setFailures([])
+    setReviewItems([])
+    setReviewIndex(0)
+    setSavedCount(0)
+    setProcTotal(todo.length)
+    setProcDone(0)
+    setPageState('processing')
+
+    const held: ReviewItem[] = []
+    const failed: ProcessFailure[] = []
+    let saved = 0
+    let seq = matchSeqCounter
+
+    for (let i = 0; i < todo.length; i++) {
+      const m = todo[i]
+      setProcDone(i)
+      setProcCurrentLabel(`${m.mapName ?? 'Unknown map'}${m.dateText ? ` · ${m.dateText}` : ''}`)
+      setProcessingStatus(null)
+      const leaverGame = m.leaver.team || m.leaver.enemy
+      // A permanent leaver's board is asymmetric, so it is not read at all —
+      // the same rule as the per-match path (discardsScoreboard).
+      const ids = [m.summaryId, ...m.personalIds, ...(!leaverGame && m.teamsId ? [m.teamsId] : [])]
+      const urls = ids.map(id => sessionUrls[id]).filter((u): u is string => !!u)
+
+      try {
+        const raw = await processMatchPhotos(
+          urls,
+          status => setProcessingStatus(status),
+          undefined,
+          gamertag || undefined,
+          m.format,
+          sessionExtraHeroes(m),
+        )
+        const result: ProcessedMatch = leaverGame
+          ? { ...raw, scoreboard: null, allyComp: null, enemyComp: null, matchFormat: m.format }
+          : raw
+        applyMatchDateRoles(result)
+
+        seq += 1
+        const batch: PendingBatch = {
+          batchId: `${session.sessionId}--match-${seq}`,
+          metadata: sessionMatchMetadata(session.sessionId, m, result, session.metadata.uploaded_at),
+          photoUrls: urls,
+          photoPaths: ids,
+        }
+        const reasons = sessionMatchExceptions(m, result)
+        if (reasons.length === 0) {
+          await saveMatch(batch, result)
+          saved += 1
+          setSavedCount(saved)
+        } else {
+          held.push({
+            batch,
+            result,
+            matchSeq: seq,
+            userResolved: !(result.scoreboard?.ocrAnalysis && !result.scoreboard.ocrAnalysis.resolved),
+            saved: false,
+            heldBecause: reasons,
+          })
+        }
+      } catch (err: any) {
+        console.error(`[session] match ${m.dateText ?? m.key} failed:`, err)
+        failed.push({
+          batchId: m.dateText ?? m.key,
+          message: err?.message || 'Processing failed',
+          uploadedAt: session.metadata.uploaded_at,
+        })
+      }
+    }
+
+    setProcDone(todo.length)
+    setMatchSeqCounter(seq)
+    setFailures(failed)
+    setSessionStats({ autoSaved: saved, held: held.length, skipped: skip.size, unplaced: grouping.leftovers.length })
+    setReviewItems(held)
+
+    if (held.length === 0) {
+      setSessionRemaining(await countSessionRemaining(session.sessionId))
+      setPageState('done')
+      return
+    }
+    setReviewIndex(0)
+    void enterReviewForIndex(0, held)
+  }
+
   function resetToIdle() {
+    setActiveSession(null)
+    setSessionFps([])
+    setSessionManual({})
+    setSessionStats(null)
+    setSessionRemaining(null)
     setReviewItems([])
     setReviewIndex(0)
     setFailures([])
@@ -1248,6 +1473,44 @@ export default function ProcessPage() {
           <p className="text-ow-muted font-display tracking-wider">CHECKING FOR UPLOADS…</p>
         </div>
       </div>
+    )
+  }
+
+  // ---------- (v1.2.0) SESSION: READING SCREENSHOTS ----------
+  if (pageState === 'session_reading') {
+    const pct = sessionRead.total > 0 ? Math.round((100 * sessionRead.done) / sessionRead.total) : 0
+    return (
+      <div className="max-w-3xl mx-auto space-y-6">
+        <div>
+          <h1 className="font-display text-3xl tracking-[0.12em] text-ow-fg uppercase">Reading session</h1>
+          <p className="text-sm text-ow-muted mt-1">
+            Reading each screenshot to work out which match it belongs to. Nothing is saved yet.
+          </p>
+        </div>
+        <div className="bg-ow-panel rounded-lg p-10 text-center border border-ow-line">
+          <div className="w-12 h-12 border-[3px] border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-6" />
+          <p className="text-ow-fg font-display text-lg">{sessionRead.done} / {sessionRead.total} screenshots</p>
+          <div className="mt-6 bg-ow-dark rounded-full h-2 overflow-hidden max-w-sm mx-auto">
+            <div className="h-full bg-ow-orange transition-all duration-500 rounded-full" style={{ width: `${pct}%` }} />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ---------- (v1.2.0) SESSION: GROUPING PREVIEW ----------
+  if (pageState === 'session_preview' && activeSession && sessionGrouping) {
+    return (
+      <SessionPreview
+        grouping={sessionGrouping}
+        fingerprints={sessionFpById}
+        urlFor={id => sessionUrls[id]}
+        manual={sessionManual}
+        alreadySaved={alreadySavedKeys}
+        onPlace={placeSessionScreenshot}
+        onConfirm={() => void runSessionLoop(activeSession, sessionGrouping, alreadySavedKeys)}
+        onCancel={resetToIdle}
+      />
     )
   }
 
@@ -1343,6 +1606,14 @@ export default function ProcessPage() {
           )}
           {item.result.score && <span className="text-ow-muted text-sm font-display">{item.result.score}</span>}
         </div>
+
+        {/* (v1.2.0) Bulk session: why this match wasn't saved automatically. */}
+        {item.heldBecause && item.heldBecause.length > 0 && (
+          <div className="bg-ow-draw/10 border border-ow-draw/30 rounded-lg px-4 py-3 space-y-1">
+            <p className="text-xs font-display tracking-wider text-ow-draw">HELD FOR CHECKING</p>
+            {item.heldBecause.map(r => <p key={r} className="text-sm text-ow-muted">● {r}</p>)}
+          </div>
+        )}
 
         {reviewError && (
           <div className="bg-ow-defeat/10 border border-ow-defeat/30 rounded-lg px-4 py-3 text-sm text-ow-defeat">
@@ -1547,6 +1818,31 @@ export default function ProcessPage() {
           </p>
         </div>
 
+        {/* (v1.2.0) Bulk session summary. */}
+        {activeSession && sessionStats && (
+          <div className="bg-ow-panel rounded-lg border border-ow-line p-5 space-y-2">
+            <p className="font-display text-sm tracking-wider text-ow-fg">SESSION</p>
+            <p className="text-sm text-ow-muted">
+              {sessionStats.autoSaved} saved automatically · {sessionStats.held} held for checking
+              {sessionStats.skipped > 0 && ` · ${sessionStats.skipped} already saved earlier (skipped)`}
+              {sessionStats.unplaced > 0 && ` · ${sessionStats.unplaced} screenshot${sessionStats.unplaced !== 1 ? 's' : ''} not placed`}
+            </p>
+            {sessionRemaining != null && sessionRemaining > 0 && (
+              <div className="flex items-center justify-between gap-3 flex-wrap pt-1">
+                <p className="text-xs text-ow-faint">
+                  {sessionRemaining} screenshot{sessionRemaining !== 1 ? 's' : ''} still in this session&apos;s upload
+                  (unplaced, repeats, or matches not saved). They stay for next time unless you delete them.
+                </p>
+                <button onClick={() => void deleteSessionRemainder(activeSession.sessionId)}
+                  className="text-xs text-ow-faint hover:text-ow-defeat font-display tracking-wider transition-colors whitespace-nowrap">
+                  DELETE REMAINING
+                </button>
+              </div>
+            )}
+            {sessionRemaining === 0 && <p className="text-xs text-ow-faint">Session finished — nothing left in its upload.</p>}
+          </div>
+        )}
+
         {failures.length > 0 && (
           <div className="bg-ow-panel rounded-lg border border-ow-defeat/30 p-5 space-y-3">
             <p className="text-ow-defeat font-display font-bold text-sm tracking-wider">
@@ -1593,7 +1889,32 @@ export default function ProcessPage() {
         </p>
       </div>
 
-      {batches.length === 0 ? (
+      {/* (v1.2.0) Bulk sessions — grouped into matches when opened. */}
+      {sessions.length > 0 && (
+        <div className="space-y-3">
+          {sessions.map(sess => (
+            <div key={sess.sessionId}
+              className="bg-ow-panel rounded-lg border border-ow-orange/30 px-5 py-4 flex items-center justify-between gap-3 flex-wrap">
+              <div className="min-w-0">
+                <p className="text-ow-orange font-display font-bold tracking-wider">
+                  SESSION · {sess.photoPaths.length} SCREENSHOT{sess.photoPaths.length !== 1 ? 'S' : ''}
+                </p>
+                <p className="text-ow-muted text-xs mt-0.5">
+                  Uploaded {new Date(sess.metadata.uploaded_at).toLocaleString()}
+                  {sess.metadata.upload_complete === false && ` · upload incomplete (${sess.metadata.uploaded_count ?? '?'} of ${sess.metadata.photo_count})`}
+                  {' · '}{isAlpha ? 'saves as TEST data' : 'saves as REAL data'}
+                </p>
+              </div>
+              <button onClick={() => void openSession(sess)}
+                className="bg-ow-orange hover:bg-ow-accent text-ow-dark font-display font-bold px-4 py-2 rounded-lg tracking-wider text-xs transition-colors whitespace-nowrap">
+                OPEN SESSION
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {batches.length === 0 && sessions.length > 0 ? null : batches.length === 0 ? (
         <div className="bg-ow-panel rounded-lg p-12 text-center border border-ow-line">
           <span className="text-4xl block mb-3">📷</span>
           <p className="text-ow-muted font-display text-lg tracking-wider">NO PENDING UPLOADS</p>

@@ -12,7 +12,7 @@ import AnalyticsFilters, {
 } from '@/components/AnalyticsFilters'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 import { defaultSeasonSelection } from '@/lib/season-util'
-import { HEROES, getHeroesByRole } from '@/data/reference'
+import { HEROES, getHeroesByRole, heroRoleAt, heroEraName, heroDisplayRole } from '@/data/reference'
 import {
   aggregateSingles,
   rankTopNPerRole,
@@ -41,7 +41,7 @@ import {
   type LiftView,
   type LiftViewBoth,
   type AttributionMode,
-  aggregateStandouts, inScopeMatchIds, userHeroesByMatch,
+  aggregateStandouts, inScopeMatchIds, userHeroesByMatch, applyRoleEras,
   type StandoutRow, type StandoutCell,
 } from './matchups-lib'
 
@@ -157,12 +157,21 @@ export default function MatchupsPage() {
         if (pairRes.error) throw pairRes.error
         if (setRes.error) throw setRes.error
         if (cancelled) return
-        setPairs(keepVisible(pairRes.data ?? []) as PairRow[])
-        setTeamSets(keepVisible(setRes.data ?? []) as TeamSetRow[])
+        // (v1.2.0) Role eras applied ONCE, at load: rows from a hero's earlier
+        // role become "Sombra (DPS era)" so every panel keeps the eras apart.
         // Non-fatal, like seasons: a failed standouts read empties two tile rows
         // rather than blanking the page. The table is also legitimately empty
         // until Season 4, so "no rows" is a normal state, not an error.
-        if (!standoutRes.error) setStandouts((standoutRes.data ?? []) as StandoutRow[])
+        const eras = applyRoleEras(
+          keepVisible(pairRes.data ?? []) as PairRow[],
+          keepVisible(setRes.data ?? []) as TeamSetRow[],
+          standoutRes.error ? [] : (standoutRes.data ?? []) as StandoutRow[],
+          heroRoleAt,
+          heroEraName,
+        )
+        setPairs(eras.pairs)
+        setTeamSets(eras.teamSets)
+        if (!standoutRes.error) setStandouts(eras.standouts)
         // A failed seasons read is NOT fatal: the control hides itself when the
         // list is empty, and every other panel on the page still works. Throwing
         // here would blank the whole surface over a filter that is optional.
@@ -282,8 +291,8 @@ export default function MatchupsPage() {
     const all = [activeAnchor, ...picks]
     const order: Record<Role, number> = { tank: 0, dps: 1, support: 2 }
     return all.sort((a, b) => {
-      const ra = HEROES.find((h) => h.name === a)?.role ?? 'dps'
-      const rb = HEROES.find((h) => h.name === b)?.role ?? 'dps'
+      const ra = heroDisplayRole(a) ?? 'dps'
+      const rb = heroDisplayRole(b) ?? 'dps'
       return order[ra] - order[rb]
     })
   }
@@ -304,10 +313,11 @@ export default function MatchupsPage() {
 
   // user's slot for the scoreboard (fixed by Queue in 5v5, else the anchor's role)
   const userRole: Role | null = fixedRole
-    ?? (activeAnchor ? (HEROES.find((h) => h.name === activeAnchor)?.role ?? null) : null)
+    ?? (activeAnchor ? (heroDisplayRole(activeAnchor) ?? null) : null)
 
   // --- lift drill-down ---
-  const heroRole = (h: string): Role | null => HEROES.find((x) => x.name === h)?.role ?? null
+  // (v1.2.0) Display-name aware: "Sombra (DPS era)" -> dps.
+  const heroRole = (h: string): Role | null => heroDisplayRole(h) ?? null
   const allHeroList = useMemo(() => HEROES.map((h) => ({ name: h.name, role: h.role })), [])
   // team shape for each lift side: 6v6 uses that side's chooser; 5v5 is
   // locked 1-2-2. These are FULL team shapes (computeLift reserves the
@@ -1124,12 +1134,12 @@ function LiftDrillDown({
     const accent = side === 'ally' ? 'text-sky-300' : 'text-rose-300'
     const shape = side === 'ally' ? allyShape : enemyShape
     const isUserSide = side === 'ally' && !!anchorHero
-    const userRoleHere = isUserSide ? (HEROES.find((h) => h.name === anchorHero)?.role ?? null) : null
+    const userRoleHere = isUserSide ? (heroDisplayRole(anchorHero) ?? null) : null
     // heroes unavailable to pick: everything already on this side + your hero
     const taken = new Set<string>([...set, ...(anchorHero && side === 'ally' ? [anchorHero] : [])])
 
     // picks of a given role, in order
-    const picksOfRole = (role: Role) => set.filter((h) => HEROES.find((x) => x.name === h)?.role === role)
+    const picksOfRole = (role: Role) => set.filter((h) => heroDisplayRole(h) === role)
 
     function replacePick(role: Role, indexInRole: number, hero: string) {
       const ofRole = picksOfRole(role)

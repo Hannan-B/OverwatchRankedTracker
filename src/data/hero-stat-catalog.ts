@@ -6,6 +6,8 @@
 // without this, but this enables accuracy checking.
 // ============================================================
 
+import { normaliseStat } from '@/data/stat-meta'
+
 export interface HeroStatDefinition {
   name: string          // ALL CAPS stat name as shown on screen
   hasAvgPer10?: boolean // whether this stat typically shows AVG PER 10 MIN
@@ -172,16 +174,21 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
     ],
   },
   {
+    // Season 5 rework (Oct 2026, screen-verified): 7 -> 8 tiles, new order.
+    // WHOLE HOG KILLS dropped; AVERAGE TRASH COMPACTED and ULTIMATES NEGATED added.
+    // PLAYERS PROTECTED / ULTIMATES NEGATED read 0 on the reference screenshot, which
+    // hides the per-10 line — hasAvgPer10 follows the other heroes' tiles of that name.
     hero: 'Roadhog',
-    tileCount: 7,
+    tileCount: 8,
     stats: [
-      { name: 'CHAIN HOOK KILLS', hasAvgPer10: true },
-      { name: 'WHOLE HOG KILLS', hasAvgPer10: true },
-      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
-      { name: 'CHAIN HOOK ACCURACY' },
       { name: 'WEAPON ACCURACY' },
       { name: 'SELF HEALING', hasAvgPer10: true },
+      { name: 'OBJ CONTEST TIME', hasAvgPer10: true },
+      { name: 'CHAIN HOOK KILLS', hasAvgPer10: true },
+      { name: 'AVERAGE TRASH COMPACTED' },
       { name: 'PLAYERS PROTECTED', hasAvgPer10: true },
+      { name: 'CHAIN HOOK ACCURACY' },
+      { name: 'ULTIMATES NEGATED', hasAvgPer10: true },
     ],
   },
   {
@@ -239,7 +246,7 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
   },
 
   // ============================================================
-  // DPS (24 heroes)
+  // DPS (23 heroes)
   // ============================================================
   {
     hero: 'Anran',
@@ -469,20 +476,6 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
     ],
   },
   {
-    hero: 'Sombra',
-    tileCount: 8,
-    stats: [
-      { name: 'WEAPON ACCURACY', hasAvgPer10: true },
-      { name: 'VIRUS KILLS', hasAvgPer10: true },
-      { name: 'FINAL BLOWS', hasAvgPer10: true },
-      { name: 'ENEMIES HACKED', hasAvgPer10: true },
-      { name: 'LOW HEALTH TELEPORTS', hasAvgPer10: true },
-      { name: 'SOLO KILLS', hasAvgPer10: true },
-      { name: 'VIRUS ACCURACY', hasAvgPer10: true },
-      { name: 'EMP KILLS', hasAvgPer10: true },
-    ],
-  },
-  {
     hero: 'Symmetra',
     tileCount: 7,
     stats: [
@@ -564,7 +557,7 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
   },
 
   // ============================================================
-  // SUPPORT (14 heroes)
+  // SUPPORT (16 heroes)
   // ============================================================
   {
     hero: 'Ana',
@@ -641,6 +634,25 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
       { name: 'ORBITAL RAY ASSISTS' },
       { name: 'WEAPON ACCURACY' },
       { name: 'ORBITAL RAY HEALING' },
+    ],
+  },
+  {
+    // Hero 54 (Season 5, Oct 2026, screen-verified). Six tiles, but NOT the first
+    // six positions: the screen leaves R2C3 empty and continues on row 3, so
+    // PLAYERS SAVED sits at R3C1 (grid index 5) and DELIVERANCE HEALTH CAPPED at
+    // R3C2 (index 6). This array cannot express the gap, so the label-OCR-failed
+    // fallback in breakdown-ocr.ts is WRONG for row 3: R3C1 -> stats[5] names it
+    // DELIVERANCE HEALTH CAPPED, R3C2 -> stats[6] is out of range (UNKNOWN_TILE).
+    // Label OCR, the primary path, is unaffected.
+    hero: 'Doctrine',
+    tileCount: 6,
+    stats: [
+      { name: 'INFUSED SCEPTER DAMAGE', hasAvgPer10: true },
+      { name: 'DELIVERANCE OVERHEALTH GRANTED', hasAvgPer10: true },
+      { name: 'WEAPON ACCURACY' },
+      { name: 'INFUSED SCEPTER HEALING', hasAvgPer10: true },
+      { name: 'PLAYERS SAVED', hasAvgPer10: true },
+      { name: 'DELIVERANCE HEALTH CAPPED', hasAvgPer10: true },
     ],
   },
   {
@@ -723,6 +735,24 @@ export const HERO_STAT_CATALOG: HeroStatCatalogEntry[] = [
     ],
   },
   {
+    // Moved from DPS to support in Season 5 (Oct 2026, screen-verified). The DPS
+    // role tiles FINAL BLOWS / SOLO KILLS are gone; the support tile PLAYERS SAVED
+    // replaces them. EMP KILLS read 0 on the reference screenshot (per-10 hidden);
+    // hasAvgPer10 kept from her previous entry.
+    hero: 'Sombra',
+    tileCount: 8,
+    stats: [
+      { name: 'CRITICAL HIT ACCURACY' },
+      { name: 'CYBERSPACE DAMAGE', hasAvgPer10: true },
+      { name: 'PLAYERS SAVED', hasAvgPer10: true },
+      { name: 'HOTFIX HEALING', hasAvgPer10: true },
+      { name: 'HEALTH PACKS HACKED', hasAvgPer10: true },
+      { name: 'WEAPON ACCURACY' },
+      { name: 'CYBERSPACE HEALING', hasAvgPer10: true },
+      { name: 'EMP KILLS', hasAvgPer10: true },
+    ],
+  },
+  {
     hero: 'Wuyang',
     tileCount: 7,
     stats: [
@@ -766,6 +796,20 @@ export function getExpectedStats(heroName: string): string[] {
 export function getExpectedTileCount(heroName: string): number {
   const entry = HERO_STAT_LOOKUP.get(heroName)
   return entry ? entry.tileCount : 0
+}
+
+/** (v1.2.0) Is this stat on the hero's CURRENT breakdown screen? The catalog
+ *  records today's screen, so a stat in HERO_BREAKDOWN_ORDER that is absent here
+ *  has been retired by a rework (Roadhog's WHOLE HOG KILLS, Sombra's DPS kit) or
+ *  dropped for a role tile (the five tank ultimates in RETIRED_TILE_BY_HERO).
+ *  Earlier matches still hold its values, so pages show it as "retired" rather
+ *  than hiding it. Compared after singular/plural folding; a hero with no
+ *  catalog entry treats every stat as current. */
+export function isCurrentKitStat(heroName: string, canonical: string): boolean {
+  const entry = HERO_STAT_LOOKUP.get(heroName)
+  if (!entry) return true
+  const want = normaliseStat(canonical)
+  return entry.stats.some(s => normaliseStat(s.name) === want)
 }
 
 // ============================================================

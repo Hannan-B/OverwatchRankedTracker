@@ -54,6 +54,10 @@ type Step =
   | 'photos' | 'confirm_leaver' | 'checking' | 'confirm_side'
   | 'standout_ally' | 'standout_enemy'
   | 'uploading' | 'done'
+  // (v1.2.0) Bulk session upload — a separate path beside the per-match wizard,
+  // which is unchanged. A whole play session's match-history screenshots go up
+  // in one batch, in any order; /process groups them into matches itself.
+  | 'session_photos' | 'session_uploading' | 'session_done'
 
 type FileStatus = 'idle' | 'uploading' | 'success' | 'error'
 interface FilePreview { file: File; preview: string; status: FileStatus }
@@ -261,6 +265,14 @@ export default function UploadPage() {
   const [lightbox, setLightbox] = useState<string | null>(null)
 
   const [files, setFiles] = useState<FilePreview[]>([])
+  // (v1.2.0) Bulk session upload. No previews: a session can be 100–200
+  // full-resolution screenshots, too many to decode as thumbnails on a phone.
+  const [sessionFiles, setSessionFiles] = useState<File[]>([])
+  const [sessionDone, setSessionDone] = useState(0)
+  // Each photo keeps its original number, so a retry can never overwrite one
+  // that already uploaded.
+  const [sessionFailed, setSessionFailed] = useState<{ file: File; n: number }[]>([])
+  const sessionIdRef = useRef<string | null>(null)
 
   const [detectedMap, setDetectedMap] = useState<string | null>(null)
   const [startingSide, setStartingSide] = useState<StartingSide | null>(null)
@@ -600,6 +612,151 @@ export default function UploadPage() {
     setLeaverConfirmed(false)
   }
 
+  // ======================== SESSION UPLOAD (v1.2.0) ========================
+  // Storage: pending/session-<ts>/photo_NNN.jpg + metadata.json. metadata.json
+  // is written FIRST with upload_complete:false (so an abandoned upload is
+  // still found and auto-cleaned like any other), then rewritten with
+  // upload_complete:true once every photo is up. /process warns on an
+  // incomplete session rather than hiding it.
+  async function writeSessionMetadata(sessionId: string, complete: boolean, uploaded: number, total: number) {
+    const metadata = {
+      kind: 'session',
+      upload_complete: complete,
+      uploaded_at: new Date().toISOString(),
+      photo_count: total,
+      uploaded_count: uploaded,
+    }
+    await supabase.storage
+      .from('match-images')
+      .upload(`pending/${sessionId}/metadata.json`, JSON.stringify(metadata), {
+        contentType: 'application/json',
+        upsert: true,
+      })
+  }
+
+  async function uploadSession(toUpload: { file: File; n: number }[]) {
+    const firstRun = sessionIdRef.current == null
+    const sessionId = sessionIdRef.current ?? `session-${Date.now()}`
+    sessionIdRef.current = sessionId
+    const total = sessionFiles.length
+    setStep('session_uploading')
+    if (firstRun) await writeSessionMetadata(sessionId, false, 0, total)
+
+    const failed: { file: File; n: number }[] = []
+    let done = firstRun ? 0 : sessionDone
+    for (const item of toUpload) {
+      try {
+        const jpegBlob = await convertToJpeg(item.file)
+        const { error } = await supabase.storage
+          .from('match-images')
+          .upload(`pending/${sessionId}/photo_${String(item.n).padStart(3, '0')}.jpg`, jpegBlob, {
+            contentType: 'image/jpeg',
+            upsert: true,
+          })
+        if (error) failed.push(item)
+        else done++
+      } catch (err) {
+        console.warn(`Session upload: photo ${item.n} failed`, err)
+        failed.push(item)
+      }
+      setSessionDone(done)
+    }
+    setSessionFailed(failed)
+    await writeSessionMetadata(sessionId, failed.length === 0, done, total)
+    setStep('session_done')
+  }
+
+  function resetSession() {
+    sessionIdRef.current = null
+    setSessionFiles([])
+    setSessionDone(0)
+    setSessionFailed([])
+    setStep('format')
+  }
+
+  if (step === 'session_photos') {
+    return (
+      <StepShell
+        title="Upload a session"
+        hint="Select every match-history screenshot from your session — Summary, Teams and each Personal page — in any order. The tracker sorts them into matches when you process them."
+        onBack={resetSession}
+        onNext={() => void uploadSession(sessionFiles.map((file, i) => ({ file, n: i + 1 })))}
+        nextLabel={sessionFiles.length ? `UPLOAD ${sessionFiles.length} SCREENSHOTS` : 'UPLOAD'}
+        nextDisabled={sessionFiles.length === 0}>
+        <label className="block w-full rounded-xl border-2 border-dashed border-ow-line hover:border-ow-orange/40
+          bg-ow-panel/50 px-4 py-10 text-center cursor-pointer transition-colors">
+          <input type="file" accept="image/*" multiple className="hidden"
+            onChange={e => {
+              const picked = Array.from(e.target.files ?? []).filter(f => f.type.startsWith('image/'))
+              setSessionFiles(prev => [...prev, ...picked])
+              e.target.value = ''
+            }} />
+          <span className="font-display tracking-wider text-ow-fg">
+            {sessionFiles.length ? `${sessionFiles.length} SCREENSHOTS SELECTED` : 'CHOOSE SCREENSHOTS'}
+          </span>
+          <span className="block text-xs text-ow-faint mt-2">
+            {sessionFiles.length ? 'Tap to add more' : 'You can pick them all at once'}
+          </span>
+        </label>
+        {sessionFiles.length > 0 && (
+          <button type="button" onClick={() => setSessionFiles([])}
+            className="w-full text-xs text-ow-faint hover:text-ow-defeat font-display tracking-wider py-2">
+            CLEAR SELECTION
+          </button>
+        )}
+      </StepShell>
+    )
+  }
+
+  if (step === 'session_uploading') {
+    const total = sessionFiles.length || 1
+    return (
+      <div className="min-h-[100dvh] flex items-center justify-center px-6 bg-ow-dark">
+        <div className="w-full max-w-sm text-center">
+          <div className="w-10 h-10 border-[3px] border-ow-orange border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+          <p className="text-ow-fg font-display text-lg tracking-wider">UPLOADING SESSION</p>
+          <p className="text-ow-muted text-sm mt-1">{sessionDone} / {sessionFiles.length} screenshots</p>
+          <div className="h-2 rounded-full bg-ow-panel border border-ow-line mt-5 overflow-hidden">
+            <div className="h-full bg-ow-orange transition-all" style={{ width: `${Math.round((100 * sessionDone) / total)}%` }} />
+          </div>
+          <p className="text-xs text-ow-faint mt-4">Keep this screen open until it finishes.</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (step === 'session_done') {
+    const ok = sessionFailed.length === 0
+    return (
+      <div className="min-h-[100dvh] flex items-center justify-center px-6 bg-ow-dark">
+        <div className="w-full max-w-sm">
+          <div className={`${ok ? 'bg-ow-victory/10 border-ow-victory/30' : 'bg-ow-defeat/10 border-ow-defeat/30'} border rounded-xl p-8 text-center`}>
+            <span className="text-4xl block mb-3">{ok ? '✓' : '!'}</span>
+            <p className={`${ok ? 'text-ow-victory' : 'text-ow-defeat'} font-display text-xl font-bold tracking-wider`}>
+              {ok ? 'SESSION UPLOADED' : `${sessionFailed.length} FAILED`}
+            </p>
+            <p className="text-ow-muted text-sm mt-2">
+              {ok
+                ? `${sessionDone} screenshots. Open the tracker on your laptop to process the session.`
+                : `${sessionDone} of ${sessionFiles.length} uploaded. Retry the rest before processing.`}
+            </p>
+            {!ok && (
+              <button onClick={() => void uploadSession(sessionFailed)}
+                className="mt-6 w-full rounded-xl bg-ow-orange text-ow-dark font-display font-bold px-6 py-3 tracking-wider text-sm">
+                RETRY {sessionFailed.length}
+              </button>
+            )}
+            <button onClick={resetSession}
+              className="mt-3 rounded-xl bg-ow-panel border border-ow-line text-ow-fg font-display
+                px-6 py-3 tracking-wider text-sm hover:border-ow-orange/30 transition-colors">
+              DONE
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   // ======================== FORMAT (auto-advance) ========================
   if (step === 'format') {
     return (
@@ -617,6 +774,12 @@ export default function UploadPage() {
             <OptionButton big label="6V6" selected={matchFormat === '6v6'}
               onClick={() => { setRole(null); pickAndAdvance(setMatchFormat, '6v6', 'role') }} />
           </div>
+          {/* (v1.2.0) Bulk session upload — a separate path; the per-match
+              flow above is unchanged. */}
+          <button type="button" onClick={() => setStep('session_photos')}
+            className="w-full mt-8 text-xs font-display tracking-[0.2em] text-ow-faint hover:text-ow-orange uppercase transition-colors">
+            Or upload a whole session →
+          </button>
         </div>
       </div>
     )
@@ -921,7 +1084,7 @@ export default function UploadPage() {
             You marked a leaver on <span className="text-ow-defeat font-semibold">{sides}</span>.
           </p>
           <p className="text-sm text-ow-faint mb-6">
-            A leaver changes the scoreboard, so the scoreboard stats won't be read
+            A leaver changes the scoreboard, so the scoreboard stats won’t be read
             for this match. Your result, heroes and breakdown are still saved.
           </p>
           <div className="space-y-3">

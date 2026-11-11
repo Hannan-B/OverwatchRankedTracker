@@ -30,22 +30,20 @@ npm-debug.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# Local-only personal docs — never committed (even though the repo is private).
-# These live on the laptop only. A new agent should be given FILE-MAP.md by
-# uploading it at the start of a session (it is not in the repo by design).
-FILE-MAP.md
-New Season Runbook.md
+# macOS / iCloud sync duplicates — ".next 2/", "opencv 2.js", "README 2.md".
+# Always junk copies, never real files. Hero portraits with spaces are safe:
+# these patterns need a literal " 2" at the end of the name or before the
+# extension, which "Soldier 76.png" and "Junker Queen.png" do not have.
+* 2
+* 2.*
 
 # Local-only personal docs — never committed (even though the repo is private).
+# These live on the laptop only, and are given to an agent by uploading them at
+# the start of a session; they are not in the repo by design.
 FILE-MAP.md
 New Season Runbook.md
-
-# Local-only personal docs — never committed (even though the repo is private).
-FILE-MAP.md
-New Season Runbook.md
-
-# Internal investigation docs — local only, uploaded per session like FILE-MAP.md
 KNOWN-FAILURE-MODES.md
 MAP-RESULT-DETECTION.md
 docs/KNOWN-FAILURE-MODES.md
 docs/MAP-RESULT-DETECTION.md
+BULK-UPLOAD-PLAN.md

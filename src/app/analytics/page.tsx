@@ -22,7 +22,8 @@ export default function AnalyticsLandingPage() {
       <AnalyticsMenu />
 
       <p className="text-xs text-ow-faint">
-        {ANALYTICS_TABS.length} surfaces, grouped above.
+        {ANALYTICS_TABS.filter(t => !t.retired).length} surfaces, grouped above
+        {ANALYTICS_TABS.some(t => t.retired) && ` · ${ANALYTICS_TABS.filter(t => t.retired).length} retired`}.
       </p>
     </div>
   )

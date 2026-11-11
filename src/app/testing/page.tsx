@@ -40,6 +40,9 @@ import {
 } from '@/lib/new-content-readiness'
 import { SCOREBOARD_ROLE_HERO_NAMES } from '@/lib/scoreboard-extractor'
 import { findMapName } from '@/lib/ocr-extractor'
+import { fingerprintSession } from '@/lib/session-fingerprint'
+import { groupSession } from '@/lib/session-grouper'
+import { sessionExtraHeroes } from '@/lib/session-match'
 
 // ============================================================
 // CONSOLE CAPTURE
@@ -375,6 +378,8 @@ interface MatchGroup {
   via: 'prefix' | 'content'
   /** Per-file page type (content mode only); used for canonical ordering + UI labels. */
   pageTypes?: PageType[]
+  /** Session mode: heroes beyond the Summary's top 3, from the sidebar. */
+  extraHeroes?: string[]
 }
 
 /** Canonical order rank for a page type (summary → breakdown → scoreboard). */
@@ -1089,9 +1094,9 @@ function ReadinessPanel({ readiness }: { readiness: MatchReadiness }) {
           {heroesToShow.map((h) => <HeroReadinessRow key={h.heroName} h={h} />)}
           <div className="flex items-center justify-between bg-ow-dark rounded border border-ow-line p-2">
             <span className="text-[11px] text-ow-muted">
-              Run this once in Supabase so new heroes have a role in Matchups (<code className="text-ow-orange">hero_role_ref</code>):
+              Run this once in Supabase so new heroes have a role in Matchups (<code className="text-ow-orange">hero_role_ref</code> + <code className="text-ow-orange">hero_role_history</code>):
             </span>
-            <CopyButton text={generateHeroRoleRefSql()} label="COPY hero_role_ref SQL" />
+            <CopyButton text={generateHeroRoleRefSql()} label="COPY hero role SQL" />
           </div>
         </div>
       )}
@@ -1548,8 +1553,63 @@ function ScoreboardStats({
 // MAIN PAGE
 // ============================================================
 
+// (v1.2.0) Session mode — groups an order-free session with the SAME reader and
+// grouper bulk upload uses (session-fingerprint / session-grouper), then hands
+// each match to the normal PROCESS ALL. Nothing is written to the database.
+async function groupFilesAsSession(files: File[]): Promise<{ groups: MatchGroup[]; info: SessionTestInfo }> {
+  const urls = new Map(files.map(f => [f.name, URL.createObjectURL(f)]))
+  try {
+    const fps = await fingerprintSession(files.map(f => ({ id: f.name, url: urls.get(f.name)! })))
+    const g = groupSession(fps)
+    const byName = new Map(files.map(f => [f.name, f]))
+    const groups: MatchGroup[] = g.matches.map((m, i) => {
+      const leaverGame = m.leaver.team || m.leaver.enemy
+      const ids = [m.summaryId, ...m.personalIds, ...(!leaverGame && m.teamsId ? [m.teamsId] : [])]
+      return {
+        key: `Session ${i + 1} · ${m.dateText ?? 'no date'} · ${m.mapName ?? 'unknown map'}`,
+        via: 'content' as const,
+        files: ids.map(id => byName.get(id)!).filter(Boolean),
+        pageTypes: ids.map(id => (id === m.summaryId ? 'summary' : id === m.teamsId ? 'scoreboard' : 'breakdown')) as PageType[],
+        extraHeroes: sessionExtraHeroes(m),
+      }
+    })
+    const fpById = new Map(fps.map(f => [f.id, f]))
+    const pageValues = (id: string): string => {
+      const f = fpById.get(id)
+      if (!f) return id
+      if (f.kind === 'summary') return `${id}: summary slots ${f.slots.map(s => `${s.percentPlayed ?? '?'}%/${s.playTimeSeconds ?? '?'}s`).join(', ')} · date "${f.dateText ?? '—'}"`
+      if (f.kind === 'personal') return `${id}: ${f.hero ?? '?'} ${f.percentPlayed ?? '?'}%/${f.playTimeSeconds ?? '?'}s · sidebar [${f.sidebar.map(n => n ?? '?').join(', ')}]`
+      if (f.kind === 'teams') return `${id}: teams ${f.allyRows} v ${f.enemyRows}, pitch ${f.pitch ?? '?'}, your row ${f.userRowIndex ?? '?'} = ${f.userEad ? `${f.userEad.e}/${f.userEad.a}/${f.userEad.d}` : '?'}`
+      return `${id}: ${f.reason}`
+    }
+    const info: SessionTestInfo = {
+      perGroup: g.matches.map(m => ({
+        values: [m.summaryId, ...m.personalIds, ...(m.teamsId ? [m.teamsId] : [])].map(pageValues),
+        format: m.format ? `${m.format}${m.formatCertain ? '' : '?'}` : '—',
+        rows: m.allyRows != null ? `${m.allyRows} v ${m.enemyRows}` : '—',
+        ead: m.ead ? `${m.ead.e}/${m.ead.a}/${m.ead.d}` : '—',
+        issues: m.issues,
+        notes: m.notes,
+      })),
+      leftovers: g.leftovers,
+      duplicates: g.duplicates,
+    }
+    return { groups, info }
+  } finally {
+    urls.forEach(u => URL.revokeObjectURL(u))
+  }
+}
+
+interface SessionTestInfo {
+  perGroup: { values: string[]; format: string; rows: string; ead: string; issues: string[]; notes: string[] }[]
+  leftovers: { id: string; reason: string }[]
+  duplicates: { id: string; reason: string }[]
+}
+
 export default function TestingPage() {
   const [groups, setGroups] = useState<MatchGroup[]>([])
+  const [sessionMode, setSessionMode] = useState(false)
+  const [sessionInfo, setSessionInfo] = useState<SessionTestInfo | null>(null)
   const [grouping, setGrouping] = useState(false)
   const [results, setResults] = useState<MatchTestResult[]>([])
   const [processing, setProcessing] = useState(false)
@@ -1567,8 +1627,16 @@ export default function TestingPage() {
     setResults([])
     setError(null)
     setGroups([])
+    setSessionInfo(null)
     setGrouping(true)
     try {
+      if (sessionMode) {
+        const { groups: sg, info } = await groupFilesAsSession(imageFiles)
+        setGroups(sg)
+        setSessionInfo(info)
+        if (sg.length === 0) setError('No Summary page found — a session match needs its Summary.')
+        return
+      }
       // Content grouping may decode images to classify them; prefix grouping
       // resolves instantly. Either way we await the unified entry point.
       const g = await groupFiles(imageFiles)
@@ -1581,7 +1649,7 @@ export default function TestingPage() {
     } finally {
       setGrouping(false)
     }
-  }, [])
+  }, [sessionMode])
 
   const processAll = useCallback(async () => {
     if (groups.length === 0) return
@@ -1612,6 +1680,8 @@ export default function TestingPage() {
           (status) => setCurrentStatus(status),
           undefined,
           gamertag || undefined,
+          undefined,
+          group.extraHeroes,
         )
       } catch (err: any) {
         errMsg = err?.message || String(err)
@@ -1723,6 +1793,11 @@ export default function TestingPage() {
             disabled={processing}
             className="text-sm text-ow-muted file:mr-3 file:py-1.5 file:px-3 file:rounded-lg file:border-0 file:text-sm file:font-medium file:bg-ow-panel file:text-ow-muted hover:file:bg-white/5 file:cursor-pointer disabled:opacity-50"
           />
+          <label className="flex items-center justify-center gap-2 mt-3 text-xs text-ow-muted cursor-pointer">
+            <input type="checkbox" checked={sessionMode} disabled={processing}
+              onChange={e => setSessionMode(e.target.checked)} />
+            Session mode (order-free) — group a whole session by page content, like bulk upload
+          </label>
         </div>
 
         {/* Grouping in progress (content classification can decode images) */}
@@ -1759,6 +1834,17 @@ export default function TestingPage() {
               {groups.map((g) => (
                 <div key={g.key} className="bg-ow-dark rounded px-3 py-2 border border-ow-line">
                   <p className="text-sm text-ow-fg font-display">{g.key}</p>
+                  {sessionInfo?.perGroup[groups.indexOf(g)] && (() => {
+                    const si = sessionInfo.perGroup[groups.indexOf(g)]
+                    return (
+                      <div className="mt-1 space-y-0.5">
+                        <p className="text-[11px] text-ow-muted">E/A/D {si.ead} · {si.format} · rows {si.rows}</p>
+                        {si.values.map(v => <p key={v} className="text-[10px] font-mono text-ow-faint">{v}</p>)}
+                        {si.issues.map(x => <p key={x} className="text-[11px] text-ow-defeat">● held: {x}</p>)}
+                        {si.notes.map(x => <p key={x} className="text-[11px] text-ow-draw">● {x}</p>)}
+                      </div>
+                    )
+                  })()}
                   <div className="mt-1 space-y-0.5">
                     {g.files.map((f, i) => (
                       <p key={f.name} className="text-[11px] text-ow-faint flex gap-2">
@@ -1772,6 +1858,15 @@ export default function TestingPage() {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* (v1.2.0) Session mode: what didn't fit */}
+        {!grouping && sessionInfo && (sessionInfo.leftovers.length > 0 || sessionInfo.duplicates.length > 0) && results.length === 0 && (
+          <div className="bg-ow-panel rounded-lg border border-ow-draw/30 p-5 space-y-1">
+            <p className="text-ow-draw font-display font-bold text-sm">NOT PLACED</p>
+            {sessionInfo.leftovers.map(l => <p key={l.id} className="text-[11px] text-ow-muted"><span className="text-ow-fg">{l.id}</span> — {l.reason}</p>)}
+            {sessionInfo.duplicates.map(l => <p key={l.id} className="text-[11px] text-ow-faint"><span className="text-ow-muted">{l.id}</span> — {l.reason}</p>)}
           </div>
         )}
 

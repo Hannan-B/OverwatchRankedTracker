@@ -4,7 +4,9 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 import { supabase } from '@/lib/supabase'
 import Select from '@/components/Select'
-import { HEROES, MAPS, GAME_MODE_CONFIG, type GameMode } from '@/data/reference'
+import { HEROES, MAPS, GAME_MODE_CONFIG, heroRoleAt, type GameMode, type HeroRole } from '@/data/reference'
+import { isCurrentKitStat } from '@/data/hero-stat-catalog'
+import { defaultSeasonSelection } from '@/lib/season-util'
 import { formatStatValue, HERO_BREAKDOWN_ORDER, type BreakdownStat } from '@/data/stat-meta'
 
 // ============================================================
@@ -26,11 +28,10 @@ import { formatStatValue, HERO_BREAKDOWN_ORDER, type BreakdownStat } from '@/dat
 // ============================================================
 
 type Format = '5v5' | '6v6'
-type Role = 'tank' | 'dps' | 'support'
+type Role = HeroRole
 const TINY_SAMPLE = 3 // single-hero games at/below this -> show a low-confidence warning
 const MAX_SLOTS = 4
 
-const HERO_ROLE = new Map<string, Role>(HEROES.map(h => [h.name, h.role]))
 const HERO_NAMES = HEROES.map(h => h.name).sort()
 const GAME_MODES = Object.keys(GAME_MODE_CONFIG) as GameMode[]
 const mapsForMode = (mode: GameMode) =>
@@ -40,6 +41,7 @@ const modeHasSide = (mode: GameMode | '') => mode !== '' && GAME_MODE_CONFIG[mod
 // One row of the fact table (only the columns we use)
 interface Fact {
   hero_name: string
+  played_at: string | null
   match_format: Format
   map: string | null
   game_mode: string | null
@@ -62,14 +64,20 @@ interface Fact {
 
 interface Filters {
   format: Format
+  /** (v1.2.0) '' = All Time. Defaults to the current season once seasons load.
+   *  Lets one hero sit in two slots either side of a rework or role change. */
+  season: number | ''
   mode: GameMode | ''
   map: string
   side: 'attack' | 'defense' | ''
 }
-const emptyFilters: Filters = { format: '5v5', mode: '', map: '', side: '' }
+const emptyFilters: Filters = { format: '5v5', season: '', mode: '', map: '', side: '' }
+interface SeasonRow { id: number; name: string; start_date: string; end_date: string }
 
 // ---- aggregation: turn a set of fact rows into the displayed stats ----
 interface Computed {
+  /** (v1.2.0) Roles the hero held across these games (role on each match date). */
+  roles: Role[]
   games: number
   wins: number
   losses: number
@@ -111,7 +119,13 @@ function compute(rows: Fact[]): Computed {
   const wins = rows.filter(r => r.result === 'victory').length
   const losses = rows.filter(r => r.result === 'defeat').length
   const draws = rows.filter(r => r.result === 'draw').length
+  const roles: Role[] = []
+  for (const r of rows) {
+    const role = heroRoleAt(r.hero_name, r.played_at)
+    if (role && !roles.includes(role)) roles.push(role)
+  }
   return {
+    roles,
     games: rows.length, wins, losses, draws,
     winRate: (wins + losses) === 0 ? null : Math.round((1000 * wins) / (wins + losses)) / 10,
     singleHeroGames: sh.length,
@@ -173,10 +187,34 @@ export default function ComparePage() {
   ])
   const [showBreakdown, setShowBreakdown] = useState(false)
 
+  // (v1.2.0) Seasons for the per-slot filter. Once loaded, every filter that
+  // hasn't been touched yet moves from All Time to the current season — the
+  // default every other analytics surface uses.
+  const [seasons, setSeasons] = useState<SeasonRow[]>([])
+  const [defaultSeason, setDefaultSeason] = useState<number | ''>('')
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const { data } = await supabase
+        .from('seasons').select('id, name, start_date, end_date')
+        .order('start_date', { ascending: false })
+      if (cancelled) return
+      const list = (data as SeasonRow[] | null) || []
+      const cur = defaultSeasonSelection(list)[0] ?? ''
+      setSeasons(list)
+      setDefaultSeason(cur)
+      setCmpFilters(f => ({ ...f, season: cur }))
+      setSlots(prev => prev.map(x => ({ ...x, filters: { ...x.filters, season: cur } })))
+    })()
+    return () => { cancelled = true }
+  }, [])
+  const seasonName = (id: number | '') => seasons.find(se => se.id === id)?.name ?? ''
+
   // build + run a filtered query against the fact table, return computed stats
   const fetchStats = useCallback(async (hero: string, f: Filters): Promise<Computed | null> => {
     if (!hero) return null
     let q = supabase.from('hero_match_facts').select('*').eq('hero_name', hero).eq('match_format', f.format)
+    if (f.season !== '') q = q.eq('season_id', f.season)
     if (f.mode) q = q.eq('game_mode', f.mode)
     if (f.map) q = q.eq('map', f.map)
     if (f.side && modeHasSide(f.mode)) q = q.eq('starting_side', f.side)
@@ -200,6 +238,7 @@ export default function ComparePage() {
     if (!hero) return null
     let q = supabase.from('hero_stat_facts').select('stat_canonical, stat_num, game_length_seconds')
       .eq('hero_name', hero).eq('match_format', f.format)
+    if (f.season !== '') q = q.eq('season_id', f.season)
     if (f.mode) q = q.eq('game_mode', f.mode)
     if (f.map) q = q.eq('map', f.map)
     if (f.side && modeHasSide(f.mode)) q = q.eq('starting_side', f.side)
@@ -310,6 +349,18 @@ export default function ComparePage() {
           />
         </label>
         <label className="flex flex-col gap-1">
+          <span className={labelCls}>Season</span>
+          <Select<number | ''>
+            className={selectCls}
+            value={value.season}
+            onChange={season => onChange({ ...value, season })}
+            options={[
+              { value: '', label: 'All Time' },
+              ...seasons.map(se => ({ value: se.id, label: se.name })),
+            ]}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
           <span className={labelCls}>Game Mode</span>
           <Select<GameMode | ''>
             className={selectCls}
@@ -355,9 +406,10 @@ export default function ComparePage() {
   }
 
   // ---- decide which stat rows to show, given the roles present in columns ----
-  // breakdown rows are role-specific; show a row if ANY column's hero has that role
-  function statRows(heroes: string[], detailed: boolean): { key: keyof Computed; label: string; pct?: boolean; suffix?: string; higherBetter: boolean; singleHero?: boolean }[] {
-    const roles = new Set(heroes.map(h => HERO_ROLE.get(h)).filter(Boolean) as Role[])
+  // breakdown rows are role-specific; show a row if ANY column held that role.
+  // (v1.2.0) Roles come from the games in each column (role on the match date),
+  // so a DPS-era Sombra slot gets Final Blows and a support-era one Players Saved.
+  function statRows(roles: Set<Role>, detailed: boolean): { key: keyof Computed; label: string; pct?: boolean; suffix?: string; higherBetter: boolean; singleHero?: boolean }[] {
     const rows: { key: keyof Computed; label: string; pct?: boolean; suffix?: string; higherBetter: boolean; singleHero?: boolean }[] = [
       { key: 'games', label: 'Games', higherBetter: true },
       { key: 'winRate', label: 'Win rate', pct: true, higherBetter: true },
@@ -393,7 +445,10 @@ export default function ComparePage() {
     if (heroes.length === 0) {
       return <p className="text-sm text-ow-muted py-8 text-center">Pick at least one hero to compare.</p>
     }
-    const rows = statRows(heroes, detailed)
+    const roles = new Set<Role>(columns.flatMap(c =>
+      c.data && c.data.roles.length > 0 ? c.data.roles
+        : c.hero ? [heroRoleAt(c.hero)].filter((r): r is Role => r != null) : []))
+    const rows = statRows(roles, detailed)
     // for highlighting: per row, find the best column value
     const bestIndex = (key: keyof Computed, higherBetter: boolean): number => {
       let best = -1, bestVal: number | null = null
@@ -544,7 +599,7 @@ export default function ComparePage() {
             ))}
             {slots.length < MAX_SLOTS && (
               <button
-                onClick={() => setSlots(prev => [...prev, { id: `s${Date.now()}`, hero: prev[0]?.hero || '', filters: { ...emptyFilters }, data: null, breakdown: null, loading: false }])}
+                onClick={() => setSlots(prev => [...prev, { id: `s${Date.now()}`, hero: prev[0]?.hero || '', filters: { ...emptyFilters, season: defaultSeason }, data: null, breakdown: null, loading: false }])}
                 className="w-full bg-ow-panel border border-ow-line hover:border-ow-orange/40 text-ow-fg font-display font-bold py-2.5 rounded-lg tracking-wider text-sm">
                 + ADD SLOT
               </button>
@@ -553,7 +608,7 @@ export default function ComparePage() {
           <Grid detailed={true}
             columns={slots.map(s => ({
               hero: s.hero, data: s.data, loading: s.loading,
-              sub: [s.filters.mode, s.filters.map, s.filters.side].filter(Boolean).join(' · ') || 'all',
+              sub: [s.filters.season === '' ? 'All Time' : seasonName(s.filters.season), s.filters.mode, s.filters.map, s.filters.side].filter(Boolean).join(' · '),
             }))} />
 
           {/* Toggleable full breakdown stats table */}
@@ -575,7 +630,15 @@ export default function ComparePage() {
                     if (!seenKeys.has(st.canonical)) { seenKeys.add(st.canonical); seen.push(st) }
                   })
                 })
-                if (seen.length === 0) return <p className="text-sm text-ow-faint p-4">No breakdown stats for these heroes.</p>
+                // (v1.2.0) A stat no slot's hero still has on its breakdown screen is
+                // RETIRED: labelled as such, and dropped entirely when no slot has a
+                // value for it in its filters (e.g. Whole Hog Kills in Season 5).
+                const slotHeroes = slots.map(s => s.hero).filter(Boolean)
+                const isRetired = (st: BreakdownStat) =>
+                  slotHeroes.every(h => !(HERO_BREAKDOWN_ORDER[h] || []).some(x => x.canonical === st.canonical)
+                    || !isCurrentKitStat(h, st.canonical))
+                const shown = seen.filter(st => !isRetired(st) || slots.some(s => s.breakdown?.[st.canonical]?.perGame != null))
+                if (shown.length === 0) return <p className="text-sm text-ow-faint p-4">No breakdown stats for these heroes.</p>
                 return (
                   <div className="overflow-x-auto">
                     <div className="grid gap-px bg-white/10"
@@ -589,10 +652,11 @@ export default function ComparePage() {
                           </span>
                         </div>
                       ))}
-                      {seen.map(st => (
+                      {shown.map(st => (
                         <div key={st.canonical} className="contents">
                           <div className="bg-ow-panel p-2.5 text-xs text-ow-muted font-display tracking-wide flex items-center">
                             {st.label}
+                            {isRetired(st) && <span className="ml-1.5 text-[10px] text-ow-faint normal-case">(retired)</span>}
                           </div>
                           {slots.map((s, i) => {
                             const v = s.breakdown?.[st.canonical]

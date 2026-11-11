@@ -9,7 +9,7 @@ import MultiSelect from '@/components/MultiSelect'
 import { matchQuery } from '@/lib/alpha'
 import { loadExclusionPrefs, isExcludedGame, EXCLUSION_COLS, type ExcludableRow } from '@/lib/leaver'
 import { defaultSeasonSelection } from '@/lib/season-util'
-import { HEROES, MAPS, GAME_MODE_CONFIG, type GameMode } from '@/data/reference'
+import { MAPS, GAME_MODE_CONFIG, heroRoleAt, type GameMode, type HeroRole } from '@/data/reference'
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 
 // ============================================================
@@ -35,7 +35,6 @@ const MIN_GAMES = 5
 const MIN_PCT_GAMES = 5
 const SINGLE_HERO_PCT = 95   // a "single-hero game" = played >= this % on the hero
 
-const HERO_ROLE = new Map<string, 'tank' | 'dps' | 'support'>(HEROES.map(h => [h.name, h.role]))
 const GAME_MODES = Object.keys(GAME_MODE_CONFIG) as GameMode[]
 const mapsForMode = (mode: GameMode) => MAPS.filter(m => m.mode === mode).map(m => m.name).sort()
 
@@ -61,7 +60,7 @@ function heroPortrait(name: string): string {
 
 // Row-level columns we read (mirrors the live views; NO is_alpha on the view).
 const MATCH_FACT_COLS =
-  'match_id, hero_name, match_format, game_mode, map, season_id, result, ' +
+  'match_id, hero_name, match_format, game_mode, map, season_id, played_at, result, ' +
   'percent_played, is_single_hero, game_length_seconds, ' +
   'user_elims, user_assists, user_deaths, damage_pct, healing_pct, mitigation_pct'
 const STAT_FACT_COLS =
@@ -75,6 +74,7 @@ interface MatchFactRow {
   game_mode: string | null
   map: string | null
   season_id: number | null
+  played_at: string | null
   result: 'victory' | 'defeat' | 'draw'
   percent_played: number | string | null
   is_single_hero: boolean | null
@@ -224,6 +224,11 @@ export default function AnalyticsHeroesPage() {
   // ---- aggregate per hero (games-weighted, one match counted once) ----
   interface HeroAgg {
     hero_name: string
+    /** (v1.2.0) Role in the hero's most recent game in scope — a hero's role
+     *  can change between seasons (Sombra: DPS -> support at Season 5). */
+    role: HeroRole | undefined
+    /** Every role the hero held across the games in scope, oldest first. */
+    roles: HeroRole[]
     games: number
     wins: number
     losses: number
@@ -254,8 +259,18 @@ export default function AnalyticsHeroesPage() {
       // single-hero rows for the % / E-A-D block
       const sh = rows.filter(r => r.is_single_hero === true ||
         (num(r.percent_played) != null && (num(r.percent_played) as number) >= SINGLE_HERO_PCT))
+      // Roles in date order. ISO played_at strings sort chronologically; a
+      // missing date falls back to the current role (heroRoleAt with no date).
+      const dated = [...rows].sort((a, b) => (a.played_at ?? '').localeCompare(b.played_at ?? ''))
+      const roles: HeroRole[] = []
+      for (const r of dated) {
+        const role = heroRoleAt(hero, r.played_at)
+        if (role && !roles.includes(role)) roles.push(role)
+      }
       out.push({
         hero_name: hero,
+        role: dated.length ? heroRoleAt(hero, dated[dated.length - 1].played_at) : heroRoleAt(hero),
+        roles,
         games: rows.length,
         wins, losses, draws,
         win_rate: (wins + losses) === 0 ? null : Math.round((1000 * wins) / (wins + losses)) / 10,
@@ -299,7 +314,7 @@ export default function AnalyticsHeroesPage() {
   }, [statRowsInScope])
 
   let heroes = heroAggs.filter(h => h.games >= MIN_GAMES)
-  if (roleTab !== 'all') heroes = heroes.filter(h => HERO_ROLE.get(h.hero_name) === roleTab)
+  if (roleTab !== 'all') heroes = heroes.filter(h => h.role === roleTab)
   // (v1.1.0 Phase 5) Sortable. Games remains the default.
   //
   // ⚠️ A null win rate means NO DECISIVE GAMES (all draws) — not a zero. Those
@@ -434,12 +449,15 @@ export default function AnalyticsHeroesPage() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 items-start">
           {heroes.map(h => {
-            const role = HERO_ROLE.get(h.hero_name)
+            const role = h.role
             const shg = h.single_hero_games || 0
             const showStats = shg > MIN_PCT_GAMES
             const isOpen = expanded === h.hero_name
             const bd = bdByHero.get(h.hero_name)
-            const roleStats = role ? ROLE_BREAKDOWN[role] : []
+            // (v1.2.0) Tiles for EVERY role held in scope, so a hero that changed
+            // role keeps its earlier tiles (Sombra's Final Blows / Solo Kills)
+            // when the filter reaches back before the change.
+            const roleStats = Array.from(new Set(h.roles.flatMap(r => ROLE_BREAKDOWN[r])))
 
             return (
               <div key={h.hero_name}

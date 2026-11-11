@@ -227,7 +227,7 @@ export default function SettingsPage() {
           <span className="text-xs text-ow-faint">{seasons.length} total</span>
         </div>
         <p className="text-xs text-ow-faint -mt-2">
-          Matches auto-assign to a season by their real played date. Ranges can't overlap.
+          Matches auto-assign to a season by their real played date. Ranges can’t overlap.
           New seasons are saved with question set <span className="text-ow-muted">Q{CURRENT_QUESTION_SCALE}</span>.
         </p>
 

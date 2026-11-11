@@ -16,6 +16,7 @@
 import { loadHeroBank, matchHero, scoreCropAgainstAllHeroes, resetOrbFailureCount, getOrbFailureCount } from '@/lib/hero-matcher'
 import { initOpenCV, getOpenCVHealth } from '@/lib/opencv-loader'
 import type { RoleType } from '@/lib/types'
+import { HEROES } from '@/data/reference'
 import type {
   ScoreboardGrid,
   ScoreboardGridRow,
@@ -42,32 +43,21 @@ export type {
   ScoreboardPlayerStats,
 }
 
-// Hero → Role lookup: every Overwatch hero has a fixed role.
-// Used to override icon-based role classification after hero identification.
-const HERO_ROLE_MAP: Record<string, RoleType> = {
-  // Tanks (15)
-  'D.Mon': 'tank', 'D.Va': 'tank', 'Doomfist': 'tank', 'Domina': 'tank',
-  'Hazard': 'tank', 'Junker Queen': 'tank', 'Mauga': 'tank', 'Orisa': 'tank',
-  'Ramattra': 'tank', 'Reinhardt': 'tank', 'Roadhog': 'tank', 'Sigma': 'tank',
-  'Winston': 'tank', 'Wrecking Ball': 'tank', 'Zarya': 'tank',
-  // DPS (24)
-  'Anran': 'dps', 'Ashe': 'dps', 'Bastion': 'dps', 'Cassidy': 'dps',
-  'Echo': 'dps', 'Emre': 'dps', 'Freja': 'dps', 'Genji': 'dps',
-  'Hanzo': 'dps', 'Junkrat': 'dps', 'Mei': 'dps', 'Pharah': 'dps',
-  'Reaper': 'dps', 'Shion': 'dps', 'Sierra': 'dps', 'Sojourn': 'dps',
-  'Soldier: 76': 'dps', 'Sombra': 'dps', 'Symmetra': 'dps', 'Torbjörn': 'dps',
-  'Tracer': 'dps', 'Vendetta': 'dps', 'Venture': 'dps', 'Widowmaker': 'dps',
-  // Support (14)
-  'Ana': 'support', 'Baptiste': 'support', 'Brigitte': 'support',
-  'Illari': 'support', 'Jetpack Cat': 'support', 'Juno': 'support',
-  'Kiriko': 'support', 'Lifeweaver': 'support', 'Lúcio': 'support',
-  'Mercy': 'support', 'Mizuki': 'support', 'Moira': 'support',
-  'Wuyang': 'support', 'Zenyatta': 'support',
-}
+// Hero → Role lookup, used to override icon-based role classification after
+// hero identification.
+//
+// (v1.2.0) Built from HEROES instead of hand-kept. It was a second copy of
+// every hero's role — a New-Season step of its own — and Sombra's move to
+// support would have needed both copies changed in step. Uses the CURRENT role:
+// extraction runs on fresh screenshots. /process re-derives every saved row's
+// role with heroRoleAt(hero, played_at), which covers a pre-change backlog.
+const HERO_ROLE_MAP: Record<string, RoleType> = Object.fromEntries(
+  HEROES.map(h => [h.name, h.role]),
+)
 
-/** Hero names present in the scoreboard HERO_ROLE_MAP above. Exported so the
- *  testing page's new-content readiness check can confirm a new hero was added
- *  here (one of the required New-Season steps). Read-only; do not mutate. */
+/** Hero names present in the scoreboard HERO_ROLE_MAP above. Exported for the
+ *  testing page's new-content readiness check. Since v1.2.0 the map is derived
+ *  from HEROES, so this is always in step with it. Read-only; do not mutate. */
 export const SCOREBOARD_ROLE_HERO_NAMES: string[] = Object.keys(HERO_ROLE_MAP)
 
 /** Override icon-detected roles with the identified hero's known role.
@@ -205,6 +195,12 @@ function getScoreboardColumns(format: '5v5' | '6v6' | null): ScoreboardGrid['col
 // tableLeft+46. Widening the window does NOT widen the classification scan; it
 // changes which pixels can set top/bottom/midY. Getting this backwards was a
 // real diagnostic error during v1.1.3 — see PATCH-SPEC-v1_1_3.md §1.2a.
+//
+// (v1.2.0) The paragraph above was NOT true until v1.2.0: the scan ended at
+// min(left+34, right+1), and `right` is capped by the window. On 5v5 the window
+// ends at x=1109 and the DPS glyph's third bar starts at ~1108, so the scan saw
+// it by 1–2px. HDR moved tableLeft 1070 -> 1069, the bar fell off the end, and
+// every DPS icon read as tank. The scan is now genuinely left .. left+34.
 
 // ── Format-specific pixel calibration ──
 // 5v5 and 6v6 scoreboards have different X positions for icons, portraits, and gamertags.
@@ -321,6 +317,22 @@ const TABLE_LEFT_BASELINE: Record<'5v5' | '6v6', number> = {
   '6v6': 1161,
 }
 
+/** Team blue for the table-edge scan only. isBlue() requires r < 40, which the
+ *  ally role-icon strip — the table's true left edge — fails under HDR:
+ *  SDR (1,186,250) passes, HDR (83,232,255) does not. The scan then anchored on
+ *  whatever blue pixel came next, landing 11–23px right (tableLeft 1081/1093 on
+ *  the Season 5 HDR boards), and every icon window and portrait crop moved with
+ *  it: DPS icons read as tank, wrong heroes. (v1.2.0)
+ *
+ *  The second clause accepts the bright HDR cyan without changing any SDR
+ *  pixel's answer: the SDR strip already passes isBlue, and the SDR anti-alias
+ *  edge (44,169,223) fails g > 200, so SDR boards keep their exact edges. The
+ *  purple HDR page background (~95,88,196) fails g > 200. Only ally rows are
+ *  scanned, so the red side needs no equivalent. */
+function isTableBlue(r: number, g: number, b: number): boolean {
+  return isBlue(r, g, b) || (g > 200 && b > 200 && b - r > 120)
+}
+
 /** Find the horizontal extent of the table on a given row: the first and last
  *  strongly team-coloured pixel. A large, high-contrast feature — far more
  *  robust than anchoring to the small role icon, whose own detection window is
@@ -337,7 +349,7 @@ export function detectTableEdges(
     let r = -1
     for (let x = 600; x < 3300; x++) {
       const [pr, pg, pb] = getPixel(px, w, x, y)
-      if (isBlue(pr, pg, pb) || isRed(pr, pg, pb)) {
+      if (isTableBlue(pr, pg, pb) || isRed(pr, pg, pb)) {
         if (l < 0) l = x
         r = x
       }
@@ -795,7 +807,20 @@ function countBrightFill(
   return total > 0 ? count / total : 0
 }
 
-/** Find the bounds of the role icon by scanning for bright pixels */
+/** Is this pixel part of a role-icon glyph? The glyph is WHITE, so test the
+ *  weakest channel rather than average brightness.
+ *
+ *  (v1.2.0) Average brightness failed under HDR: the ally icon strip is cyan
+ *  (0,183,246 → avg 143 SDR; 82,230,253 → avg 188 HDR), which crossed the old
+ *  avg>180 cut-off, so the whole strip read as glyph and the icon's top/bottom
+ *  (and midY) blew out to the ±30px search limits. Cyan and red both keep one
+ *  channel low (r ≤ 82 ally, g ≤ 55 enemy, either mode); the glyph is ≥ 200
+ *  on all three. */
+function isIconWhite(r: number, g: number, b: number, thr: number): boolean {
+  return Math.min(r, g, b) > thr
+}
+
+/** Find the bounds of the role icon by scanning for white pixels */
 function findIconBounds(
   px: Uint8ClampedArray,
   w: number,
@@ -809,7 +834,7 @@ function findIconBounds(
     let rowBright = 0
     for (let x = iconXStart; x <= iconXEnd; x++) {
       const [r, g, b] = getPixel(px, w, x, y)
-      if ((r + g + b) / 3 > 180) rowBright++
+      if (isIconWhite(r, g, b, 180)) rowBright++
     }
     if (rowBright > 2) brightRows.push(y)
   }
@@ -826,7 +851,7 @@ function findIconBounds(
   for (let y = top; y <= bottom; y++) {
     for (let x = iconXStart; x <= iconXEnd; x++) {
       const [r, g, b] = getPixel(px, w, x, y)
-      if ((r + g + b) / 3 > 180) {
+      if (isIconWhite(r, g, b, 180)) {
         if (x < left) left = x
         if (x > right) right = x
       }
@@ -847,9 +872,11 @@ function classifyRoleIcon(
   // buffer, so the detection window has no bearing on it. Its presence
   // implied otherwise and produced a wrong diagnosis during v1.1.3 — the
   // 27px window was blamed for clipping DPS glyphs it never touched.
+  // (v1.2.0) It did touch them, through iconBounds.right — see the note at the
+  // top of this file's role-icon section. The scan is no longer capped by it.
   const cx = iconBounds.midY
   const lx = iconBounds.left
-  const rx = Math.min(lx + 34, iconBounds.right + 1)
+  const rx = lx + 34
   const THR = 200 // higher threshold to avoid blue/red background noise
 
   // Feature 1: count rows with 3+ bright segments (DPS three-bar pattern)
@@ -864,7 +891,7 @@ function classifyRoleIcon(
 
     for (let x = lx; x < rx; x++) {
       const [r, g, b] = getPixel(px, w, x, y)
-      const isBright = (r + g + b) / 3 > THR
+      const isBright = isIconWhite(r, g, b, THR)
       if (isBright) {
         hasContent = true
         if (!inBright) segs++
@@ -889,13 +916,13 @@ function classifyRoleIcon(
 
   for (let x = lx; x < rx; x++) {
     const [r1, g1, b1] = getPixel(px, w, x, cx - 8)
-    if ((r1 + g1 + b1) / 3 > THR) upperCount++
+    if (isIconWhite(r1, g1, b1, THR)) upperCount++
 
     const [r2, g2, b2] = getPixel(px, w, x, cx)
-    if ((r2 + g2 + b2) / 3 > THR) midCount++
+    if (isIconWhite(r2, g2, b2, THR)) midCount++
 
     const [r3, g3, b3] = getPixel(px, w, x, cx - 12)
-    if ((r3 + g3 + b3) / 3 > THR) topCount++
+    if (isIconWhite(r3, g3, b3, THR)) topCount++
   }
 
   if (midCount === 0) return 'tank'
@@ -2219,4 +2246,152 @@ export async function extractStats(
   }
 
   return results
+}
+
+// ============================================================
+// TEAMS PAGE MEASUREMENT FOR SESSION GROUPING  (v1.2.0)
+// ------------------------------------------------------------
+// Bulk session upload has no wizard, so a Teams page must say for itself how
+// many players each side had and which row is the user's — WITHOUT the
+// equal-rows assumption detectScoreboard() makes. A permanent leaver's row is
+// DROPPED from the match-history board (confirmed by the user: sometimes down
+// to one enemy row, or none), so the two sides can differ.
+//
+// Rows are counted from ROLE ICONS: every player row has exactly one white
+// icon at the table's left edge, and each row's team is the colour of the row
+// itself at x=1800 (blue ally / red enemy). This works for any number of rows
+// on either side, including a side with none. Measured on the Season 5 boards:
+// icon centres every ~130px on 5v5 history boards; the header row's white
+// text sits above the first team row and is excluded by its colour.
+//
+// The user's row is the ally row with the LIGHTER fill (highlighted): its
+// E/A/D cell background is brighter than the other ally rows' (luma ~89 vs ~70
+// SDR, ~123 vs ~96 HDR).
+// ============================================================
+
+export interface TeamsPageMeasure {
+  /** Players listed per side. 0 when a side has no rows at all. */
+  allyRows: number
+  enemyRows: number
+  /** Icon-centre y of each row, top to bottom, with its team. */
+  rows: { team: 'ally' | 'enemy'; centerY: number }[]
+  /** Median spacing between consecutive same-team rows (px), or null. */
+  pitch: number | null
+  /** Index of the user's row among the ALLY rows, or null if not clear. */
+  userRowIndex: number | null
+  /** The user's row E / A / D, or null when the row wasn't found. */
+  userEad: { e: number | null; a: number | null; d: number | null } | null
+  tableLeft: number | null
+}
+
+/** Default row pitch when a side has a single row (5v5 history boards). */
+const TEAMS_DEFAULT_PITCH = 130
+
+export function measureTeamsPage(img: HTMLImageElement): TeamsPageMeasure {
+  const canvas = document.createElement('canvas')
+  canvas.width = img.naturalWidth
+  canvas.height = img.naturalHeight
+  const ctx = canvas.getContext('2d')!
+  ctx.drawImage(img, 0, 0)
+  const w = canvas.width
+  const h = canvas.height
+  const px = ctx.getImageData(0, 0, w, h).data
+
+  const PROBE_X = 1800
+  const teamAt = (y: number): 'ally' | 'enemy' | null => {
+    const [r, g, b] = getPixel(px, w, PROBE_X, y)
+    if (isTableBlue(r, g, b)) return 'ally'
+    if (isRed(r, g, b)) return 'enemy'
+    return null
+  }
+
+  // Table left edge, from the first ally-coloured y found down the probe column.
+  let firstAllyY: number | null = null
+  for (let y = 420; y < Math.min(h, 1400); y += 4) {
+    if (teamAt(y) === 'ally') { firstAllyY = y + 30; break }
+  }
+  const edges = firstAllyY != null ? detectTableEdges(px, w, [firstAllyY]) : null
+  const tableLeft = edges?.left ?? null
+  const iconX0 = (tableLeft ?? 1070) + 5
+  const iconX1 = (tableLeft ?? 1070) + 50
+
+  // Icon runs: rows with ≥3 white pixels in the icon window, ≥15px tall.
+  const centers: number[] = []
+  let runStart = -1
+  for (let y = 420; y < Math.min(h, 2150); y++) {
+    let n = 0
+    for (let x = iconX0; x <= iconX1; x++) {
+      const [r, g, b] = getPixel(px, w, x, y)
+      if (isIconWhite(r, g, b, 180)) n++
+    }
+    const on = n >= 3
+    if (on && runStart < 0) runStart = y
+    if (!on && runStart >= 0) {
+      if (y - runStart >= 15) centers.push(Math.round((runStart + y) / 2))
+      runStart = -1
+    }
+  }
+
+  const rows: { team: 'ally' | 'enemy'; centerY: number }[] = []
+  for (const cy of centers) {
+    const team = teamAt(cy)
+    if (team) rows.push({ team, centerY: cy })
+  }
+  const ally = rows.filter(r => r.team === 'ally')
+  const enemy = rows.filter(r => r.team === 'enemy')
+
+  const gaps: number[] = []
+  for (const side of [ally, enemy]) {
+    for (let i = 1; i < side.length; i++) gaps.push(side[i].centerY - side[i - 1].centerY)
+  }
+  gaps.sort((a, b) => a - b)
+  const pitch = gaps.length ? gaps[Math.floor(gaps.length / 2)] : null
+
+  // User row: the ally row with the brightest E/A/D cell background.
+  const lumaOf = (cy: number): number => {
+    const vals: number[] = []
+    for (let y = cy - 20; y <= cy + 30; y += 2) {
+      for (let x = SCOREBOARD_COLUMNS.E.startX; x <= SCOREBOARD_COLUMNS.D.endX; x += 3) {
+        const [r, g, b] = getPixel(px, w, x, y)
+        vals.push(0.299 * r + 0.587 * g + 0.114 * b)
+      }
+    }
+    vals.sort((a, b) => a - b)
+    return vals[Math.floor(vals.length * 0.3)]   // background, not the digits
+  }
+  let userRowIndex: number | null = null
+  if (ally.length === 1) {
+    userRowIndex = 0
+  } else if (ally.length > 1) {
+    const lumas = ally.map(r => lumaOf(r.centerY))
+    const order = lumas.map((l, i) => [l, i] as const).sort((a, b) => b[0] - a[0])
+    if (order[0][0] - order[1][0] >= 8) userRowIndex = order[0][1]
+  }
+
+  let userEad: TeamsPageMeasure['userEad'] = null
+  if (userRowIndex != null) {
+    const cy = ally[userRowIndex].centerY
+    const rowTop = Math.round(cy - (pitch ?? TEAMS_DEFAULT_PITCH) / 2)
+    const rowBottom = rowTop + (pitch ?? TEAMS_DEFAULT_PITCH)
+    const read = (col: { startX: number; endX: number }): number | null => {
+      const { value } = sbReadCellMultiThreshold(px, w, col.startX, col.endX, rowTop, rowBottom)
+      const n = parseInt(value.replace(/[^\d]/g, ''), 10)
+      return Number.isFinite(n) ? n : null
+    }
+    userEad = {
+      e: read(SCOREBOARD_COLUMNS.E),
+      a: read(SCOREBOARD_COLUMNS.A),
+      d: read(SCOREBOARD_COLUMNS.D),
+    }
+  }
+
+  return {
+    allyRows: ally.length,
+    enemyRows: enemy.length,
+    rows,
+    pitch,
+    userRowIndex,
+    userEad,
+    tableLeft,
+  }
 }

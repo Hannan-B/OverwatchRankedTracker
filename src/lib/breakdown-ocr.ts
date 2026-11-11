@@ -32,6 +32,7 @@
 
 import Tesseract from 'tesseract.js'
 import { HERO_STAT_LOOKUP } from '@/data/hero-stat-catalog'
+import { statFormat, normaliseStat } from '@/data/stat-meta'
 
 // ============================================================
 // CONSTANTS
@@ -45,6 +46,9 @@ const VZ_BOTTOM_GREEN = 175   // Value zone bottom for green bar tiles
 const THRESH = 120            // Binarization threshold (grayscale > 120 → white)
 const TILE_W = 964            // Tile width in pixels
 const MIN_BLOB_AREA = 10      // Minimum blob area to keep
+// "%" pieces are found by SHAPE, relative to the line's tallest blob — see smartSegment Pass 2.
+const PCT_CIRCLE_MAX_H = 0.75   // a "%" circle is at most this fraction of the line height
+const PCT_SLASH_MAX_FILL = 0.3  // a "%" slash fills at most this fraction of its bounding box
 const NORM_H = 64             // Normalized height for template matching
 
 // Hero info tile: scan the right portion for white text bands
@@ -455,17 +459,34 @@ function smartSegment(binary: Uint8Array, width: number, height: number): Segmen
   }
 
   // Pass 2: Merge percent signs (2-3 small blobs overlapping horizontally)
+  //
+  // (v1.2.0) "%" pieces are identified by SHAPE, not area. A "%" is two small
+  // circles plus a thin diagonal slash; a digit is full line height and fills
+  // ≥ ~0.4 of its box. Measured (HDR on):
+  //   stat tiles (line h46): circles h28–29, slash h46 fill 0.20; "1" fill 0.70
+  //   hero-info tile (h34):  circles h20,    slash h33 fill 0.21; "7" fill 0.43
+  // The area rule this replaces could not fit both fonts: at 400 the hero tile's
+  // "7" (346 px) was swallowed ("87%" → "8%", seen since the beta), and the
+  // 400 → 460 bump made for HDR stat tiles swallowed its "3" (438 px) too
+  // ("13%" → "1%"). A group must hold ≥2 pieces, at least one a circle.
+  // Line height from character-sized blobs only: a tile-edge bar (4px wide,
+  // 80px tall, seen on Roadhog's R2C3) would otherwise make every real
+  // character look "short".
+  const lineH = Math.max(1, ...raw.filter(b => b.width >= 8).map(b => b.height))
+  const isCircle = (b: RawBlob) => b.height <= PCT_CIRCLE_MAX_H * lineH
+  const isSlash = (b: RawBlob) => b.area / (b.width * b.height) <= PCT_SLASH_MAX_FILL
+  const isPctPiece = (b: RawBlob) => isCircle(b) || isSlash(b)
   let idx = 0
   while (idx < raw.length) {
     if (used.has(idx)) { idx++; continue }
     const b = raw[idx]
-    if (b.area < 400) {
+    if (isPctPiece(b)) {
       const grp: RawBlob[] = [b]
       const ids = new Set<number>([idx])
       for (let j = idx + 1; j < Math.min(idx + 5, raw.length); j++) {
         if (used.has(j)) continue
         const o = raw[j]
-        if (o.area < 400) {
+        if (isPctPiece(o)) {
           const gxmax = Math.max(...grp.map(g => g.x_max))
           if (o.x_min <= gxmax + 5) {
             grp.push(o)
@@ -473,10 +494,10 @@ function smartSegment(binary: Uint8Array, width: number, height: number): Segmen
           }
         }
       }
-      if (grp.length >= 2) {
+      if (grp.length >= 2 && grp.some(isCircle)) {
         const ta = grp.reduce((s, g) => s + g.area, 0)
         const tw = Math.max(...grp.map(g => g.x_max)) - Math.min(...grp.map(g => g.x_min))
-        if (ta > 600 && tw < 80) {
+        if (ta > 0.25 * lineH * lineH && tw < 80) {
           result.push(makeSeg(grp, 'percent'))
           for (const id of ids) used.add(id)
           idx = Math.max(...ids) + 1
@@ -1187,6 +1208,21 @@ const TO_PLURAL: Record<string, string> = {
   KILL: 'KILLS', BLOW: 'BLOWS', HIT: 'HITS', ASSIST: 'ASSISTS',
 }
 
+/** (v1.2.0) Whole-phrase singular/plural pairs for count nouns the two general
+ *  rules can't reach: the noun is neither the trailing head noun nor one of the
+ *  leading ENEMY/PLAYER subjects, and NEGATED is a non-count tail. The game
+ *  shows the singular at exactly 1 ("1 HEALTH PACK HACKED", "1 ULTIMATE
+ *  NEGATED"), so the stored name follows it — and STAT_NORMALISE /
+ *  hero_stats_normalised fold both forms to the plural. */
+const PHRASE_FORMS: [singular: string, plural: string][] = [
+  ['HEALTH PACK HACKED', 'HEALTH PACKS HACKED'],  // Sombra (Season 5 kit)
+  ['ULTIMATE NEGATED', 'ULTIMATES NEGATED'],      // Roadhog (Season 5), Sigma and others
+  ['ULTIMATE REFLECTED', 'ULTIMATES REFLECTED'],  // Genji — same game wording as Negated
+]
+/** Matching-only folds for the nouns in PHRASE_FORMS, so a singular label on
+ *  screen matches the plural catalog name by its normalised word sequence. */
+const MATCH_SINGULAR: Record<string, string> = { PACKS: 'PACK', ULTIMATES: 'ULTIMATE' }
+
 /**
  * Return the count-correct display form of a (catalog) stat name given the
  * tile's extracted value. Singular when the value is exactly 1, plural
@@ -1199,6 +1235,10 @@ function applyCountGrammar(statName: string, statValue: string): string {
   // guard anyway: treat unparseable as plural (the safer default form).
   const numeric = parseInt(statValue.replace(/[^\d-]/g, ''), 10)
   const isOne = numeric === 1
+
+  for (const [one, many] of PHRASE_FORMS) {
+    if (statName === one || statName === many) return isOne ? one : many
+  }
 
   const words = statName.split(/\s+/)
   if (words.length === 0) return statName
@@ -1225,6 +1265,7 @@ function applyCountGrammar(statName: string, statValue: string): string {
 function normalizePluralWord(word: string): string {
   const w = word.toUpperCase().replace(/[^A-Z0-9]/g, '')
   if (TO_SINGULAR[w]) return TO_SINGULAR[w]
+  if (MATCH_SINGULAR[w]) return MATCH_SINGULAR[w]
   return w
 }
 
@@ -1447,6 +1488,28 @@ export async function ocrBreakdownPage(
     console.log(`[breakdown-ocr] Tile ${i} R${row + 1}C${col + 1} (catalogIndex=${catalogIndex}): "${matchedLabel || 'UNKNOWN'}" = ${value} (conf=${confidence.toFixed(3)})${green ? ' [GREEN BAR]' : ''}`)
   }
 
+  // ── (v1.2.0) Resolve label-failed tiles by ELIMINATION ──────────────────
+  // The positional fallback above assumes the catalog's tile order, but the
+  // game reorders tiles — "NEW CAREER BEST!" tiles move to the front (seen on
+  // Orisa, 6v6, 10 Nov 2026: PLAYERS PROTECTED, value 22, landed in R3C1 with
+  // its label unread and its catalog slot already taken → UNKNOWN_TILE_R3C1).
+  // When every other label read, the stat that's left IS that tile's. Assign it
+  // only when exactly one unclaimed expected stat fits the value's format
+  // (% → percent, m:ss → time, else number); anything less certain stays
+  // UNKNOWN so it's visible rather than guessed.
+  const valueFormat = (v: string) => (v.includes('%') ? 'percent' : v.includes(':') ? 'time' : 'number')
+  const claimed = new Set(result.stats.filter(s => !s.statName.startsWith('UNKNOWN')).map(s => normaliseStat(s.statName)))
+  const unclaimed = expectedStats.filter(name => !claimed.has(normaliseStat(name)))
+  const unknown = result.stats.filter(s => s.statName.startsWith('UNKNOWN'))
+  for (const tile of unknown) {
+    const fits = unclaimed.filter(name => statFormat(normaliseStat(name)) === valueFormat(tile.statValue))
+    if (fits.length !== 1) continue
+    const name = fits[0]
+    console.log(`[breakdown-ocr] ${tile.statName} = ${tile.statValue} → ${name} (only unclaimed ${valueFormat(tile.statValue)} stat)`)
+    tile.statName = applyCountGrammar(name, tile.statValue)
+    unclaimed.splice(unclaimed.indexOf(name), 1)
+  }
+
   result.foundStatCount = result.stats.filter(s => !s.statName.startsWith('UNKNOWN')).length
 
   return result
@@ -1515,6 +1578,44 @@ export function getBreakdownPortraitLocation(
       h: PORTRAIT_ART_HALF * 2,
     },
   }
+}
+
+// ============================================================
+// HERO-INFO TILE READS FOR SESSION GROUPING (v1.2.0)
+// ------------------------------------------------------------
+// The Summary page's three hero slots use the SAME tile layout as the
+// Personal page's R1C1 hero tile — measured: the "100%" and play-time lines
+// sit at identical offsets from the portrait centre on both pages. So the
+// proven hero-info reader can read either, given the tile's top-left corner:
+//   Personal page: (col_starts[0], ROW_TOPS[0])            — variant-aware
+//   Summary slot s: portrait centre (355, 720 + 480·s) minus the R1C1
+//                   portrait offset (169, 234) → (186, 486 + 480·s)
+// ============================================================
+
+/** Top-left of the Personal page's hero-info tile (R1C1). */
+export function getBreakdownHeroTileOrigin(img: HTMLImageElement): { x: number; y: number } {
+  const canvas = imageToCanvas(img)
+  const { data, width, height } = getPixelArray(canvas)
+  const variant = detectVariant(data, width, height)
+  return { x: VARIANTS[variant].col_starts[0], y: ROW_TOPS[0] }
+}
+
+/** Top-left of the Summary page's hero slot `slot` (0-2). */
+export function summaryHeroTileOrigin(slot: number): { x: number; y: number } {
+  return { x: 355 - R1C1_PORTRAIT_DX, y: 720 + 480 * slot - (R1C1_PORTRAIT_CY - ROW_TOPS[0]) }
+}
+
+/** % played and play time from one or more hero-info tiles on an image.
+ *  Decodes the image once for all tiles. */
+export async function readHeroTiles(
+  img: HTMLImageElement,
+  origins: { x: number; y: number }[],
+): Promise<{ percentPlayed: number | null; playTimeSeconds: number | null }[]> {
+  const canvas = imageToCanvas(img)
+  const { data, width } = getPixelArray(canvas)
+  const out: { percentPlayed: number | null; playTimeSeconds: number | null }[] = []
+  for (const o of origins) out.push(await extractHeroInfoValues(canvas, data, width, o.x, o.y))
+  return out
 }
 
 // ============================================================

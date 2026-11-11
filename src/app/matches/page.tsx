@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
 import { supabase } from '@/lib/supabase'
 import Select from '@/components/Select'
 import { useRouter } from 'next/navigation'
-import { HEROES } from '@/data/reference'
+import { heroRoleAt } from '@/data/reference'
 import { matchQuery } from '@/lib/alpha'
 
 // ============================================================
@@ -13,7 +13,7 @@ import { matchQuery } from '@/lib/alpha'
 //   • Role = Tank/DPS/Support → Hero dropdown shows THAT role's heroes directly
 //     (no extra role step)
 //   • Role = 6v6 or All → an extra "Role" dropdown appears first, then Hero
-// - Heroes bucketed by their REAL role from reference.ts (HERO_ROLE map),
+// - Heroes bucketed by their REAL role in that match (heroRoleAt, reference.ts),
 //   NEVER by the match's role_played (that was the old broken logic)
 // - Legible rows: LEFT role · map · mode · score | RIGHT relative time
 // - No E/A/D or stars on the row; higher-contrast text
@@ -25,10 +25,6 @@ type HeroRole = '' | 'tank' | 'dps' | 'support'
 const PAGE = 20
 const STATE_KEY = 'matchHistory:listState'
 
-// Real hero → role, from reference data. Source of truth for bucketing heroes.
-const HERO_ROLE = new Map<string, 'tank' | 'dps' | 'support'>(
-  HEROES.map(h => [h.name, h.role])
-)
 
 interface Row {
   id: number
@@ -271,11 +267,11 @@ export default function MatchHistoryPage() {
   const effectiveHeroRole: HeroRole = showHeroRoleDropdown ? heroRole : roleFilter
 
   // Hero options: every hero that appears in the role-filtered matches, bucketed by
-  // the hero's REAL role (HERO_ROLE), then narrowed to the effective hero-role.
+  // the hero's REAL role in THAT match (heroRoleAt — v1.2.0, roles can change
+  // between seasons), then narrowed to the effective hero-role.
   const heroOptions = Array.from(new Set(
-    roleFiltered
-      .flatMap(r => r.heroes_played || [])
-      .filter(h => !effectiveHeroRole || HERO_ROLE.get(h) === effectiveHeroRole)
+    roleFiltered.flatMap(r => (r.heroes_played || [])
+      .filter(h => !effectiveHeroRole || heroRoleAt(h, r.played_at) === effectiveHeroRole))
   )).sort()
 
   const filtered = heroFilter

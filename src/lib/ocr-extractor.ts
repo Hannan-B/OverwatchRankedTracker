@@ -197,6 +197,20 @@ async function ocrRegion(
   region: Region,
   scale: number = 3
 ): Promise<string> {
+  return ocrImageRegion(img, region, scale)
+}
+
+/** (v1.2.0) Exported crop-and-OCR for session grouping (Personal page sidebar).
+ *  `region` is at reference resolution (3840×2160); it is scaled to the image.
+ *  Shares this module's Tesseract worker — call terminateOcr() when done. */
+export async function ocrImageRegion(
+  img: HTMLImageElement,
+  region: { x: number; y: number; w: number; h: number },
+  scale: number = 3,
+  /** White text on a coloured background (e.g. the highlighted sidebar button,
+   *  white on bright blue): recolour to black-on-white before OCR. */
+  whiteText: boolean = false,
+): Promise<string> {
   const r = scaleRegion(region, img.naturalWidth, img.naturalHeight)
 
   const cropCanvas = document.createElement('canvas')
@@ -212,6 +226,16 @@ async function ocrRegion(
   const scaledCtx = scaledCanvas.getContext('2d')!
   scaledCtx.imageSmoothingEnabled = true
   scaledCtx.drawImage(cropCanvas, 0, 0, scaledCanvas.width, scaledCanvas.height)
+
+  if (whiteText) {
+    const id = scaledCtx.getImageData(0, 0, scaledCanvas.width, scaledCanvas.height)
+    const d = id.data
+    for (let i = 0; i < d.length; i += 4) {
+      const v = Math.min(d[i], d[i + 1], d[i + 2]) > 170 ? 0 : 255
+      d[i] = d[i + 1] = d[i + 2] = v
+    }
+    scaledCtx.putImageData(id, 0, 0)
+  }
 
   const ocr = await getWorker()
   const result = await ocr.recognize(scaledCanvas)
@@ -558,6 +582,8 @@ export function findMapName(upperText: string): string | null {
     'SURAVASA': 'Suravasa',
     'AATLIS': 'Aatlis',
     'DORADO': 'Dorado',
+    'GRIMSV': 'Grímsvötn',
+    'GRÍMSV': 'Grímsvötn',
     'HAVANA': 'Havana',
     'RIALTO': 'Rialto',
     'ROUTE 66': 'Route 66',

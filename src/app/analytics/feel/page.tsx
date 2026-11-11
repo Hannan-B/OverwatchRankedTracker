@@ -17,7 +17,7 @@ import AnalyticsFilters, {
 import { AnalyticsNav, AnalyticsHeader } from '@/components/AnalyticsNav'
 import { useChartColors } from '@/components/useChartColors'
 import { type ChartColors } from '@/lib/chart-theme'
-import { HEROES } from '@/data/reference'
+import { heroRoleAt } from '@/data/reference'
 import {
   winRateByEnum, funDistribution, avgFunByResult, funByResult,
   allFlagOutcomes, teamVsEnemyByEnum, feelVsStats,
@@ -78,6 +78,8 @@ function teamEnemy(c: ChartColors): { team: string; enemy: string } {
 // after a change to either interface.
 interface FeelMatchRow extends FilterableMatch, FeelMatch {
   season_id: number | null
+  /** (v1.2.0) For heroRoleAt — a hero's role is the role on the match date. */
+  played_at: string | null
   team_leaver: boolean | null
   enemy_leaver: boolean | null
   team_leaver_type: LeaverType | null
@@ -87,7 +89,7 @@ interface FeelMatchRow extends FilterableMatch, FeelMatch {
 }
 
 const MATCH_COLS =
-  'id, season_id, result, role_played, match_format, game_mode, map, ' +
+  'id, season_id, played_at, result, role_played, match_format, game_mode, map, ' +
   'fun_rating, match_feel, performance_feel, tilt_mood, ' +
   'team_tempo, enemy_tempo, team_coordination, enemy_coordination, ' +
   'matchup_feel, performance_rating, fun_rating_6, ' +
@@ -97,7 +99,6 @@ const MATCH_COLS =
 // hero-grain rows for feel-vs-reality (share %s + hero→role) and the hero filter.
 const HERO_COLS = 'match_id, hero_name, damage_pct, healing_pct, mitigation_pct'
 
-const HERO_ROLE = new Map<string, Role>(HEROES.map(h => [h.name, h.role as Role]))
 const LABELS_RESULT: Record<string, string> = { all: 'All', victory: 'Victory', defeat: 'Defeat', draw: 'Draw' }
 
 // Palette-driven chart style builders (call with the live ChartColors).
@@ -461,7 +462,7 @@ export default function FeelPage() {
         // The version-appropriate performance answer. visibleIds is already
         // scale-scoped, so this cannot pick up the other version's column.
         perfKey: isV2 ? match.performance_rating : match.performance_feel,
-        role: HERO_ROLE.get(h.hero_name) ?? null,
+        role: (heroRoleAt(h.hero_name, match.played_at) as Role | undefined) ?? null,
         damage_pct: num(h.damage_pct),
         healing_pct: num(h.healing_pct),
         mitigation_pct: num(h.mitigation_pct),

@@ -577,21 +577,20 @@ export function overallWinRate(matches: MatchRow[]): number | null {
 }
 
 // ============================================================
-// HERO → ROLE MAP (for 6v6 role filtering).
+// HERO → ROLE LOOKUP (for 6v6 role filtering).
 // In 6v6 a match has multiple roles, so role_played (single) can't filter within
-// a game. We map each hero the user played to its role via the static roster.
-// The caller injects the roster (from @/data/reference) so the lib stays pure.
+// a game. We map each hero the user played to its role IN THAT MATCH — a hero's
+// role can change between seasons (v1.2.0: Sombra, DPS -> support at Season 5).
+// The caller injects the lookup (heroRoleAt from @/data/reference) so the lib
+// stays pure.
 // ============================================================
-export type HeroRoleMap = Map<string, Role>
-export function buildHeroRoleMap(heroes: { name: string; role: Role }[]): HeroRoleMap {
-  return new Map(heroes.map(h => [h.name, h.role]))
-}
+export type HeroRoleLookup = (hero: string, playedAt: string | null) => Role | undefined
 // The role the user played in a fact row, via its hero (scoreboard_hero if set,
-// else hero_name). Null when unknown.
-export function rowUserRole(r: CombatFactRow, heroRole: HeroRoleMap): Role | null {
+// else hero_name) on the row's played_at. Null when unknown.
+export function rowUserRole(r: CombatFactRow, heroRole: HeroRoleLookup): Role | null {
   const hero = r.scoreboard_hero ?? r.hero_name
   if (hero == null) return null
-  return heroRole.get(hero) ?? null
+  return heroRole(hero, r.played_at) ?? null
 }
 
 // ============================================================
@@ -858,7 +857,7 @@ export function finalBlowRatesByHero(rows: CombatFactRow[], minGames: number = M
 // set. Empty set = no filter (all rows). Used by the page's 6v6 local control so
 // 6v6 can show the same per-role breakdown as the 5v5 queue.
 // ============================================================
-export function filterBySixRoles(rows: CombatFactRow[], roles: Set<Role>, heroRole: HeroRoleMap): CombatFactRow[] {
+export function filterBySixRoles(rows: CombatFactRow[], roles: Set<Role>, heroRole: HeroRoleLookup): CombatFactRow[] {
   if (roles.size === 0) return rows
   return rows.filter(r => {
     const role = rowUserRole(r, heroRole)

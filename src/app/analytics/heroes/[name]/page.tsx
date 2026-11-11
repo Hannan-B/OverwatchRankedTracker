@@ -8,7 +8,9 @@ import Select from '@/components/Select'
 import MultiSelect from '@/components/MultiSelect'
 import { matchQuery } from '@/lib/alpha'
 import { loadExclusionPrefs, isExcludedGame, EXCLUSION_COLS, type ExcludableRow } from '@/lib/leaver'
-import { HEROES, MAPS, GAME_MODE_CONFIG, type GameMode } from '@/data/reference'
+import { MAPS, GAME_MODE_CONFIG, heroRoleAt, heroRoleEras, type GameMode, type HeroRole } from '@/data/reference'
+import { isCurrentKitStat } from '@/data/hero-stat-catalog'
+import { defaultSeasonSelection } from '@/lib/season-util'
 import { normaliseStat, formatStatValue, HERO_BREAKDOWN_ORDER, type BreakdownStat } from '@/data/stat-meta'
 
 // ============================================================
@@ -16,15 +18,20 @@ import { normaliseStat, formatStatValue, HERO_BREAKDOWN_ORDER, type BreakdownSta
 // - Role-specific stats at the TOP (most important).
 // - Then the hero's FULL breakdown stat set (USER-ordered, from stat-meta), per-game and
 //   per-10-min (per-10-min only for stats flagged hasPer10 in the ordered list).
-// - Cascading map/mode/side filters affect everything.
+// - Cascading season/map/mode/side filters affect everything. Season defaults to
+//   the current season, like every other analytics surface (v1.2.0).
+// - (v1.2.0) A hero's kit and role can change between seasons. Role stats follow
+//   the role(s) the hero held in the games in view; breakdown stats no longer on
+//   the hero's screen are listed separately as RETIRED, and every stat line
+//   carries its own game count because current and retired stats come from
+//   different games.
 // - Last 5 games with this hero.
 // - Reads hero_stat_facts (full breakdown) + hero_match_facts (games/W-L/EAD/%).
 // (Moved from /heroes/[name]; only the back-link path changed.)
 // ============================================================
 
 type Format = '5v5' | '6v6'
-type Role = 'tank' | 'dps' | 'support'
-const HERO_ROLE = new Map<string, Role>(HEROES.map(h => [h.name, h.role]))
+type Role = HeroRole
 const GAME_MODES = Object.keys(GAME_MODE_CONFIG) as GameMode[]
 const mapsForMode = (mode: GameMode) => MAPS.filter(m => m.mode === mode).map(m => m.name).sort()
 const modeHasSide = (mode: GameMode | '') => mode !== '' && GAME_MODE_CONFIG[mode].needsStartingSide
@@ -92,10 +99,19 @@ interface MatchFact {
 }
 // (v1.1.0 Phase 2) mode/map became arrays. `format` stays scalar (5v5 and 6v6 never
 // mix) and so does `side` (attack/defense is a binary choice, not a set).
-interface Filters { format: Format; modes: GameMode[]; maps: string[]; side: 'attack' | 'defense' | ''; playtimePct: number }
+// (v1.2.0) `seasons`: [] = All Time, else exactly these season ids (same rule as
+// the Heroes list).
+interface Filters { format: Format; seasons: number[]; modes: GameMode[]; maps: string[]; side: 'attack' | 'defense' | ''; playtimePct: number }
+interface SeasonRow { id: number; name: string; start_date: string; end_date: string }
 // Playtime-% options for the single-hero stat block (default 95; can loosen to 90).
 const PLAYTIME_PCT_OPTIONS = [95, 90] as const
-const emptyFilters: Filters = { format: '5v5', modes: [], maps: [], side: '', playtimePct: 95 }
+const emptyFilters: Filters = { format: '5v5', seasons: [], modes: [], maps: [], side: '', playtimePct: 95 }
+
+const ROLE_NAME: Record<Role, string> = { tank: 'Tank', dps: 'DPS', support: 'Support' }
+/** "6 Oct 2026" from a YYYY-MM-DD era boundary. */
+function eraDate(day: string): string {
+  return new Date(day + 'T00:00:00Z').toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })
+}
 
 const selectCls =
   'bg-ow-dark border border-ow-line rounded-lg px-3 py-2 text-sm text-ow-fg font-display tracking-wider focus:border-ow-orange focus:outline-none [color-scheme:dark]'
@@ -116,9 +132,12 @@ function titleCase(s: string): string {
 export default function HeroDetailPage() {
   const params = useParams()
   const heroName = decodeURIComponent(String(params?.name || ''))
-  const role = HERO_ROLE.get(heroName)
 
   const [filters, setFilters] = useState<Filters>(emptyFilters)
+  const [seasons, setSeasons] = useState<SeasonRow[]>([])
+  // The fact queries wait for this, so the page never flashes All Time before
+  // the current-season default lands.
+  const [seasonsReady, setSeasonsReady] = useState(false)
   const [statFacts, setStatFacts] = useState<StatFact[]>([])
   const [matchFacts, setMatchFacts] = useState<MatchFact[]>([])
   const [loading, setLoading] = useState(true)
@@ -129,6 +148,8 @@ export default function HeroDetailPage() {
 
   const buildQuery = useCallback((table: string, f: Filters) => {
     let q = supabase.from(table).select('*').eq('hero_name', heroName).eq('match_format', f.format)
+    // [] = All Time = no clause. A null-season row (alpha) only shows under All Time.
+    if (f.seasons.length > 0) q = q.in('season_id', f.seasons)
     // (v1.1.0 Phase 2) .eq() → .in() for the multi-select fields. This page filters
     // in SQL rather than in JS, so it is the one surface where the array shape has
     // to reach the query builder. [] = no clause at all, i.e. no filter.
@@ -161,7 +182,24 @@ export default function HeroDetailPage() {
     return () => { cancelled = true }
   }, [])
 
+  // Seasons once; default the filter to the current season (else All Time).
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const { data } = await supabase
+        .from('seasons').select('id, name, start_date, end_date')
+        .order('start_date', { ascending: false })
+      if (cancelled) return
+      const list = (data as SeasonRow[] | null) || []
+      setSeasons(list)
+      setFilters(f => ({ ...f, seasons: defaultSeasonSelection(list) }))
+      setSeasonsReady(true)
+    })()
+    return () => { cancelled = true }
+  }, [])
+
   const load = useCallback(async () => {
+    if (!seasonsReady) return
     setLoading(true)
     const [{ data: sf }, { data: mf }] = await Promise.all([
       buildQuery('hero_stat_facts', filters),
@@ -170,7 +208,7 @@ export default function HeroDetailPage() {
     setStatFacts((sf as StatFact[] | null) || [])
     setMatchFacts((mf as MatchFact[] | null) || [])
     setLoading(false)
-  }, [buildQuery, filters])
+  }, [buildQuery, filters, seasonsReady])
 
   useEffect(() => { load() }, [load])
 
@@ -217,18 +255,39 @@ export default function HeroDetailPage() {
 
   const last5 = visibleMatchFacts.slice(0, 5)
 
-  // role-specific stats (top), drawn from statAgg
-  const roleStats = role ? ROLE_STAT[role] : []
+  // (v1.2.0) Role as of the most recent game in view (facts arrive newest first),
+  // else the current role. `rolesHeld` = every role the hero had across the
+  // games in view, oldest first — Sombra over All Time is DPS then support.
+  const role: Role | undefined = heroRoleAt(heroName, visibleMatchFacts[0]?.played_at ?? null)
+  const rolesHeld: Role[] = []
+  for (const m of [...visibleMatchFacts].reverse()) {
+    const r = heroRoleAt(heroName, m.played_at)
+    if (r && !rolesHeld.includes(r)) rolesHeld.push(r)
+  }
+  const eras = heroRoleEras(heroName)
+  const formerly = eras.length > 1
+    ? eras.slice(0, -1).map(e => `${ROLE_NAME[e.role]} until ${eraDate(e.until as string)}`).join(', ')
+    : null
+
+  // role-specific stats (top), drawn from statAgg — one block per role held
+  const roleStatGroups = rolesHeld.map(r => ({ role: r, stats: ROLE_STAT[r] }))
+  const roleStats = rolesHeld.flatMap(r => ROLE_STAT[r])
   // full breakdown set in the USER's specified order (from stat-meta), excluding
   // any role stats (those are pinned on top). Falls back to empty if hero absent.
+  // Split into the hero's CURRENT kit and RETIRED stats (no longer on its screen);
+  // a retired stat only shows when the games in view actually hold a value for it.
   const orderedBreakdown: BreakdownStat[] = (HERO_BREAKDOWN_ORDER[heroName] || [])
     .filter(s => !roleStats.includes(s.canonical))
+  const currentBreakdown = orderedBreakdown.filter(s => isCurrentKitStat(heroName, s.canonical))
+  const retiredBreakdown = orderedBreakdown.filter(s =>
+    !isCurrentKitStat(heroName, s.canonical) && (statAgg.get(s.canonical)?.n ?? 0) > 0)
 
   // Column header row for the two-column stat layout (per-game / per-10-min).
   function StatHeader() {
     return (
-      <div className="grid grid-cols-[1.6fr_1fr_1fr] gap-2 text-[10px] text-ow-faint font-display tracking-wider uppercase pb-1 border-b border-ow-line">
+      <div className="grid grid-cols-[1.6fr_0.6fr_1fr_1fr] gap-2 text-[10px] text-ow-faint font-display tracking-wider uppercase pb-1 border-b border-ow-line">
         <span>Stat</span>
+        <span className="text-right">Games</span>
         <span className="text-right">Per Game</span>
         <span className="text-right">Per 10 Min</span>
       </div>
@@ -245,8 +304,9 @@ export default function HeroDetailPage() {
     const showPer10 = stat ? stat.hasPer10 : !!hasPer10
     const a = statAgg.get(canon) || statAgg.get((name || '').toUpperCase())
     return (
-      <div className="grid grid-cols-[1.6fr_1fr_1fr] gap-2 text-sm py-1.5 border-b border-ow-line">
+      <div className="grid grid-cols-[1.6fr_0.6fr_1fr_1fr] gap-2 text-sm py-1.5 border-b border-ow-line">
         <span className="text-ow-muted font-display tracking-wide">{titleCase(label)}</span>
+        <span className="text-ow-faint font-display text-right">{a?.n ?? 0}</span>
         <span className="text-ow-fg font-display text-right">{formatStatValue(canon, a?.perGame ?? null)}</span>
         <span className="text-ow-muted font-display text-right">{showPer10 ? formatStatValue(canon, a?.per10 ?? null) : '—'}</span>
       </div>
@@ -268,11 +328,22 @@ export default function HeroDetailPage() {
           <p className="text-sm text-ow-muted mt-0.5">
             {role ? role.toUpperCase() : ''} · {games} games · {winRate == null ? '—' : `${winRate}% WR`}
           </p>
+          {formerly && <p className="text-[11px] text-ow-faint">Formerly {formerly}</p>}
         </div>
       </div>
 
       {/* filters */}
       <div className="flex flex-wrap gap-3">
+        <div className="flex flex-col gap-1"><span className={labelCls}>Season</span>
+          <MultiSelect<number>
+            className={selectCls}
+            value={filters.seasons}
+            onChange={sel => setFilters({ ...filters, seasons: sel })}
+            options={seasons.map(se => ({ value: se.id, label: se.name }))}
+            allLabel="All Time"
+            noun="seasons"
+            aria-label="Season"
+          /></div>
         <label className="flex flex-col gap-1"><span className={labelCls}>Format</span>
           <Select<Format>
             className={selectCls}
@@ -352,27 +423,42 @@ export default function HeroDetailPage() {
         </div>
       ) : (
         <>
-          {/* ROLE-SPECIFIC STATS — top */}
-          {roleStats.length > 0 && (
-            <div className="bg-ow-panel rounded-lg p-4 border border-ow-orange/30">
-              <h2 className="font-display text-ow-orange text-sm tracking-wider uppercase mb-2">Role stats</h2>
+          {/* ROLE-SPECIFIC STATS — top. One block per role held in the games in
+              view (v1.2.0); a single role keeps the original "Role stats" title. */}
+          {roleStatGroups.map(g => (
+            <div key={g.role} className="bg-ow-panel rounded-lg p-4 border border-ow-orange/30">
+              <h2 className="font-display text-ow-orange text-sm tracking-wider uppercase mb-2">
+                {roleStatGroups.length > 1 ? `${ROLE_NAME[g.role]} role stats` : 'Role stats'}
+              </h2>
               <StatHeader />
-              {roleStats.map(s => <StatLine key={s} name={s} hasPer10 />)}
+              {g.stats.map(s => <StatLine key={s} name={s} hasPer10 />)}
             </div>
-          )}
+          ))}
 
           {/* FULL BREAKDOWN SET — user-specified order */}
           <div className="bg-ow-panel rounded-lg p-4 border border-ow-line">
             <h2 className="font-display text-ow-fg text-sm tracking-wider uppercase mb-2">Hero breakdown stats</h2>
-            {orderedBreakdown.length === 0 ? (
+            {currentBreakdown.length === 0 ? (
               <p className="text-sm text-ow-faint">No breakdown stats configured for this hero.</p>
             ) : (
               <div>
                 <StatHeader />
-                {orderedBreakdown.map(s => <StatLine key={s.canonical} stat={s} />)}
+                {currentBreakdown.map(s => <StatLine key={s.canonical} stat={s} />)}
               </div>
             )}
           </div>
+
+          {/* RETIRED STATS — no longer on the hero's breakdown screen (a rework, or
+              a tile dropped to make room for a role tile), shown only when the
+              games in view hold values for them. */}
+          {retiredBreakdown.length > 0 && (
+            <div className="bg-ow-panel rounded-lg p-4 border border-ow-line">
+              <h2 className="font-display text-ow-muted text-sm tracking-wider uppercase mb-1">Retired stats</h2>
+              <p className="text-[11px] text-ow-faint mb-2">No longer on {heroName}&apos;s breakdown screen; from earlier games only.</p>
+              <StatHeader />
+              {retiredBreakdown.map(s => <StatLine key={s.canonical} stat={s} />)}
+            </div>
+          )}
 
           {/* LAST 5 GAMES */}
           <div className="bg-ow-panel rounded-lg p-4 border border-ow-line">
@@ -426,7 +512,7 @@ export default function HeroDetailPage() {
           </div>
 
           <p className="text-[11px] text-ow-faint">
-            Per-game uses all games where you played {heroName} ≥1 min. “/10min” shown for stats that have a per-10-min figure.
+            Per-game uses all games where you played {heroName} ≥1 min that recorded the stat — the Games column — so stats added or retired by a rework average over different games. “/10min” shown for stats that have a per-10-min figure.
             Performance %s use only ≥{filters.playtimePct}%-played games. For side-by-side splits, use the <Link href="/compare" className="text-ow-orange hover:underline">Compare</Link> page.
           </p>
         </>

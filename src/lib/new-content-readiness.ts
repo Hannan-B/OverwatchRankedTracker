@@ -17,7 +17,7 @@
 //
 // What it CANNOT check from the browser (DB-side), so it flags as
 // "verify in Supabase" and generates SQL instead:
-//   - hero in hero_role_ref view (roles for Matchups)
+//   - hero in hero_role_ref + hero_role_history views (roles for Matchups)
 //   - new stat in hero_stats_normalised view
 //
 // Note on the scoreboard HERO_ROLE_MAP (scoreboard-extractor.ts): that
@@ -247,20 +247,42 @@ export function computeMatchReadiness(
 // editor. (Roles come from HEROES; the user only had to add the hero there.)
 
 /**
- * Full `create or replace view hero_role_ref` built from the current HEROES
- * list. Because HEROES already contains the new hero (the user added it in
- * reference.ts as step 1), this snippet includes it automatically.
+ * Full `create or replace view` for BOTH hero-role views, built from the
+ * current HEROES list. Because HEROES already contains the new hero (the user
+ * added it in reference.ts as step 1), this snippet includes it automatically.
+ *
+ * (v1.2.0) Two views, both regenerated in full:
+ *   • hero_role_ref     — one row per hero, CURRENT role.
+ *   • hero_role_history — every role a hero has held, with [valid_from,
+ *     valid_to) dates from HEROES[].previously. matchup_rows / matchup_user
+ *     join this one by game date, so a new hero must be in it too.
  */
 export function generateHeroRoleRefSql(): string {
   const rows = HEROES
     .map(h => `  ('${sqlEscape(h.name)}'::text, '${h.role}'::text)`)
     .join(',\n')
+  const date = (d: string | null) => (d ? `'${d}'::date` : 'NULL::date')
+  const historyRows: string[] = []
+  for (const h of HEROES) {
+    let from: string | null = null
+    for (const past of h.previously ?? []) {
+      historyRows.push(`  ('${sqlEscape(h.name)}'::text, '${past.role}'::text, ${date(from)}, ${date(past.until)})`)
+      from = past.until
+    }
+    historyRows.push(`  ('${sqlEscape(h.name)}'::text, '${h.role}'::text, ${date(from)}, NULL::date)`)
+  }
   return [
     'create or replace view hero_role_ref as',
     'select hero_name, role',
     'from ( values',
     rows,
     ') t(hero_name, role);',
+    '',
+    'create or replace view hero_role_history as',
+    'select hero_name, role, valid_from, valid_to',
+    'from ( values',
+    historyRows.join(',\n'),
+    ') t(hero_name, role, valid_from, valid_to);',
   ].join('\n')
 }
 

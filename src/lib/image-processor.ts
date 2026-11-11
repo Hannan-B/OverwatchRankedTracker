@@ -273,6 +273,36 @@ export async function classifyPageType(img: HTMLImageElement): Promise<PageType>
   return pageType
 }
 
+// ── (v1.2.0) Session grouping: page type from the ACTIVE TAB alone ──────────
+// The match-history pages carry a SUMMARY / TEAMS / PERSONAL nav whose active
+// tab is filled bright blue. Measured on the Season 5 set (HDR on and off): the
+// active box reads 11,000–15,800 fill px, the inactive ones ≤ 34. Unlike
+// classifyImage(), this does not need a red enemy block to recognise a Teams
+// page — a board whose enemy rows all disappeared (permanent leavers) still
+// classifies.
+const TEAMS_TAB_BOX = { x0: 480, x1: 660, y0: 50, y1: 120 }
+
+export type SessionPageType = 'summary' | 'personal' | 'teams' | 'unknown'
+
+export function classifyByTabs(img: HTMLImageElement): SessionPageType {
+  const { data, width, height } = getImagePixels(img)
+  const fills: [SessionPageType, number][] = [
+    ['summary', countTabFill(data, width, height, SUMMARY_TAB_BOX)],
+    ['teams', countTabFill(data, width, height, TEAMS_TAB_BOX)],
+    ['personal', countTabFill(data, width, height, PERSONAL_TAB_BOX)],
+  ]
+  fills.sort((a, b) => b[1] - a[1])
+  return fills[0][1] >= TAB_FILL_MIN && fills[1][1] < TAB_FILL_MIN ? fills[0][0] : 'unknown'
+}
+
+/** Which of the Summary page's three hero slots hold a hero (orange ring
+ *  present), using the same ring test as processMatchPhotos. */
+export function summarySlotsFilled(img: HTMLImageElement): boolean[] {
+  const { data, width, height } = getImagePixels(img)
+  return SUMMARY_PORTRAIT_CENTERS.map(({ x, y }) =>
+    countRingBandPixels(data, width, height, x, y) >= SLOT_FILLED_MIN_RING_PX)
+}
+
 /** Canonical within-match processing order: summary first, then breakdown(s), then scoreboard. */
 const PAGE_ORDER: Record<PageType, number> = {
   summary: 0,
@@ -555,6 +585,13 @@ async function assignBreakdownsToHeroes(
  *   ONLY where there is genuinely no user answer to pass — `/testing` uploads
  *   bare files and therefore still exercises the derived path, which is what a
  *   detection harness should do. `/process` must always pass it.
+ * @param extraHeroes (v1.2.0, bulk session upload) heroes known to have been
+ *   played from the Personal pages' sidebar. The Summary shows only the top
+ *   three, so in a 4+-hero match the remaining Personal pages had no hero to be
+ *   assigned to and were dropped. Names here that the Summary didn't already
+ *   give become extra assignment candidates, and each one whose breakdown gets
+ *   assigned is added to `heroes` (after the Summary's). Pass only for a 4+-hero
+ *   match (sessionExtraHeroes) — a Summary misread must not be "fixed" by it.
  */
 export async function processMatchPhotos(
   photoUrls: string[],
@@ -562,6 +599,7 @@ export async function processMatchPhotos(
   roleFilter?: RoleType,
   gamertag?: string,
   formatHint?: '5v5' | '6v6' | null,
+  extraHeroes?: string[],
 ): Promise<ProcessedMatch> {
   const startTime = Date.now()
 
@@ -767,7 +805,9 @@ export async function processMatchPhotos(
   if (breakdownImages.length > 0 && opencvAvailable) {
     onStatus({ stage: 'reading_breakdowns', progress: 65 })
 
-    const knownHeroes = Array.from(summaryHeroNames)
+    const extras = (extraHeroes ?? []).filter(h => !summaryHeroNames.has(h))
+    if (extras.length > 0) console.log(`Extra heroes from the sidebar (beyond the Summary's top 3): [${extras.join(', ')}]`)
+    const knownHeroes = [...Array.from(summaryHeroNames), ...extras]
     const assignments = await assignBreakdownsToHeroes(
       breakdownImages, knownHeroes, opencvAvailable,
     )
@@ -796,6 +836,13 @@ export async function processMatchPhotos(
         })
       } catch (e) {
         console.warn(`Breakdown OCR failed for ${assignment.heroName}:`, e)
+      }
+    }
+
+    // Sidebar-only heroes count as played once their breakdown is assigned.
+    for (const name of extras) {
+      if (result.heroBreakdowns.some(b => b.heroName === name)) {
+        result.heroes.push({ name, confidence: 0.5, source: 'ocr' })
       }
     }
 

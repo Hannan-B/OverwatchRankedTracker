@@ -7,10 +7,25 @@ export type DpsSubRole = 'sharpshooter' | 'flanker' | 'specialist' | 'recon'
 export type SupportSubRole = 'tactician' | 'medic' | 'survivor'
 export type SubRole = TankSubRole | DpsSubRole | SupportSubRole
 
+export type HeroRole = 'tank' | 'dps' | 'support'
+
+/** A role the hero held BEFORE its current one. `until` is the first date
+ *  (YYYY-MM-DD, compared against the UTC date of `played_at` — the same day
+ *  boundary `get_season_for_date` uses) on which the hero no longer had it. */
+export interface PastRole {
+  role: HeroRole
+  subRole: SubRole
+  until: string
+}
+
 export interface Hero {
   name: string
-  role: 'tank' | 'dps' | 'support'
+  /** The hero's CURRENT role. For anything tied to a specific match, use
+   *  heroRoleAt(name, playedAt) instead — a hero's role can change. */
+  role: HeroRole
   subRole: SubRole
+  /** Earlier roles, oldest first. Absent for heroes that have never changed. */
+  previously?: PastRole[]
 }
 
 export interface GameMap {
@@ -22,7 +37,7 @@ export interface GameMap {
 export type GameMode = 'escort' | 'control' | 'hybrid' | 'push' | 'flashpoint'
 
 // ============================================================
-// HEROES (53)
+// HEROES (54)
 // ============================================================
 
 export const HEROES: Hero[] = [
@@ -68,25 +83,28 @@ export const HEROES: Hero[] = [
   { name: 'Soldier: 76', role: 'dps', subRole: 'specialist' },
   { name: 'Symmetra', role: 'dps', subRole: 'specialist' },
   { name: 'Torbjörn', role: 'dps', subRole: 'specialist' },
-  // DPS — Recon (4)
+  // DPS — Recon (3)
   { name: 'Echo', role: 'dps', subRole: 'recon' },
   { name: 'Freja', role: 'dps', subRole: 'recon' },
   { name: 'Pharah', role: 'dps', subRole: 'recon' },
-  { name: 'Sombra', role: 'dps', subRole: 'recon' },
 
-  // Support — Tactician (5)
+  // Support — Tactician (6)
   { name: 'Ana', role: 'support', subRole: 'tactician' },
   { name: 'Baptiste', role: 'support', subRole: 'tactician' },
   { name: 'Jetpack Cat', role: 'support', subRole: 'tactician' },
   { name: 'Lúcio', role: 'support', subRole: 'tactician' },
+  // Moved from DPS (recon) when Season 5 started on 2026-10-06.
+  { name: 'Sombra', role: 'support', subRole: 'tactician',
+    previously: [{ role: 'dps', subRole: 'recon', until: '2026-10-06' }] },
   { name: 'Zenyatta', role: 'support', subRole: 'tactician' },
   // Support — Medic (4)
   { name: 'Kiriko', role: 'support', subRole: 'medic' },
   { name: 'Lifeweaver', role: 'support', subRole: 'medic' },
   { name: 'Mercy', role: 'support', subRole: 'medic' },
   { name: 'Moira', role: 'support', subRole: 'medic' },
-  // Support — Survivor (5)
+  // Support — Survivor (6)
   { name: 'Brigitte', role: 'support', subRole: 'survivor' },
+  { name: 'Doctrine', role: 'support', subRole: 'survivor' },
   { name: 'Illari', role: 'support', subRole: 'survivor' },
   { name: 'Juno', role: 'support', subRole: 'survivor' },
   { name: 'Mizuki', role: 'support', subRole: 'survivor' },
@@ -94,13 +112,14 @@ export const HEROES: Hero[] = [
 ]
 
 // ============================================================
-// MAPS (30)
+// MAPS (31)
 // ============================================================
 
 export const MAPS: GameMap[] = [
-  // Escort (8)
+  // Escort (9)
   { name: 'Circuit Royal', mode: 'escort', location: 'Monte Carlo' },
   { name: 'Dorado', mode: 'escort', location: 'Mexico' },
+  { name: 'Grímsvötn', mode: 'escort', location: 'Iceland' },
   { name: 'Havana', mode: 'escort', location: 'Cuba' },
   { name: 'Junkertown', mode: 'escort', location: 'Australia' },
   { name: 'Rialto', mode: 'escort', location: 'Italy' },
@@ -177,6 +196,77 @@ export const QUESTION_SCALE_LABELS: Record<number, string> = {
 // ============================================================
 // HELPERS
 // ============================================================
+
+// ============================================================
+// ROLE AT A POINT IN TIME
+// ============================================================
+// A hero's role is a property of the MATCH, not of the hero: Sombra was DPS
+// until Season 5 and support from it. Anything that attaches a role to a
+// specific game (saving a scoreboard, bucketing appearances, choosing a
+// damage-vs-healing share) must ask for the role ON THAT DATE. The SQL side
+// mirrors this in hero_role_ref's valid_from / valid_to columns.
+
+const HERO_BY_NAME = new Map(HEROES.map(h => [h.name, h]))
+
+/** UTC calendar date (YYYY-MM-DD) of a played_at value, or null. */
+function utcDate(playedAt: string | Date | null | undefined): string | null {
+  if (!playedAt) return null
+  const d = typeof playedAt === 'string' ? new Date(playedAt) : playedAt
+  return isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10)
+}
+
+/** The hero's role on the date of `playedAt`. With no date, the current role.
+ *  Undefined for a name that isn't a known hero. */
+export function heroRoleAt(name: string, playedAt?: string | Date | null): HeroRole | undefined {
+  const hero = HERO_BY_NAME.get(name)
+  if (!hero) return undefined
+  const day = utcDate(playedAt)
+  if (day && hero.previously) {
+    for (const past of hero.previously) if (day < past.until) return past.role
+  }
+  return hero.role
+}
+
+/** Every role the hero has held, oldest first, with the date range it applied
+ *  (`from`/`until` null = open-ended). One entry for heroes that never changed. */
+export function heroRoleEras(name: string): { role: HeroRole; subRole: SubRole; from: string | null; until: string | null }[] {
+  const hero = HERO_BY_NAME.get(name)
+  if (!hero) return []
+  const eras: { role: HeroRole; subRole: SubRole; from: string | null; until: string | null }[] = []
+  let from: string | null = null
+  for (const past of hero.previously ?? []) {
+    eras.push({ role: past.role, subRole: past.subRole, from, until: past.until })
+    from = past.until
+  }
+  eras.push({ role: hero.role, subRole: hero.subRole, from, until: null })
+  return eras
+}
+
+const ERA_ROLE_WORD: Record<HeroRole, string> = { tank: 'Tank', dps: 'DPS', support: 'Support' }
+const ERA_SUFFIX = / \((Tank|DPS|Support) era\)$/
+
+/** The hero's name AS IT WAS on `playedAt`: the plain name while it held its
+ *  current role, "Sombra (DPS era)" in an earlier one. For surfaces that key
+ *  by hero name and must keep a hero's eras apart (Matchups). */
+export function heroEraName(name: string, playedAt?: string | Date | null): string {
+  const hero = HERO_BY_NAME.get(name)
+  const role = heroRoleAt(name, playedAt)
+  if (!hero || !role || role === hero.role) return name
+  return `${name} (${ERA_ROLE_WORD[role]} era)`
+}
+
+/** Strip an era label: "Sombra (DPS era)" -> "Sombra". Plain names pass through. */
+export function baseHeroName(display: string): string {
+  return display.replace(ERA_SUFFIX, '')
+}
+
+/** Role for a hero DISPLAY name: the era's role for an era name, else the
+ *  hero's current role. */
+export function heroDisplayRole(display: string): HeroRole | undefined {
+  const m = display.match(ERA_SUFFIX)
+  if (m) return (Object.keys(ERA_ROLE_WORD) as HeroRole[]).find(r => ERA_ROLE_WORD[r] === m[1])
+  return HERO_BY_NAME.get(display)?.role
+}
 
 export const getHeroesByRole = (role: 'tank' | 'dps' | 'support') =>
   HEROES.filter(h => h.role === role).sort((a, b) => a.name.localeCompare(b.name))

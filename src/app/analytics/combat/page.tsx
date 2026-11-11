@@ -9,7 +9,7 @@ import { supabase } from '@/lib/supabase'
 import { keepVisible } from '@/lib/alpha'
 import { loadExclusionPrefs, EXCLUSION_COLS } from '@/lib/leaver'
 import { defaultSeasonSelection } from '@/lib/season-util'
-import { HEROES } from '@/data/reference'
+import { heroRoleAt } from '@/data/reference'
 import AnalyticsFilters, {
   DEFAULT_FILTERS,
   matchesFilters,
@@ -27,7 +27,7 @@ import {
   shareWinsVsLosses, shareTrendPerMatch, shareTrendByWeek,
   perRoleSummary, sixVsSixSummary, finalBlowRate,
   shareDrill, drillDimension, shareBySession, rateStat, finalBlowRatesByHero, ratesByHero,
-  buildHeroRoleMap, filterBySixRoles,
+  filterBySixRoles,
   overallWinRate,
   deathShare,
   type CombatFactRow, type Role,
@@ -68,7 +68,7 @@ const COLS =
   // rebuilt in v1.1.0 to expose the type and thrower columns for this.
   EXCLUSION_COLS
 
-const HERO_ROLE = buildHeroRoleMap(HEROES.map(h => ({ name: h.name, role: h.role as Role })))
+const HERO_ROLE = (hero: string, playedAt: string | null) => heroRoleAt(hero, playedAt) as Role | undefined
 
 const axisTickOf = (c: ChartColors) => ({ fill: c.axisLabel, fontSize: 11 })
 const tooltipStyleOf = (c: ChartColors) => ({

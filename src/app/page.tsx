@@ -8,7 +8,7 @@ import Link from 'next/link'
 import { AnalyticsMenu } from '@/components/AnalyticsNav'
 import MultiSelect from '@/components/MultiSelect'
 import { currentSeasonId } from '@/lib/season-util'
-import { HEROES } from '@/data/reference'
+import { heroRoleAt } from '@/data/reference'
 import { isExcludedGame, loadExclusionPrefs, EXCLUSION_COLS } from '@/lib/leaver'
 // (v1.1.0 Phase 5) The session-boundary rule is IMPORTED, never redefined. The
 // Time page owns 45 minutes and the divergence from Builder's 60 is deliberate —
@@ -107,11 +107,6 @@ const QUEUES: Queue[] = ['5v5', '6v6']
 const ROLES: Role[] = ['tank', 'dps', 'support']
 const ROLE_LABEL: Record<Role, string> = { tank: 'Tank', dps: 'DPS', support: 'Support' }
 
-// hero display-name -> role (display names are the SAME scheme used in the DB;
-// safe-names are only for portrait filenames -- handover section 5).
-const HERO_ROLE: Record<string, Role> = Object.fromEntries(
-  HEROES.map(h => [h.name, h.role as Role]),
-)
 
 // Portrait path for a hero. Files live at public/heroes/{file}.png. VERIFIED
 // against the real folder: the filename equals the display name for all heroes
@@ -471,7 +466,10 @@ function buildAppearances(
     out.push({
       matchId: m.id,
       queue: m.match_format,
-      role: HERO_ROLE[hero] ?? 'unknown',
+      // (v1.2.0) Role on the match date — Sombra was DPS before Season 5.
+      // Display names are the SAME scheme used in the DB; safe-names are only
+      // for portrait filenames (handover section 5).
+      role: heroRoleAt(hero, m.played_at) ?? 'unknown',
       hero,
       seconds: secs,
       map: m.map,
